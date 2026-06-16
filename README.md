@@ -30,3 +30,5 @@ profiler.print_global_top_stats(min_time_us=0.01, top_n=40)
 
 ## Licence
 MIT
+
+The claude.md is partially created from https://github.com/multica-ai/andrej-karpathy-skills/blob/main/CLAUDE.md

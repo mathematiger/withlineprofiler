@@ -10,11 +10,10 @@ from lineprofiler.profiler import (
     LineStats,
 )
 
-
 __all__ = [
-    "LineProfiler",
-    "LineStats", 
     "FunctionStats",
+    "LineProfiler",
+    "LineStats",
 ]
 
 __version__ = "0.1.1"
