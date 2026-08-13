@@ -38,7 +38,7 @@ I/O BY PHASE (measured exactly)
 
 I/O
 ──────────────────────────────────────────────────────────────
-Read                                   0 B           0 B/s
+Read (from disk)                       0 B           0 B/s
 Write                              40.0 MB        8.0 MB/s
 
   iteration/train_step      r        0 B   w    40.0 MB

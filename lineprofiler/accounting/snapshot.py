@@ -25,7 +25,13 @@ from pathlib import Path
 from typing import Any
 
 from lineprofiler.accounting.phase import PhaseTree, merge_trees, tree_from_dict, tree_to_dict
-from lineprofiler.accounting.sampler import Sample, read_samples
+from lineprofiler.accounting.sampler import (
+    Sample,
+    open_process,
+    read_io_snapshot,
+    read_samples,
+)
+from lineprofiler.accounting.selfio import record_bytes_written
 
 FORMAT_VERSION = 1
 
@@ -52,6 +58,7 @@ class SnapshotWriter:
         self.samples_path = self.worker_dir / f"{stem}.samples"
         self.started_at = time.time()
         self._backend: dict[str, Any] | None = None
+        self._process = open_process()
         _write_metadata_once(run_dir)
 
     def write(self, tree: PhaseTree) -> None:
@@ -65,9 +72,16 @@ class SnapshotWriter:
             "backend": self._backend,
             "phases": tree_to_dict(tree),
         }
+        document = json.dumps(payload)
         temporary = self.path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(payload), encoding="utf-8")
+        before = read_io_snapshot(self._process)
+        temporary.write_text(document, encoding="utf-8")
         os.replace(temporary, self.path)
+        after = read_io_snapshot(self._process)
+        record_bytes_written(
+            len(document.encode("utf-8")),
+            max(0, after.write_bytes - before.write_bytes),
+        )
 
     def record_backend(self, description: dict[str, Any]) -> None:
         """Attach the heavy-profiler artifact description to the next snapshot."""
@@ -230,8 +244,16 @@ def _write_metadata_once(run_dir: Path) -> None:
         "host": socket.gethostname(),
         "python": sys.version,
     }
+    document = json.dumps(payload, indent=2)
+    process = open_process()
     with contextlib.suppress(OSError):
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        before = read_io_snapshot(process)
+        path.write_text(document, encoding="utf-8")
+        after = read_io_snapshot(process)
+        record_bytes_written(
+            len(document.encode("utf-8")),
+            max(0, after.write_bytes - before.write_bytes),
+        )
 
 
 def _read_metadata(run_dir: Path) -> dict[str, Any]:

@@ -80,10 +80,14 @@ ITERATIONS  (75 entries)
 
 I/O BY PHASE (measured exactly)
 ──────────────────────────────────────────────────────────────
+  iteration/load_batch      r   408.7 MB   w        0 B    327.6 MB/s
+                            + 359.3 MB read from page cache
   iteration/checkpoint      r        0 B   w    40.0 MB    785.7 MB/s
 
 I/O
 ──────────────────────────────────────────────────────────────
+Read (from disk)                  408.7 MB        1.1 GB/s
+Read (from page cache)            359.3 MB
 Write                              40.0 MB      108.2 MB/s
   write █     █      █     █      █                 peak 1.0 GB/s
 
@@ -109,8 +113,32 @@ Two blocks, with different guarantees:
   on whichever phase was open when the interval began. The sparkline shows *when* the bytes
   moved, which a total alone hides.
 
+Both blocks report two layers, because on Linux they answer different questions:
+
+| | counter | measures |
+|---|---|---|
+| `from disk` | `read_bytes`/`write_bytes` | traffic that reached the block device |
+| `from page cache` | `read_chars` − `read_bytes` | bytes your program read that RAM served |
+
+**A warm dataset moves no disk bytes at all.** If your shards fit in page cache, the disk
+counter correctly reports zero while the loader is still copying gigabytes — so a run that
+looks I/O-free by `read_bytes` alone may still be loader-bound. The cache line is what tells
+you the reads happened; `wait%` on the same phase tells you whether they cost you anything.
+
+Bytes moved while no phase was open are labelled `(no phase open)`, never billed to the
+root, and the block prints what share of traffic landed there. A high share means the sample
+interval was too coarse for this run, not that the root did the work — wrap those regions in
+`io=True` and read the exact block instead.
+
+The profiler excludes its own sample and snapshot writes from both layers. It measures them
+rather than estimating: rewriting a 500-byte worker file costs whole blocks for data, inode
+and journal, which was measured at eight times the bytes handed to `write()`.
+
 Per-operation attribution needs eBPF and is out of scope. Per-process I/O *time* is not
-exposed by any OS counter — use a phase's `wait%` as the blocked-time proxy instead.
+exposed by any OS counter — use a phase's `wait%` as the blocked-time proxy instead. Note
+also that `write_bytes` is writeback-dependent: bytes land on the phase that was open when
+the kernel flushed them unless that phase calls `fsync`, whereas `write_chars` is charged to
+the phase that called `write`.
 
 ### Overhead
 
@@ -119,15 +147,15 @@ Measured on Python 3.12 with `benchmarks/bench_accounting.py`, per phase enter+e
 | | ns/call |
 |---|---|
 | `phase()`, `enabled=False` | 320 |
-| `phase()`, `enabled=True`, `measure_cpu=False` | 1840 |
-| `phase()`, `enabled=True`, `measure_cpu=True` | 3390 |
-| `phase(io=True)` | 40300 |
-| `count()` | 345 |
+| `phase()`, `enabled=True`, `measure_cpu=False` | 2280 |
+| `phase()`, `enabled=True`, `measure_cpu=True` | 3840 |
+| `phase(io=True)` | 44900 |
+| `count()` | 355 |
 
 `measure_cpu` (on by default) is what produces `wait%`, and it doubles the cost:
 `time.thread_time_ns()` reads `CLOCK_THREAD_CPUTIME_ID`, which is not in the vDSO, so each
-call is a real syscall at roughly 590 ns. `io=True` costs two `/proc` reads — negligible on
-a 10 ms checkpoint, ruinous on an inner loop.
+call is a real syscall at roughly 590 ns. `io=True` costs two `/proc` reads and two reads of
+the overhead counter — negligible on a 10 ms checkpoint, ruinous on an inner loop.
 
 At around a microsecond per phase, put `phase()` around searches, env steps and train
 steps — not inside an inner simulation loop. Use `count()` there instead; it is five times

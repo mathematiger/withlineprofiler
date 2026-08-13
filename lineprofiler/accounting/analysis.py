@@ -20,12 +20,22 @@ from lineprofiler.accounting.sampler import Sample
 _SPARK_CHARS = " ▁▂▃▄▅▆▇█"
 
 
+NO_PHASE = "(no phase open)"
+"""Label for bytes moved while no phase was on the stack — an admission, not a finding."""
+
+
 @dataclass(slots=True)
 class IoTotals:
-    """Bytes read and written, and the wall time over which that happened."""
+    """Bytes read and written, and the wall time over which that happened.
+
+    ``*_bytes`` is block-layer traffic and ``*_chars`` is syscall-level, so the difference
+    between them is what the page cache served without touching the device.
+    """
 
     read_bytes: int = 0
     write_bytes: int = 0
+    read_chars: int = 0
+    write_chars: int = 0
     seconds: float = 0.0
 
     @property
@@ -35,6 +45,11 @@ class IoTotals:
     @property
     def write_rate(self) -> float:
         return self.write_bytes / self.seconds if self.seconds else 0.0
+
+    @property
+    def cached_read_bytes(self) -> int:
+        """Bytes the program read that never came off the disk."""
+        return max(0, self.read_chars - self.read_bytes)
 
 
 @dataclass(slots=True)
@@ -73,6 +88,32 @@ class SampleAnalysis:
     def has_samples(self) -> bool:
         return self.memory.last_rss > 0 or self.totals.read_bytes > 0
 
+    @property
+    def unattributed_read_share(self) -> float:
+        """Share of read traffic the sampler could not pin to any phase, in ``0.0..1.0``.
+
+        High here means the sample interval was too coarse for this run, not that the root
+        did the reading. Compare against the exactly-measured ``io=True`` phases instead.
+        """
+        loose = self.io_by_phase.get(NO_PHASE)
+        if loose is None:
+            return 0.0
+        return _share(
+            loose.read_bytes or loose.read_chars,
+            self.totals.read_bytes or self.totals.read_chars,
+        )
+
+    @property
+    def unattributed_write_share(self) -> float:
+        """Share of write traffic the sampler could not pin to any phase, in ``0.0..1.0``."""
+        loose = self.io_by_phase.get(NO_PHASE)
+        if loose is None:
+            return 0.0
+        return _share(
+            loose.write_bytes or loose.write_chars,
+            self.totals.write_bytes or self.totals.write_chars,
+        )
+
 
 @dataclass(slots=True)
 class _Interval:
@@ -83,6 +124,8 @@ class _Interval:
     phase: str
     read: int
     write: int
+    read_chars: int
+    write_chars: int
 
 
 def analyse(samples: list[Sample], series_width: int = 48) -> SampleAnalysis:
@@ -164,17 +207,27 @@ def format_bytes(value: float) -> str:
 
 
 def _intervals_of(ordered: list[Sample]) -> list[_Interval]:
-    """Reduce one process's samples to the deltas between consecutive rows."""
-    return [
-        _Interval(
-            start=previous.t,
-            seconds=max(0.0, current.t - previous.t),
-            phase=previous.phase or "(root)",
-            read=max(0, current.read_bytes - previous.read_bytes),
-            write=max(0, current.write_bytes - previous.write_bytes),
+    """Reduce one process's samples to the deltas between consecutive rows.
+
+    Writes the profiler itself performed between the two rows are deducted, so its own
+    sample and snapshot files never appear as the workload's I/O.
+    """
+    intervals = []
+    for previous, current in zip(ordered, ordered[1:], strict=False):
+        blocks = max(0, current.self_write_bytes - previous.self_write_bytes)
+        chars = max(0, current.self_write_chars - previous.self_write_chars)
+        intervals.append(
+            _Interval(
+                start=previous.t,
+                seconds=max(0.0, current.t - previous.t),
+                phase=previous.phase or NO_PHASE,
+                read=max(0, current.read_bytes - previous.read_bytes),
+                write=max(0, current.write_bytes - previous.write_bytes - blocks),
+                read_chars=max(0, current.read_chars - previous.read_chars),
+                write_chars=max(0, current.write_chars - previous.write_chars - chars),
+            ),
         )
-        for previous, current in zip(ordered, ordered[1:], strict=False)
-    ]
+    return intervals
 
 
 def _fill_io_from_intervals(analysis: SampleAnalysis, intervals: list[_Interval]) -> None:
@@ -182,13 +235,21 @@ def _fill_io_from_intervals(analysis: SampleAnalysis, intervals: list[_Interval]
     for interval in intervals:
         analysis.totals.read_bytes += interval.read
         analysis.totals.write_bytes += interval.write
-        analysis.totals.seconds = max(analysis.totals.seconds, 0.0)
+        analysis.totals.read_chars += interval.read_chars
+        analysis.totals.write_chars += interval.write_chars
 
         bucket = analysis.io_by_phase.setdefault(interval.phase, IoTotals())
         bucket.read_bytes += interval.read
         bucket.write_bytes += interval.write
+        bucket.read_chars += interval.read_chars
+        bucket.write_chars += interval.write_chars
         bucket.seconds += interval.seconds
     analysis.totals.seconds = _wall_span(intervals)
+
+
+def _share(part: int, whole: int) -> float:
+    """``part / whole``, or zero when there was nothing to divide."""
+    return part / whole if whole > 0 else 0.0
 
 
 def _wall_span(intervals: list[_Interval]) -> float:

@@ -20,6 +20,9 @@ from lineprofiler.accounting.snapshot import MergedRun, imbalance_of
 _WIDTH = 62
 _RULE = "─" * _WIDTH
 
+_CACHE_NOISE_FLOOR = 64 * 1024
+"""Below one readahead window, cached reads are interpreter noise rather than your data."""
+
 
 def render(run: MergedRun) -> str:
     """Return the full text report for a merged run.
@@ -196,41 +199,60 @@ def _exact_io_block(tree: PhaseTree) -> str:
     """
     rows = []
     for path, stats in sorted(tree.items(), key=lambda item: -_exact_io_total(item[1])):
-        total = _exact_io_total(stats)
-        if total <= 0:
+        if _exact_io_total(stats) <= 0:
             continue
-        read = stats.counters.get("io_read_bytes", 0)
-        write = stats.counters.get("io_write_bytes", 0)
-        seconds = stats.wall_ns / 1e9
-        rate = format_bytes(total / seconds) + "/s" if seconds else "-"
-        rows.append(
-            f"  {'/'.join(path)[-26:]:<26}"
-            f"r {format_bytes(read):>10}   w {format_bytes(write):>10}{rate:>14}",
-        )
+        rows.extend(_exact_io_rows(path, stats))
     if not rows:
         return ""
     return "\n".join(["", "I/O BY PHASE (measured exactly)", _RULE, *rows])
 
 
+def _exact_io_rows(path: PhasePath, stats: PhaseStats) -> list[str]:
+    """One row of disk traffic, plus a second naming what the page cache served.
+
+    Disk bytes lead because they are what costs time on a saturated device. The cache line
+    only appears when it changes the reading — without it a warm dataset looks like a phase
+    that does no I/O at all, when in fact it is moving gigabytes out of RAM.
+    """
+    read = stats.counters.get("io_read_bytes", 0)
+    write = stats.counters.get("io_write_bytes", 0)
+    seconds = stats.wall_ns / 1e9
+    rate = format_bytes((read + write) / seconds) + "/s" if seconds else "-"
+    rows = [
+        f"  {'/'.join(path)[-26:]:<26}"
+        f"r {format_bytes(read):>10}   w {format_bytes(write):>10}{rate:>14}",
+    ]
+    cached = max(0, stats.counters.get("io_read_chars", 0) - read)
+    if cached >= _CACHE_NOISE_FLOOR:
+        rows.append(f"{'':<28}+ {format_bytes(cached)} read from page cache")
+    return rows
+
+
 def _exact_io_total(stats: PhaseStats) -> int:
-    return stats.counters.get("io_read_bytes", 0) + stats.counters.get("io_write_bytes", 0)
+    """Every byte the phase moved at either layer, so a warm read still ranks."""
+    counters = stats.counters
+    return max(
+        counters.get("io_read_bytes", 0) + counters.get("io_write_bytes", 0),
+        counters.get("io_read_chars", 0) + counters.get("io_write_chars", 0),
+    )
 
 
 def _io_block(analysis: SampleAnalysis) -> str:
     """Bytes moved, the phases that moved them, and a sparkline of when."""
-    if not analysis.totals.read_bytes and not analysis.totals.write_bytes:
+    totals = analysis.totals
+    if not (totals.read_bytes or totals.write_bytes or totals.read_chars or totals.write_chars):
         return ""
 
     lines = ["", "I/O", _RULE]
-    lines.append(f"{'Read':<28}{format_bytes(analysis.totals.read_bytes):>14}"
-                 f"{format_bytes(analysis.totals.read_rate) + '/s':>16}")
-    lines.append(f"{'Write':<28}{format_bytes(analysis.totals.write_bytes):>14}"
-                 f"{format_bytes(analysis.totals.write_rate) + '/s':>16}")
+    lines.append(f"{'Read (from disk)':<28}{format_bytes(totals.read_bytes):>14}"
+                 f"{format_bytes(totals.read_rate) + '/s':>16}")
+    if totals.cached_read_bytes:
+        lines.append(f"{'Read (from page cache)':<28}{format_bytes(totals.cached_read_bytes):>14}")
+    lines.append(f"{'Write':<28}{format_bytes(totals.write_bytes):>14}"
+                 f"{format_bytes(totals.write_rate) + '/s':>16}")
     lines.extend(_io_phase_rows(analysis))
     lines.extend(_io_sparklines(analysis))
-    lines.append("")
-    lines.append("  (bytes come from the OS process counters; attribution to a phase has a")
-    lines.append("   resolution of one sample interval. Per-operation attribution needs eBPF.)")
+    lines.extend(_io_attribution_note(analysis))
     return "\n".join(lines)
 
 
@@ -238,17 +260,43 @@ def _io_phase_rows(analysis: SampleAnalysis, limit: int = 5) -> list[str]:
     """The phases during which most bytes moved."""
     ranked = sorted(
         analysis.io_by_phase.items(),
-        key=lambda item: -(item[1].read_bytes + item[1].write_bytes),
+        key=lambda item: -(item[1].read_bytes + item[1].write_bytes + item[1].cached_read_bytes),
     )
     rows = [""] if ranked else []
     for phase, totals in ranked[:limit]:
-        if not (totals.read_bytes or totals.write_bytes):
+        if not (totals.read_bytes or totals.write_bytes or totals.cached_read_bytes):
             continue
+        cached = f"  cache {format_bytes(totals.cached_read_bytes)}" if (
+            totals.cached_read_bytes
+        ) else ""
         rows.append(
             f"  {phase[-26:]:<26}"
-            f"r {format_bytes(totals.read_bytes):>10}   w {format_bytes(totals.write_bytes):>10}",
+            f"r {format_bytes(totals.read_bytes):>10}   "
+            f"w {format_bytes(totals.write_bytes):>10}{cached}",
         )
     return rows
+
+
+def _io_attribution_note(analysis: SampleAnalysis) -> list[str]:
+    """State the sampled block's resolution, and how much of it landed nowhere.
+
+    The share is printed rather than implied: a run shorter than a few sample intervals can
+    leave most of its bytes unattributed, and a reader who does not know that will read the
+    per-phase rows above as a finding.
+    """
+    lines = [
+        "",
+        "  (bytes come from the OS process counters; attribution to a phase has a",
+        "   resolution of one sample interval. Per-operation attribution needs eBPF.)",
+    ]
+    reads = analysis.unattributed_read_share
+    writes = analysis.unattributed_write_share
+    if max(reads, writes) > 0.05:
+        lines.append(
+            f"  {reads:.0%} of reads and {writes:.0%} of writes moved while no phase was",
+        )
+        lines.append("   open — too coarse to attribute. Wrap those regions in io=True.")
+    return lines
 
 
 def _io_sparklines(analysis: SampleAnalysis) -> list[str]:

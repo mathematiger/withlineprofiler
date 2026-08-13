@@ -35,7 +35,15 @@ from lineprofiler.accounting.backend import Backend, BackendWindow
 from lineprofiler.accounting.capabilities import nvtx_range_functions, record_function_factory
 from lineprofiler.accounting.histogram import bucket_index
 from lineprofiler.accounting.phase import PhasePath, PhaseStats, PhaseTree
-from lineprofiler.accounting.sampler import ProcessHandle, ResourceSampler, open_process
+from lineprofiler.accounting.sampler import (
+    IoSnapshot,
+    ProcessHandle,
+    ResourceSampler,
+    open_process,
+    read_io_snapshot,
+)
+from lineprofiler.accounting.selfio import bytes_written as selfio_bytes_written
+from lineprofiler.accounting.selfio import reset as selfio_reset
 from lineprofiler.accounting.snapshot import SnapshotWriter
 
 ENV_ENABLE = "LINEPROFILER_PROFILE"
@@ -170,8 +178,13 @@ class Profiler:
                 measured *exactly* rather than inferred from the 1 Hz sampler. Costs a
                 ``/proc`` read at each end — tens of microseconds — so it belongs on coarse
                 phases that actually touch the disk (checkpoint, replay load, dataset read),
-                never on an inner loop. The bytes appear as the ``io_read_bytes`` and
-                ``io_write_bytes`` counters on the phase.
+                never on an inner loop.
+
+                Four counters land on the phase. ``io_read_bytes``/``io_write_bytes`` are
+                block-layer traffic — what reached the device. ``io_read_chars``/
+                ``io_write_chars`` are syscall-level, so a read served from the page cache
+                shows up there and nowhere else. Bytes the profiler wrote for its own
+                bookkeeping are excluded from all four.
 
         Test specifically:
             - an exception inside the body still closes the phase and records it
@@ -181,25 +194,21 @@ class Profiler:
             - a generator body abandoned without exhaustion still closes its phase
             - ``io=True`` on a phase writing a known number of bytes reports them on that
               phase, and reports nothing on a phase that writes none
+            - a page-cached read reports ``io_read_chars`` and no ``io_read_bytes``
+            - a silent phase running alongside the sampler reports no I/O at all
         """
         if not self.enabled:
             return _NULL_SCOPE
         return _PhaseScope(self, name, io)
 
-    def io_counters(self) -> tuple[int, int]:
-        """Return this process's cumulative ``(read_bytes, write_bytes)``, or zeros.
+    def io_counters(self) -> IoSnapshot:
+        """Return this process's cumulative byte counters at the disk and syscall layers.
 
-        Zeros when psutil is absent or the platform has no per-process counters (macOS),
-        which makes an ``io=True`` phase degrade to an ordinary phase.
+        All zeros when psutil is absent or the platform has no per-process counters (macOS),
+        which makes an ``io=True`` phase degrade to an ordinary phase. Use
+        :meth:`IoSnapshot.is_empty` to test for that rather than comparing against a tuple.
         """
-        process = self._process
-        if process is None:
-            return (0, 0)
-        try:
-            counters = process.io_counters()
-        except Exception:  # noqa: BLE001 - the counter can vanish on a dying process
-            return (0, 0)
-        return (counters.read_bytes, counters.write_bytes)
+        return read_io_snapshot(self._process)
 
     def count(self, name: str, n: int = 1) -> None:
         """Attribute ``n`` work units to the phase currently open on this thread.
@@ -364,6 +373,7 @@ class Profiler:
             - the child's tree starts empty rather than inheriting the parent's totals
             - the sampler and flush timer run again in the child
             - nesting a fork inside a phase leaves the child with a clean phase stack
+            - the child's profiler-overhead total starts at zero, since its byte counters do
         """
         if not self.enabled:
             return
@@ -372,6 +382,9 @@ class Profiler:
         self._states = []
         self._closed = False
         self._process = open_process()
+        # The child's OS byte counters start at zero, so the parent's overhead total would
+        # over-deduct against them for the rest of the child's life.
+        selfio_reset()
         _live_profilers.clear()
         _live_profilers.append(str(self.run_dir))
         self._writer = SnapshotWriter(self.run_dir, role=self.role)
@@ -444,7 +457,8 @@ class _PhaseScope:
     """Context manager for one phase entry. Allocated per call, so it nests safely."""
 
     __slots__ = (
-        "_cpu0", "_function", "_io", "_io0", "_name", "_profiler", "_state", "_stats", "_wall0",
+        "_cpu0", "_function", "_io", "_io0", "_name", "_profiler", "_self_io0", "_state",
+        "_stats", "_wall0",
     )
 
     def __init__(self, profiler: Profiler, name: str, io: bool = False) -> None:
@@ -455,7 +469,8 @@ class _PhaseScope:
         self._stats: PhaseStats | None = None
         self._wall0 = 0
         self._cpu0 = 0
-        self._io0 = (0, 0)
+        self._io0 = IoSnapshot()
+        self._self_io0 = (0, 0)
         self._function: AbstractContextManager[object] | None = None
 
     def __enter__(self) -> None:
@@ -479,6 +494,8 @@ class _PhaseScope:
             window.on_phase_enter(self._name)
         if self._io:
             self._io0 = self._profiler.io_counters()
+            self._self_io0 = selfio_bytes_written()
+
         # Inlined rather than delegated: annotation is off by default, and a method call
         # on each side of every phase is measurable at roughly a microsecond per phase.
         nvtx = self._profiler._nvtx
@@ -530,12 +547,34 @@ class _PhaseScope:
             window.on_phase_exit(self._name)
 
     def _record_io(self, stats: PhaseStats) -> None:
-        """Attribute the bytes this phase moved, measured at its own boundaries."""
-        read, write = self._profiler.io_counters()
-        if read - self._io0[0] > 0:
-            stats.add_count("io_read_bytes", read - self._io0[0])
-        if write - self._io0[1] > 0:
-            stats.add_count("io_write_bytes", write - self._io0[1])
+        """Attribute the bytes this phase moved, measured at its own boundaries.
+
+        The profiler's own writes are deducted at the layer they were measured on: the
+        syscall figure from ``write_chars`` and the bracketed block figure from
+        ``write_bytes``. Deducting the syscall figure from both would leave most of the
+        overhead in place, because rewriting a small worker file costs several whole blocks
+        for data, inode and journal — measured at eight times the bytes handed to ``write``.
+        """
+        now = self._profiler.io_counters()
+        chars_before, blocks_before = self._self_io0
+        chars_after, blocks_after = selfio_bytes_written()
+        self._add_delta(stats, "io_read_bytes", now.read_bytes - self._io0.read_bytes)
+        self._add_delta(stats, "io_read_chars", now.read_chars - self._io0.read_chars)
+        self._add_delta(
+            stats,
+            "io_write_bytes",
+            now.write_bytes - self._io0.write_bytes - (blocks_after - blocks_before),
+        )
+        self._add_delta(
+            stats,
+            "io_write_chars",
+            now.write_chars - self._io0.write_chars - (chars_after - chars_before),
+        )
+
+    @staticmethod
+    def _add_delta(stats: PhaseStats, name: str, delta: int) -> None:
+        if delta > 0:
+            stats.add_count(name, delta)
 
 
 class _NullScope:

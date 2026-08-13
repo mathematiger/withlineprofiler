@@ -55,6 +55,10 @@ def main() -> None:
             with with_cpu.phase("p"):
                 pass
 
+        def phase_with_io() -> None:
+            with with_cpu.phase("p", io=True):
+                pass
+
         def count_only() -> None:
             with_cpu.count("units")
 
@@ -63,6 +67,8 @@ def main() -> None:
         measure("phase(), enabled=False", phase_disabled)
         measure("phase(), enabled=True, measure_cpu=False", phase_no_cpu)
         measure("phase(), enabled=True, measure_cpu=True", phase_with_cpu)
+        # Two /proc reads per end, so this runs at a fraction of the iteration count.
+        measure("phase(io=True)", phase_with_io, iterations=ITERATIONS // 20)
         measure("count()", count_only)
         print(f"\n(baseline call overhead of {baseline:.0f} ns is included in every row)")  # noqa: T201
 

@@ -25,7 +25,7 @@ The repo root is `withlineprofiler/` (the parent folder is not a git repo). Run 
 - Benchmark: `poetry run python benchmarks/bench_accounting.py` (the numbers quoted in the README come from here; re-run and update them if the hot path changes)
 - Regenerate report golden files: `LINEPROFILER_UPDATE_GOLDEN=1 poetry run pytest tests/test_accounting_report_golden.py`
 
-Tests (143 total, ~9 s):
+Tests (148 total, ~10 s):
 
 - [tests/test_profiler.py](tests/test_profiler.py) — the line profiler (27). Several tests reach into private state (`_is_in_project_folder`, `_project_cache`, `_source_cache`, `_function_stats`), so renaming those attributes breaks tests.
 - [tests/test_accounting.py](tests/test_accounting.py) — histogram, phase tree, counters, snapshots, merge.
@@ -57,9 +57,10 @@ Layered bottom-up; each module imports only from the ones above it in this list.
 - `histogram.py` — `DurationHistogram`: 512 log-spaced buckets, 8 per octave, indexed with `int.bit_length()` (no float maths, no `math.log`) because this runs on every phase exit. Mergeable by summing buckets, which is what makes quantiles survive both the snapshot and the cross-worker merge.
 - `phase.py` — `PhaseStats` (calls / wall / cpu / child_wall / histogram / counters) and the `PhaseTree`, a `dict` keyed by the full phase path. `self_ns = wall - child_wall`; `wait_ns = wall - cpu`, the blocked-on-something estimate. **`merge_trees` copies nodes on insert** — sharing them aliased worker statistics and corrupted per-worker totals.
 - `capabilities.py` — every optional dependency (`psutil`, `torch`, `pynvml`, `nvtx`), resolved once and degraded to `None`. Nothing else imports them directly.
-- `sampler.py` — the 1 Hz daemon thread: RSS, `io_counters`, CUDA allocator, NVML utilisation, each row tagged with the deepest open phase. Brackets the run with a baseline and a final row, because the OS counters are cumulative and only useful as differences.
+- `selfio.py` — the bytes the profiler's own sampler and snapshot writes cost, so they can be deducted from your phases. Two totals: `chars` is exact from the buffer length, `block_bytes` is **measured** by bracketing each of its own writes, because filesystem journal and inode churn amplify a 14 KB run of bookkeeping into ~116 KB of block traffic. Deducting the char figure from `write_bytes` would leave most of the overhead in place.
+- `sampler.py` — the 1 Hz daemon thread: RSS, `io_counters`, CUDA allocator, NVML utilisation, each row tagged with the deepest open phase. Brackets the run with a baseline and a final row, because the OS counters are cumulative and only useful as differences. `IoSnapshot` carries **both** counter layers: `*_bytes` (block device) and `*_chars` (syscall). Only the pair together makes a page-cached read visible — a warm dataset moves zero disk bytes.
 - `snapshot.py` — one complete JSON document per worker at `workers/w_<pid>_<uuid8>.json`, replaced atomically via `os.replace`. That *is* the crash-resilience mechanism: a torn write leaves the previous file intact. The uuid matters because a restarted worker reuses its rank but not its pid.
-- `analysis.py` — pure derivation from samples. **`analyse_processes` differences each process separately**; pooling samples across processes inflates totals and misattributes them.
+- `analysis.py` — pure derivation from samples. **`analyse_processes` differences each process separately**; pooling samples across processes inflates totals and misattributes them. Bytes with no phase open go to `NO_PHASE` (`"(no phase open)"`), never to the root, and `unattributed_*_share` reports how much landed there — a high share means the sample rate was too coarse, not that the root did the work.
 - `backend.py` — `Backend` enum plus `BackendWindow`, which starts one heavy profiler across a range of entries into a phase you name. A single enum value, so two backends are not representable.
 - `profiler.py` — the `Profiler` itself. Statistics are **per thread**, merged only at snapshot time, so the hot path takes no locks. `_PhaseScope.__exit__` inlines `record()` and `observe()`, and the annotation guards, because at ~3 µs per phase a Python-level call is measurable.
 - `report.py` / `compare.py` / `cli.py` — rendering. The report groups by role and descends past any single-phase level to find where the work actually branches.
@@ -71,6 +72,9 @@ Layered bottom-up; each module imports only from the ones above it in this list.
 - The profiler stops its own threads around a `fork` (`os.register_at_fork`) so enabling it never adds fork-deadlock risk, and re-initialises fully in the child so it does not inherit the parent's file or tree.
 - Environment propagation (`LINEPROFILER_PROFILE`, `LINEPROFILER_RUN_DIR`) reaches `spawn` children but **not** `forkserver` children, whose daemon froze its environment at start. There is a test asserting this limitation.
 - `io_*` counters hold bytes, not work units, so `_counter_rows` skips them; they are rendered by `_exact_io_block`.
+- An `io=True` phase records **four** counters: `io_read_bytes`/`io_write_bytes` (block layer) and `io_read_chars`/`io_write_chars` (syscall). `write_bytes` is writeback-dependent and only lands on the writing phase if it `fsync`s; `write_chars` is always charged correctly. Prefer chars when asking who wrote, bytes when asking what the device saw.
+- `Profiler.io_counters()` returns an `IoSnapshot`, not a 2-tuple. Test availability with `.is_empty()`.
+- `selfio.reset()` runs in `_reinitialise_after_fork`: the child's OS byte counters restart at zero, so an inherited overhead total would over-deduct for the child's whole life.
 
 ## Gotchas
 

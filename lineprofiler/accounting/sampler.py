@@ -19,7 +19,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, TextIO, runtime_checkable
+from typing import Any, NamedTuple, Protocol, TextIO, runtime_checkable
 
 from lineprofiler.accounting.capabilities import (
     cuda_is_available,
@@ -27,6 +27,7 @@ from lineprofiler.accounting.capabilities import (
     psutil_module,
     torch_module,
 )
+from lineprofiler.accounting.selfio import bytes_written, record_bytes_written
 
 
 class MemoryInfo(Protocol):
@@ -36,10 +37,34 @@ class MemoryInfo(Protocol):
 
 
 class IoCounters(Protocol):
-    """Cumulative byte counters, as returned by ``psutil.Process.io_counters()``."""
+    """Cumulative byte counters, as returned by ``psutil.Process.io_counters()``.
+
+    ``read_bytes``/``write_bytes`` count traffic at the block layer — what actually reached
+    the storage device. ``read_chars``/``write_chars`` count bytes passed through the read
+    and write syscalls, cache hit or not. Only the first pair exists on every platform; the
+    second is Linux's ``rchar``/``wchar`` and is read defensively.
+    """
 
     read_bytes: int
     write_bytes: int
+
+
+class IoSnapshot(NamedTuple):
+    """One reading of the process byte counters, at both the disk and the syscall layer.
+
+    Keeping both is what makes a page-cached read visible. A training run whose dataset fits
+    in RAM moves no disk bytes at all, so ``read_bytes`` alone reports its data loading as
+    idle — correctly, and uselessly.
+    """
+
+    read_bytes: int = 0
+    write_bytes: int = 0
+    read_chars: int = 0
+    write_chars: int = 0
+
+    def is_empty(self) -> bool:
+        """Whether every counter is zero, which is how an unsupported platform reports."""
+        return not (self.read_bytes or self.write_bytes or self.read_chars or self.write_chars)
 
 
 @runtime_checkable
@@ -55,6 +80,26 @@ class ProcessHandle(Protocol):
     def io_counters(self) -> IoCounters: ...
 
 
+def read_io_snapshot(process: ProcessHandle | None) -> IoSnapshot:
+    """Read both layers of byte counter at once, degrading to zeros when unavailable.
+
+    Zeros when psutil is absent or the platform has no per-process counters (macOS), which
+    makes an ``io=True`` phase degrade to an ordinary phase.
+    """
+    if process is None:
+        return IoSnapshot()
+    try:
+        counters = process.io_counters()
+    except Exception:  # noqa: BLE001 - the counter can vanish on a dying process
+        return IoSnapshot()
+    return IoSnapshot(
+        read_bytes=counters.read_bytes,
+        write_bytes=counters.write_bytes,
+        read_chars=getattr(counters, "read_chars", 0),
+        write_chars=getattr(counters, "write_chars", 0),
+    )
+
+
 @dataclass(slots=True)
 class Sample:
     """One row of resource state, taken at ``t`` while ``phase`` was open.
@@ -68,6 +113,10 @@ class Sample:
     rss: int = 0
     read_bytes: int = 0
     write_bytes: int = 0
+    read_chars: int = 0
+    write_chars: int = 0
+    self_write_chars: int = 0
+    self_write_bytes: int = 0
     cuda_alloc: int = 0
     cuda_reserved: int = 0
     gpu_util: float = -1.0
@@ -81,6 +130,10 @@ class Sample:
             rss=data.get("rss", 0),
             read_bytes=data.get("read_bytes", 0),
             write_bytes=data.get("write_bytes", 0),
+            read_chars=data.get("read_chars", 0),
+            write_chars=data.get("write_chars", 0),
+            self_write_chars=data.get("self_write_chars", 0),
+            self_write_bytes=data.get("self_write_bytes", 0),
             cuda_alloc=data.get("cuda_alloc", 0),
             cuda_reserved=data.get("cuda_reserved", 0),
             gpu_util=data.get("gpu_util", -1.0),
@@ -167,8 +220,16 @@ class ResourceSampler:
             self._write_row(handle)
 
     def _write_row(self, handle: TextIO) -> None:
-        handle.write(json.dumps(_compact(self.take())) + "\n")
+        """Append one row, declaring what it cost so no phase is billed for the profiler."""
+        line = json.dumps(_compact(self.take())) + "\n"
+        before = read_io_snapshot(self._process)
+        handle.write(line)
         handle.flush()
+        after = read_io_snapshot(self._process)
+        record_bytes_written(
+            len(line.encode("utf-8")),
+            max(0, after.write_bytes - before.write_bytes),
+        )
 
     def _add_process_metrics(self, sample: Sample) -> None:
         if self._process is None:
@@ -176,9 +237,12 @@ class ResourceSampler:
         if self.capabilities.memory:
             sample.rss = self._process.memory_info().rss
         if self.capabilities.io:
-            counters = self._process.io_counters()
+            counters = read_io_snapshot(self._process)
             sample.read_bytes = counters.read_bytes
             sample.write_bytes = counters.write_bytes
+            sample.read_chars = counters.read_chars
+            sample.write_chars = counters.write_chars
+            sample.self_write_chars, sample.self_write_bytes = bytes_written()
 
     def _add_cuda_metrics(self, sample: Sample) -> None:
         if not self.capabilities.cuda:
@@ -254,7 +318,17 @@ def _probe(read: Callable[[], object]) -> bool:
 def _compact(sample: Sample) -> dict[str, Any]:
     """Drop zero-valued fields so a 12-hour sample file stays small."""
     row: dict[str, Any] = {"t": round(sample.t, 3), "phase": sample.phase}
-    for name in ("rss", "read_bytes", "write_bytes", "cuda_alloc", "cuda_reserved"):
+    for name in (
+        "rss",
+        "read_bytes",
+        "write_bytes",
+        "read_chars",
+        "write_chars",
+        "self_write_chars",
+        "self_write_bytes",
+        "cuda_alloc",
+        "cuda_reserved",
+    ):
         value = getattr(sample, name)
         if value:
             row[name] = value

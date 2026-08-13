@@ -449,7 +449,7 @@ def test_io_phase_attributes_bytes_to_the_phase_that_wrote_them(tmp_path: Path) 
     profiler = Profiler(
         run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
     )
-    if profiler.io_counters() == (0, 0):
+    if profiler.io_counters().is_empty():
         profiler.close()
         pytest.skip("per-process io counters unavailable on this platform")
 
@@ -474,7 +474,7 @@ def test_io_phase_appears_in_the_exact_io_block(tmp_path: Path) -> None:
     profiler = Profiler(
         run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
     )
-    if profiler.io_counters() == (0, 0):
+    if profiler.io_counters().is_empty():
         profiler.close()
         pytest.skip("per-process io counters unavailable on this platform")
 
@@ -494,6 +494,139 @@ def test_io_flag_is_ignored_when_the_profiler_is_disabled(tmp_path: Path) -> Non
     with profiler.phase("save", io=True):
         pass
     assert profiler.merged_tree() == {}
+
+
+# ── page-cached reads ───────────────────────────────────────────────────────
+
+
+def _read_whole(path: Path, drop_cache: bool) -> int:
+    """Read a file, optionally evicting its pages first so the bytes come off the disk."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        if drop_cache and hasattr(os, "posix_fadvise"):
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        total = 0
+        while chunk := os.read(fd, 1 << 20):
+            total += len(chunk)
+        return total
+    finally:
+        os.close(fd)
+
+
+def test_page_cached_reads_are_reported_as_chars_not_disk_bytes(tmp_path: Path) -> None:
+    """A warm read moves no disk bytes, so ``read_bytes`` alone reports a phase as idle.
+
+    This is the page-cache blind spot: a training run whose dataset fits in RAM does its
+    reads from memory, and the block-layer counter that ``read_bytes`` exposes correctly
+    reports zero. The syscall-level counter is what shows the work happened at all.
+    """
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    if profiler.io_counters().is_empty():
+        profiler.close()
+        pytest.skip("per-process io counters unavailable on this platform")
+
+    payload = tmp_path / "shard.bin"
+    payload.write_bytes(b"z" * (8 * 1024 * 1024))
+    _read_whole(payload, drop_cache=False)  # warm the cache
+
+    with profiler.phase("load_batch", io=True):
+        assert _read_whole(payload, drop_cache=False) == 8 * 1024**2
+    profiler.close()
+
+    counters = merge_run(tmp_path).tree[("load_batch",)].counters
+    assert counters.get("io_read_chars", 0) >= 8 * 1024**2
+    assert counters.get("io_read_bytes", 0) < 8 * 1024**2
+
+
+def test_cold_reads_report_both_disk_bytes_and_chars(tmp_path: Path) -> None:
+    """A cold read moves the bytes through both counters, so disk pressure stays visible."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    if profiler.io_counters().is_empty():
+        profiler.close()
+        pytest.skip("per-process io counters unavailable on this platform")
+
+    payload = tmp_path / "cold.bin"
+    payload.write_bytes(b"z" * (8 * 1024 * 1024))
+    os.sync()
+
+    with profiler.phase("load_batch", io=True):
+        _read_whole(payload, drop_cache=True)
+    profiler.close()
+
+    counters = merge_run(tmp_path).tree[("load_batch",)].counters
+    assert counters.get("io_read_chars", 0) >= 8 * 1024**2
+    if counters.get("io_read_bytes", 0) == 0:
+        pytest.skip("filesystem did not honour POSIX_FADV_DONTNEED")
+    assert counters["io_read_bytes"] >= 4 * 1024**2
+
+
+def test_report_names_the_bytes_that_came_from_page_cache(tmp_path: Path) -> None:
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    if profiler.io_counters().is_empty():
+        profiler.close()
+        pytest.skip("per-process io counters unavailable on this platform")
+
+    payload = tmp_path / "shard.bin"
+    payload.write_bytes(b"z" * (8 * 1024 * 1024))
+    _read_whole(payload, drop_cache=False)
+
+    with profiler.phase("load_batch", io=True):
+        _read_whole(payload, drop_cache=False)
+    profiler.close()
+
+    assert "from page cache" in render(merge_run(tmp_path))
+
+
+# ── the profiler's own I/O ──────────────────────────────────────────────────
+
+
+def test_the_profilers_own_writes_are_not_attributed_to_a_phase(tmp_path: Path) -> None:
+    """The sampler and snapshot threads write to the run directory on the same process.
+
+    Those bytes land in the process-wide counters, so without exclusion they are billed to
+    whichever phase happens to be open — a phase that touched no file at all reports I/O.
+    """
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=0.01, sample_interval_s=0.01,
+    )
+    if profiler.io_counters().is_empty():
+        profiler.close()
+        pytest.skip("per-process io counters unavailable on this platform")
+
+    with profiler.phase("compute", io=True):
+        time.sleep(0.3)  # long enough for many sampler rows and snapshots to be written
+    profiler.close()
+
+    counters = merge_run(tmp_path).tree[("compute",)].counters
+    assert counters.get("io_write_chars", 0) == 0, f"leaked {counters} into a silent phase"
+    assert counters.get("io_write_bytes", 0) == 0
+
+
+# ── sampled attribution honesty ─────────────────────────────────────────────
+
+
+def test_bytes_moved_outside_any_phase_are_reported_as_unattributed() -> None:
+    """Bytes the sampler could not pin to a phase must be named, not billed to the root.
+
+    A run shorter than a few sample intervals attributes most of its bytes to whatever was
+    open when the baseline row was taken. Calling that "(root)" reads like a finding; it is
+    really an admission that the sample rate was too coarse.
+    """
+    samples = [
+        Sample(t=0.0, phase="", read_bytes=0),
+        Sample(t=1.0, phase="load", read_bytes=900),
+        Sample(t=2.0, phase="load", read_bytes=1000),
+    ]
+    analysis = analyse([samples][0])
+
+    assert analysis.io_by_phase["(no phase open)"].read_bytes == 900
+    assert analysis.unattributed_read_share == pytest.approx(0.9)
 
 
 # ── annotation (NVTX / record_function) ─────────────────────────────────────
