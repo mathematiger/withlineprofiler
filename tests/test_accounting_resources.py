@@ -9,10 +9,12 @@ import json
 import os
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from lineprofiler.accounting import Backend, Profiler, merge_run, render
+from lineprofiler.accounting import sampler as sampler_module
 from lineprofiler.accounting.analysis import (
     analyse,
     analyse_processes,
@@ -22,7 +24,7 @@ from lineprofiler.accounting.analysis import (
 from lineprofiler.accounting.backend import BackendWindow
 from lineprofiler.accounting.cli import main as cli_main
 from lineprofiler.accounting.compare import compare, comparison_as_dict, render_comparison
-from lineprofiler.accounting.sampler import Sample, read_samples
+from lineprofiler.accounting.sampler import ResourceSampler, Sample, _compact, read_samples
 from lineprofiler.accounting.snapshot import imbalance_of
 
 # ── roles ───────────────────────────────────────────────────────────────────
@@ -680,3 +682,257 @@ def test_annotation_pushes_and_pops_in_matching_pairs(tmp_path: Path) -> None:
 def test_annotation_is_ignored_when_disabled(tmp_path: Path) -> None:
     profiler = Profiler(run_dir=tmp_path, enabled=False, annotate=True)
     assert profiler._nvtx is None  # noqa: SLF001
+
+
+# ── GPU utilisation, per device and per process ─────────────────────────────
+
+
+def _fake_nvml(
+    busy: dict[int, float],
+    process_samples: dict[int, list[SimpleNamespace]] | None = None,
+) -> SimpleNamespace:
+    """Stand in for pynvml, so per-device sampling is verified without a GPU.
+
+    A device whose busy value is negative raises, mimicking a transient NVML failure on one
+    device of several. ``nvmlDeviceGetProcessUtilization`` raises when its window is empty,
+    which is what the real one does rather than returning a list of length zero.
+    """
+    rows = process_samples or {}
+
+    def get_rates(handle: int) -> SimpleNamespace:
+        if busy[handle] < 0:
+            raise RuntimeError("device unavailable")
+        return SimpleNamespace(gpu=busy[handle])
+
+    def get_process_utilization(handle: int, since: int) -> list[SimpleNamespace]:
+        fresh = [row for row in rows.get(handle, []) if row.timeStamp > since]
+        if not fresh:
+            raise RuntimeError("NVML_ERROR_NOT_FOUND")
+        return fresh
+
+    return SimpleNamespace(
+        nvmlDeviceGetCount=lambda: len(busy),
+        nvmlDeviceGetHandleByIndex=lambda index: index,
+        nvmlDeviceGetUtilizationRates=get_rates,
+        nvmlDeviceGetProcessUtilization=get_process_utilization,
+    )
+
+
+def _sampler_with_nvml(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    nvml: SimpleNamespace,
+) -> ResourceSampler:
+    """Build a sampler whose device handles come from the stub, not from a real driver."""
+    monkeypatch.setattr(sampler_module, "nvml_module", lambda: nvml)
+    return ResourceSampler(tmp_path / "samples", 1.0, lambda: "train")
+
+
+def _write_samples(run_dir: Path, samples: list[Sample]) -> None:
+    """Attach resource samples to the worker file a test's profiler already wrote.
+
+    Goes through the sampler's own compaction, so the report is fed exactly the JSON a real
+    run would have produced rather than a hand-written approximation of it.
+    """
+    worker = next(iter((run_dir / "workers").glob("w_*.json")))
+    rows = "\n".join(json.dumps(_compact(sample)) for sample in samples)
+    worker.with_suffix(".samples").write_text(rows + "\n", encoding="utf-8")
+
+
+def test_every_visible_device_gets_its_own_utilisation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sampler = _sampler_with_nvml(tmp_path, monkeypatch, _fake_nvml({0: 80.0, 1: 40.0}))
+
+    sample = sampler.take()
+
+    assert sample.gpu_utils == {0: 80.0, 1: 40.0}
+    assert sample.gpu_util == pytest.approx(60.0), "the scalar stays the mean over devices"
+
+
+def test_a_device_that_fails_to_report_does_not_lose_the_others(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sampler = _sampler_with_nvml(tmp_path, monkeypatch, _fake_nvml({0: -1.0, 1: 40.0}))
+
+    assert sampler.take().gpu_utils == {1: 40.0}
+
+
+def test_only_this_processes_rows_count_towards_its_own_utilisation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nvml = _fake_nvml(
+        {0: 90.0},
+        {0: [
+            SimpleNamespace(pid=os.getpid(), smUtil=30.0, timeStamp=10),
+            SimpleNamespace(pid=os.getpid() + 1, smUtil=55.0, timeStamp=11),
+        ]},
+    )
+    sampler = _sampler_with_nvml(tmp_path, monkeypatch, nvml)
+
+    sample = sampler.take()
+
+    assert sample.gpu_proc_utils == {0: 30.0}, "the neighbour's 55% is not ours"
+    assert sample.gpu_utils == {0: 90.0}, "but the device is busy with both"
+
+
+def test_process_utilisation_is_absent_when_nvml_reports_no_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sampler = _sampler_with_nvml(tmp_path, monkeypatch, _fake_nvml({0: 90.0}))
+
+    assert sampler.take().gpu_proc_utils == {}
+
+
+def test_per_device_utilisation_survives_the_sample_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """JSON object keys are strings; the device indices must come back as ints."""
+    nvml = _fake_nvml(
+        {0: 80.0, 1: 40.0},
+        {1: [SimpleNamespace(pid=os.getpid(), smUtil=25.0, timeStamp=3)]},
+    )
+    sampler = _sampler_with_nvml(tmp_path, monkeypatch, nvml)
+    path = tmp_path / "samples"
+    with path.open("a", encoding="utf-8") as handle:
+        sampler._write_row(handle)  # noqa: SLF001
+
+    restored = read_samples(path)[0]
+
+    assert restored.gpu_utils == {0: 80.0, 1: 40.0}
+    assert restored.gpu_proc_utils == {1: 25.0}
+
+
+def test_workers_sum_their_own_share_but_average_the_devices(tmp_path: Path) -> None:
+    """Two actors on one GPU place 60% on it between them; the device is 90% busy once."""
+    first = [
+        Sample(t=0.0, phase="train", gpu_utils={0: 90.0}, gpu_proc_utils={0: 40.0}),
+        Sample(t=1.0, phase="train", gpu_utils={0: 90.0}, gpu_proc_utils={0: 40.0}),
+    ]
+    second = [
+        Sample(t=0.0, phase="train", gpu_utils={0: 90.0}, gpu_proc_utils={0: 20.0}),
+        Sample(t=1.0, phase="train", gpu_utils={0: 90.0}, gpu_proc_utils={0: 20.0}),
+    ]
+
+    devices = analyse_processes([first, second]).gpu_devices
+
+    assert len(devices) == 1
+    assert devices[0].busy_mean == pytest.approx(90.0)
+    assert devices[0].ours_mean == pytest.approx(60.0)
+
+
+def test_windows_without_our_kernels_count_as_idle_not_as_missing() -> None:
+    """A worker busy in one window of four used a quarter of the device, not all of it."""
+    samples = [
+        Sample(t=0.0, phase="train", gpu_utils={0: 50.0}, gpu_proc_utils={0: 80.0}),
+        Sample(t=1.0, phase="train", gpu_utils={0: 50.0}),
+        Sample(t=2.0, phase="train", gpu_utils={0: 50.0}),
+        Sample(t=3.0, phase="train", gpu_utils={0: 50.0}),
+    ]
+
+    assert analyse(samples).gpu_devices[0].ours_mean == pytest.approx(20.0)
+
+
+def test_a_device_never_attributed_to_us_reports_unknown_not_zero() -> None:
+    samples = [
+        Sample(t=0.0, phase="train", gpu_utils={0: 50.0}),
+        Sample(t=1.0, phase="train", gpu_utils={0: 50.0}),
+    ]
+
+    assert analyse(samples).gpu_devices[0].ours_mean == -1.0
+
+
+def test_report_shows_a_row_per_device_with_our_share(tmp_path: Path) -> None:
+    profiler = Profiler(
+        run_dir=tmp_path, role="learner", enabled=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    with profiler.phase("train"):
+        pass
+    profiler.close()
+    _write_samples(tmp_path, [
+        Sample(t=0.0, phase="train", rss=1_000, gpu_utils={0: 90.0, 1: 10.0},
+               gpu_proc_utils={0: 45.0}),
+        Sample(t=1.0, phase="train", rss=1_000, gpu_utils={0: 90.0, 1: 10.0},
+               gpu_proc_utils={0: 45.0}),
+    ])
+
+    text = render(merge_run(tmp_path))
+
+    assert "GPU 0" in text
+    assert "GPU 1" in text
+    assert "45.0%" in text, "our share of device 0"
+    assert "this run" in text
+
+
+def test_report_falls_back_to_one_figure_for_older_sample_files(tmp_path: Path) -> None:
+    """Files written before utilisation was per-device still render their scalar."""
+    profiler = Profiler(
+        run_dir=tmp_path, role="learner", enabled=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    with profiler.phase("train"):
+        pass
+    profiler.close()
+    _write_samples(tmp_path, [
+        Sample(t=0.0, phase="train", rss=1_000, gpu_util=71.0),
+        Sample(t=1.0, phase="train", rss=1_000, gpu_util=71.0),
+    ])
+
+    text = render(merge_run(tmp_path))
+
+    assert "Utilisation (sampled)" in text
+    assert "71.0%" in text
+    assert "GPU 0" not in text
+
+
+# ── CUDA-synchronised phases ────────────────────────────────────────────────
+
+
+def test_sync_phase_drains_the_queue_at_both_ends(tmp_path: Path) -> None:
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    events: list[str] = []
+    profiler._cuda_sync = lambda: events.append("sync")  # noqa: SLF001
+
+    with profiler.phase("train", sync=True):
+        events.append("body")
+    profiler.close()
+
+    assert events == ["sync", "body", "sync"]
+
+
+def test_sync_happens_before_the_exit_clock_is_read(tmp_path: Path) -> None:
+    """The whole point: kernels still running at the end of the phase are its cost."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    profiler._cuda_sync = lambda: time.sleep(0.02)  # noqa: SLF001
+
+    with profiler.phase("train", sync=True):
+        pass
+    profiler.close()
+
+    assert merge_run(tmp_path).tree[("train",)].wall_ns >= 20_000_000
+
+
+def test_sync_is_a_no_op_without_a_cuda_device(tmp_path: Path) -> None:
+    """CI has no GPU: the phase must record exactly as an unsynchronised one does."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    with profiler.phase("train", sync=True):
+        profiler.count("steps", 3)
+    profiler.close()
+
+    tree = merge_run(tmp_path).tree
+    assert tree[("train",)].calls == 1
+    assert tree[("train",)].counters == {"steps": 3}
+
+
+def test_sync_is_ignored_when_the_profiler_is_disabled(tmp_path: Path) -> None:
+    profiler = Profiler(run_dir=tmp_path, enabled=False)
+    assert profiler._cuda_sync is None  # noqa: SLF001
+    with profiler.phase("train", sync=True):
+        pass

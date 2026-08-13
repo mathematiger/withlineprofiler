@@ -93,8 +93,11 @@ Write                              40.0 MB      108.2 MB/s
 
 GPU
 ──────────────────────────────────────────────────────────────
-Utilisation (sampled)              71.0%
-VRAM reserved (peak)               8.4 GB
+                               busy   this run     idle
+GPU 0                         92.4%      64.1%     7.6%
+GPU 1                          8.0%        n/a    92.0%
+VRAM allocated (peak)               6.1 GB
+VRAM reserved (peak)                8.4 GB
 ```
 
 `wait%` is the share of wall time the thread was not running on a CPU — blocked on a queue,
@@ -140,6 +143,50 @@ also that `write_bytes` is writeback-dependent: bytes land on the phase that was
 the kernel flushed them unless that phase calls `fsync`, whereas `write_chars` is charged to
 the phase that called `write`.
 
+### Finding GPU bottlenecks
+
+The GPU block reports every device NVML can see, in two columns that answer different
+questions:
+
+- **`busy`** — `nvmlDeviceGetUtilizationRates`, the share of time *any* kernel from *any*
+  process was resident on that device. On a shared node this includes other tenants.
+- **`this run`** — `nvmlDeviceGetProcessUtilization` summed over this run's own pids. Sixteen
+  actors on one device add up here, which is the point: it is the load *you* place on it.
+
+A device at 92% busy of which your run owns 64% is contended, not saturated, and the fix is
+scheduling rather than a faster kernel. `n/a` means NVML never attributed a sample to your
+pids on that device — no work of yours ran there, as distinct from `0.0%`, which is measured
+idleness. Windows in which NVML reports no kernels for a pid count as zero for that pid, so a
+worker busy one second in ten reads 10%, not 100%.
+
+Indices are NVML's, so they are the machine's physical devices; `CUDA_VISIBLE_DEVICES`
+renumbers what torch sees but not what appears here.
+
+#### Phase timings and asynchronous CUDA
+
+CUDA launches are asynchronous, so by default a phase around a forward pass measures the time
+to *enqueue* its kernels. Their real cost surfaces later, as `wait%` on whichever phase
+happens to synchronise — usually one that copies a result back and did nothing wrong. When you
+want a phase's wall time to mean GPU time:
+
+```python
+with profiler.phase("forward", sync=True):
+    logits = model(batch)
+```
+
+`sync=True` drains the queue at *both* ends of the phase. Entry matters as much as exit:
+synchronising only on exit bills this phase for whatever an earlier one left queued. It is a
+no-op when torch is absent or no CUDA device is visible.
+
+The cost is the pipelining you give up — across that boundary the CPU can no longer run ahead
+of the GPU — so put it on the phases you are actively measuring, not on every phase in the
+loop, and take your headline timings from a run with it off once you know where the work is.
+Note also that `wait%` on a synchronised phase depends on how the driver waits: a blocking
+sync shows up as wait, a spinning one burns CPU and shows up as none.
+
+Kernel-level attribution is still `backend="torch"`; this only fixes which phase the time
+lands on.
+
 ### Overhead
 
 Measured on Python 3.12 with `benchmarks/bench_accounting.py`, per phase enter+exit:
@@ -151,6 +198,10 @@ Measured on Python 3.12 with `benchmarks/bench_accounting.py`, per phase enter+e
 | `phase()`, `enabled=True`, `measure_cpu=True` | 3840 |
 | `phase(io=True)` | 44900 |
 | `count()` | 355 |
+
+`sync=True` is absent from the table because its cost is not the profiler's: it is however
+long the GPU still had to run. Phases that do *not* set it are unaffected — the check is one
+branch, inside the noise of the numbers above.
 
 `measure_cpu` (on by default) is what produces `wait%`, and it doubles the cost:
 `time.thread_time_ns()` reads `CLOCK_THREAD_CPUTIME_ID`, which is not in the vDSO, so each
@@ -201,8 +252,9 @@ shows your phase names. This package never launches nsys itself.
 
 Function-level tracing, CUDA kernel timing, GPU compute-versus-wait attribution and
 per-line memory are left to `torch.profiler`, VizTracer, memray and nsys. The GPU block
-reports NVML's whole-device *busy* percentage, which is a utilisation number, not a
-breakdown. `backend="torch"` gets you the breakdown for a window.
+reports utilisation — per device, and split into your run's share and everyone else's — which
+tells you *whether* the GPU is the constraint, never *which kernel* is. `backend="torch"` gets
+you that breakdown for a window.
 
 ### Optional dependencies
 

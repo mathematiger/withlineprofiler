@@ -32,7 +32,11 @@ from types import FrameType
 from typing import ParamSpec, Self, TypeVar, overload
 
 from lineprofiler.accounting.backend import Backend, BackendWindow
-from lineprofiler.accounting.capabilities import nvtx_range_functions, record_function_factory
+from lineprofiler.accounting.capabilities import (
+    cuda_synchronize,
+    nvtx_range_functions,
+    record_function_factory,
+)
 from lineprofiler.accounting.histogram import bucket_index
 from lineprofiler.accounting.phase import PhasePath, PhaseStats, PhaseTree
 from lineprofiler.accounting.sampler import (
@@ -144,6 +148,9 @@ class Profiler:
         self._sample_interval_s = sample_interval_s
         self._nvtx = nvtx_range_functions() if annotate and self.enabled else None
         self._record_function = record_function_factory() if annotate and self.enabled else None
+        # Resolved once: torch.cuda.is_available() initialises the driver on first call, so
+        # asking per phase would put a lock on the hot path.
+        self._cuda_sync = cuda_synchronize() if self.enabled else None
 
         if not self.enabled:
             return
@@ -169,11 +176,24 @@ class Profiler:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def phase(self, name: str, io: bool = False) -> _PhaseScope | _NullScope:
+    def phase(self, name: str, io: bool = False, sync: bool = False) -> _PhaseScope | _NullScope:
         """Open a named region, nested under the phase currently open on this thread.
 
         Args:
             name: The phase's name. Sibling phases with the same name accumulate together.
+            sync: Drain the CUDA queue at both ends of the phase, so its wall time means GPU
+                time. CUDA launches are asynchronous: without this, a phase around a forward
+                pass measures the time to *enqueue* the kernels, and their real cost surfaces
+                later as ``wait%`` on whichever phase happens to synchronise — usually the
+                one that copies a result back, which did nothing wrong.
+
+                Synchronising on entry as well as exit is what makes the number attributable:
+                exit alone would bill this phase for whatever was still queued when it
+                started. The cost is the pipelining you give up — the CPU can no longer run
+                ahead of the GPU across this boundary — so put it on the phases you are
+                actively measuring, not on every phase in the loop, and take timings from a
+                run where it is off once you know where the work is. A no-op when torch is
+                absent or no CUDA device is visible.
             io: Read the process byte counters on entry and exit, so this phase's I/O is
                 measured *exactly* rather than inferred from the 1 Hz sampler. Costs a
                 ``/proc`` read at each end — tens of microseconds — so it belongs on coarse
@@ -196,10 +216,13 @@ class Profiler:
               phase, and reports nothing on a phase that writes none
             - a page-cached read reports ``io_read_chars`` and no ``io_read_bytes``
             - a silent phase running alongside the sampler reports no I/O at all
+            - ``sync=True`` synchronises once on entry and once on exit, and the exit
+              synchronisation happens before the clock is read
+            - ``sync=True`` without a CUDA device records the phase like any other
         """
         if not self.enabled:
             return _NULL_SCOPE
-        return _PhaseScope(self, name, io)
+        return _PhaseScope(self, name, io, sync)
 
     def io_counters(self) -> IoSnapshot:
         """Return this process's cumulative byte counters at the disk and syscall layers.
@@ -458,13 +481,22 @@ class _PhaseScope:
 
     __slots__ = (
         "_cpu0", "_function", "_io", "_io0", "_name", "_profiler", "_self_io0", "_state",
-        "_stats", "_wall0",
+        "_stats", "_sync", "_wall0",
     )
 
-    def __init__(self, profiler: Profiler, name: str, io: bool = False) -> None:
+    def __init__(
+        self,
+        profiler: Profiler,
+        name: str,
+        io: bool = False,
+        sync: bool = False,
+    ) -> None:
         self._profiler = profiler
         self._name = name
         self._io = io
+        # Resolved here rather than read at both ends: a phase that does not synchronise
+        # then costs one `is not None` test instead of two attribute loads and a branch.
+        self._sync = profiler._cuda_sync if sync else None
         self._state: _ThreadState | None = None
         self._stats: PhaseStats | None = None
         self._wall0 = 0
@@ -505,10 +537,16 @@ class _PhaseScope:
         if factory is not None:
             self._function = factory(self._name)
             self._function.__enter__()
+        # Last thing before the clocks: work queued by an earlier phase must not be billed
+        # to this one, and anything between the drain and the timestamp is measured.
+        if self._sync is not None:
+            self._sync()
         self._cpu0 = thread_time_ns() if self._profiler.measure_cpu else 0
         self._wall0 = perf_counter_ns()
 
     def __exit__(self, *exc: object) -> None:
+        if self._sync is not None:
+            self._sync()  # first: the kernels this phase launched are part of its cost
         wall = perf_counter_ns() - self._wall0
         cpu = thread_time_ns() - self._cpu0 if self._profiler.measure_cpu else 0
         function = self._function

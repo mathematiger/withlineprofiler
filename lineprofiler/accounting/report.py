@@ -313,20 +313,51 @@ def _io_sparklines(analysis: SampleAnalysis) -> list[str]:
 
 
 def _gpu_block(analysis: SampleAnalysis) -> str:
-    """Sampled device utilisation and peak CUDA allocator state."""
-    if analysis.gpu_util_mean < 0 and not analysis.peak_cuda_reserved:
+    """Sampled utilisation per device, this run's share of it, and peak allocator state."""
+    if analysis.gpu_util_mean < 0 and not analysis.gpu_devices and not analysis.peak_cuda_reserved:
         return ""
     lines = ["", "GPU", _RULE]
-    if analysis.gpu_util_mean >= 0:
-        lines.append(f"{'Utilisation (sampled)':<28}{analysis.gpu_util_mean:>7.1f}%")
-        lines.append(f"{'Idle (sampled)':<28}{100.0 - analysis.gpu_util_mean:>7.1f}%")
+    lines.extend(_gpu_utilisation_rows(analysis))
     if analysis.peak_cuda_reserved:
         lines.append(f"{'VRAM allocated (peak)':<28}{format_bytes(analysis.peak_cuda_alloc):>14}")
         lines.append(f"{'VRAM reserved (peak)':<28}{format_bytes(analysis.peak_cuda_reserved):>14}")
     lines.append("")
-    lines.append("  (utilisation is whole-device busy time from NVML, not a compute-vs-wait")
-    lines.append("   split. For that, run with backend='torch' and analyse the trace.)")
+    lines.extend(_gpu_footnote(analysis))
     return "\n".join(lines)
+
+
+def _gpu_footnote(analysis: SampleAnalysis) -> list[str]:
+    """Say what the numbers above are, and what they are not."""
+    if analysis.gpu_devices:
+        return [
+            "  (busy is NVML's whole-device percentage — every process's kernels, not",
+            "   just yours; 'this run' is the share NVML attributes to this run's own",
+            "   pids. Neither is a compute-vs-wait split: for that, run with",
+            "   backend='torch' and analyse the trace.)",
+        ]
+    return [
+        "  (utilisation is whole-device busy time from NVML, not a compute-vs-wait",
+        "   split. For that, run with backend='torch' and analyse the trace.)",
+    ]
+
+
+def _gpu_utilisation_rows(analysis: SampleAnalysis) -> list[str]:
+    """One row per device, falling back to a single figure for pre-per-device sample files."""
+    if not analysis.gpu_devices:
+        if analysis.gpu_util_mean < 0:
+            return []
+        return [
+            f"{'Utilisation (sampled)':<28}{analysis.gpu_util_mean:>7.1f}%",
+            f"{'Idle (sampled)':<28}{100.0 - analysis.gpu_util_mean:>7.1f}%",
+        ]
+
+    rows = [f"{'':<28}{'busy':>7}  {'this run':>9}  {'idle':>7}"]
+    for device in analysis.gpu_devices:
+        ours = f"{device.ours_mean:>8.1f}%" if device.ours_mean >= 0 else f"{'n/a':>9}"
+        idle = f"{100.0 - device.busy_mean:>6.1f}%" if device.busy_mean >= 0 else f"{'n/a':>7}"
+        busy = f"{device.busy_mean:>6.1f}%" if device.busy_mean >= 0 else f"{'n/a':>7}"
+        rows.append(f"{f'GPU {device.index}':<28}{busy}  {ours}  {idle}")
+    return rows
 
 
 def _memory_block(analysis: SampleAnalysis) -> str:

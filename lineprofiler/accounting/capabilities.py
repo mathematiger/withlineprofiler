@@ -47,9 +47,12 @@ def torch_module() -> ModuleType | None:
 def nvml_module() -> ModuleType | None:
     """Return an initialised ``pynvml`` if a GPU is visible, else ``None``.
 
-    ``nvidia-ml-py`` reports whole-device utilisation — the share of time any kernel was
-    resident. That is a busy percentage, not a compute-versus-wait split; the split needs
-    kernel-level timing from ``torch.profiler``.
+    ``nvidia-ml-py`` reports two different utilisation numbers, and the sampler reads both.
+    ``nvmlDeviceGetUtilizationRates`` is whole-device: the share of time any kernel from any
+    process was resident, which on a shared node includes work that is not yours.
+    ``nvmlDeviceGetProcessUtilization`` breaks that down per pid, which is what makes "the
+    device is busy" and "*we* are keeping it busy" separable. Neither is a compute-versus-
+    wait split; that needs kernel-level timing from ``torch.profiler``.
     """
     global _nvml
     if _nvml is _UNSET:
@@ -97,6 +100,20 @@ def cuda_is_available() -> bool:
     """Whether torch is installed and reports a usable CUDA device."""
     torch = torch_module()
     return bool(torch and torch.cuda.is_available())
+
+
+def cuda_synchronize() -> Callable[[], None] | None:
+    """Return ``torch.cuda.synchronize``, or ``None`` when there is no CUDA device.
+
+    Handed to ``phase(name, sync=True)``. Returning ``None`` rather than a no-op lambda is
+    what lets the phase hot path skip the call with a single ``is not None`` test on a CPU
+    box, instead of paying for a Python-level call that does nothing.
+    """
+    torch = torch_module()
+    if torch is None or not torch.cuda.is_available():
+        return None
+    synchronize: Callable[[], None] = torch.cuda.synchronize
+    return synchronize
 
 
 def _initialise_nvml() -> ModuleType | None:

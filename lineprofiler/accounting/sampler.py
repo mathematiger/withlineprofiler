@@ -2,8 +2,13 @@
 
 The phase tree answers "where did the time go". This answers "what was the machine doing
 while it went there" — resident memory, bytes read and written, CUDA allocator state and
-whole-device GPU utilisation, each row stamped with the phase that was open when it was
-taken.
+GPU utilisation per visible device, each row stamped with the phase that was open when it
+was taken.
+
+Utilisation is recorded at two levels, because on a shared node they answer different
+questions: the whole-device busy percentage counts every process's kernels, while the
+per-process figure counts only this pid's. A device pinned at 95% that owes 20% of it to
+your run is a queueing problem, not a saturated GPU.
 
 Everything here is optional. Without ``psutil`` there are no memory or I/O rows; without
 torch there are no CUDA rows; without ``nvidia-ml-py`` there is no utilisation. The sampler
@@ -17,8 +22,9 @@ import os
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import ModuleType
 from typing import Any, NamedTuple, Protocol, TextIO, runtime_checkable
 
 from lineprofiler.accounting.capabilities import (
@@ -120,6 +126,8 @@ class Sample:
     cuda_alloc: int = 0
     cuda_reserved: int = 0
     gpu_util: float = -1.0
+    gpu_utils: dict[int, float] = field(default_factory=dict)
+    gpu_proc_utils: dict[int, float] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Sample:
@@ -137,6 +145,8 @@ class Sample:
             cuda_alloc=data.get("cuda_alloc", 0),
             cuda_reserved=data.get("cuda_reserved", 0),
             gpu_util=data.get("gpu_util", -1.0),
+            gpu_utils=_device_map(data.get("gpu_utils")),
+            gpu_proc_utils=_device_map(data.get("gpu_proc_utils")),
         )
 
 
@@ -167,6 +177,9 @@ class ResourceSampler:
         - a synthetic leak shows a positive RSS slope and a non-leaking equivalent does not
         - the thread does not prevent interpreter exit
         - construction succeeds with psutil absent, with torch absent and with NVML absent
+        - every visible device gets its own utilisation entry, and ``gpu_util`` is their mean
+        - only this pid's rows are counted towards the per-process figure
+        - a device whose utilisation call fails is skipped without losing the others
     """
 
     def __init__(self, path: Path, interval_s: float, phase_of: Callable[[], str]) -> None:
@@ -177,6 +190,8 @@ class ResourceSampler:
         self._thread: threading.Thread | None = None
         self._process: ProcessHandle | None = open_process()
         self.capabilities = _detect_capabilities(self._process)
+        self._devices: list[tuple[int, Any]] = _open_devices()
+        self._proc_util_since = 0
 
     def start(self) -> None:
         """Begin sampling in a daemon thread.
@@ -254,16 +269,46 @@ class ResourceSampler:
         sample.cuda_reserved = torch.cuda.memory_reserved()
 
     def _add_gpu_utilisation(self, sample: Sample) -> None:
-        if not self.capabilities.gpu_util:
+        """Read every visible device's busy percentage, and this process's share of it.
+
+        ``gpu_util`` stays the mean across devices so that a single-GPU run reads exactly as
+        it did before this became per-device, and so that sample files written by either
+        version parse under both.
+        """
+        if not self.capabilities.gpu_util or not self._devices:
             return
         nvml = nvml_module()
         if nvml is None:
             return
+        for index, handle in self._devices:
+            busy = _device_utilisation(nvml, handle)
+            if busy >= 0:
+                sample.gpu_utils[index] = busy
+            ours = self._process_utilisation(nvml, handle)
+            if ours >= 0:
+                sample.gpu_proc_utils[index] = ours
+        if sample.gpu_utils:
+            sample.gpu_util = sum(sample.gpu_utils.values()) / len(sample.gpu_utils)
+
+    def _process_utilisation(self, nvml: ModuleType, handle: Any) -> float:  # noqa: ANN401
+        """Mean SM utilisation NVML attributes to *this* pid since the previous sample.
+
+        The timestamp cursor advances so each internal NVML sample is counted once. NVML
+        raises rather than returning an empty list when the window held no samples, which is
+        the ordinary case for an idle process, so the failure path here is not exceptional.
+        """
         try:
-            handle = nvml.nvmlDeviceGetHandleByIndex(0)
-            sample.gpu_util = float(nvml.nvmlDeviceGetUtilizationRates(handle).gpu)
-        except Exception:  # noqa: BLE001 - a transient NVML error must not kill the thread
-            sample.gpu_util = -1.0
+            samples = nvml.nvmlDeviceGetProcessUtilization(handle, self._proc_util_since)
+        except Exception:  # noqa: BLE001 - "no samples in window" is reported as an error
+            return -1.0
+        mine = [s for s in samples if getattr(s, "pid", -1) == os.getpid()]
+        self._proc_util_since = max(
+            (getattr(s, "timeStamp", 0) for s in samples),
+            default=self._proc_util_since,
+        )
+        if not mine:
+            return -1.0
+        return sum(float(s.smUtil) for s in mine) / len(mine)
 
 
 def read_samples(path: Path) -> list[Sample]:
@@ -283,6 +328,45 @@ def read_samples(path: Path) -> list[Sample]:
         except (json.JSONDecodeError, KeyError):
             continue
     return samples
+
+
+def _device_utilisation(nvml: ModuleType, handle: Any) -> float:  # noqa: ANN401
+    """Whole-device busy percentage: any kernel, any process, this device."""
+    try:
+        return float(nvml.nvmlDeviceGetUtilizationRates(handle).gpu)
+    except Exception:  # noqa: BLE001 - a transient NVML error must not kill the thread
+        return -1.0
+
+
+def _open_devices() -> list[tuple[int, Any]]:
+    """Resolve a handle per visible device once, so sampling costs no lookups.
+
+    Indices are NVML's, which are the machine's physical devices — deliberately not torch's
+    logical ones. ``CUDA_VISIBLE_DEVICES`` renumbers what your process can use, but the
+    question this block answers is whether the *device* is busy, including with work from
+    processes that are not yours.
+    """
+    nvml = nvml_module()
+    if nvml is None:
+        return []
+    try:
+        count = int(nvml.nvmlDeviceGetCount())
+    except Exception:  # noqa: BLE001 - no usable device enumeration means no GPU block
+        return []
+    devices: list[tuple[int, Any]] = []
+    for index in range(count):
+        try:
+            devices.append((index, nvml.nvmlDeviceGetHandleByIndex(index)))
+        except Exception:  # noqa: BLE001 - skip a device that cannot be addressed
+            continue
+    return devices
+
+
+def _device_map(raw: object) -> dict[int, float]:
+    """Rebuild a per-device mapping from JSON, whose object keys are always strings."""
+    if not isinstance(raw, dict):
+        return {}
+    return {int(key): float(value) for key, value in raw.items()}
 
 
 def open_process() -> ProcessHandle | None:
@@ -334,4 +418,8 @@ def _compact(sample: Sample) -> dict[str, Any]:
             row[name] = value
     if sample.gpu_util >= 0:
         row["gpu_util"] = sample.gpu_util
+    if sample.gpu_utils:
+        row["gpu_utils"] = sample.gpu_utils
+    if sample.gpu_proc_utils:
+        row["gpu_proc_utils"] = sample.gpu_proc_utils
     return row

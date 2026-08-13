@@ -71,6 +71,22 @@ class MemoryTrend:
 
 
 @dataclass(slots=True)
+class GpuDevice:
+    """One device's utilisation over the run, split by who caused it.
+
+    ``busy_mean`` is NVML's whole-device percentage and therefore includes kernels from
+    processes outside this run. ``ours_mean`` sums the per-process figure across this run's
+    workers, so on an exclusive node the two converge and on a shared one the gap is other
+    tenants. ``ours_mean`` can exceed ``busy_mean`` slightly: the two come from different
+    NVML sampling windows.
+    """
+
+    index: int
+    busy_mean: float = -1.0
+    ours_mean: float = -1.0
+
+
+@dataclass(slots=True)
 class SampleAnalysis:
     """Everything the report derives from one run's resource samples."""
 
@@ -81,6 +97,7 @@ class SampleAnalysis:
     peak_cuda_alloc: int = 0
     peak_cuda_reserved: int = 0
     gpu_util_mean: float = -1.0
+    gpu_devices: list[GpuDevice] = field(default_factory=list)
     read_series: list[float] = field(default_factory=list)
     write_series: list[float] = field(default_factory=list)
 
@@ -155,15 +172,17 @@ def analyse_processes(
         - two processes each writing N bytes report 2N in total, not more
         - bytes land on the phase of the process that wrote them, not an interleaved one
         - one process with samples and one without still produces the first one's totals
+        - two processes on one device sum their own GPU shares but average the device's busy
+          percentage, which they both observed
     """
     analysis = SampleAnalysis()
     intervals: list[_Interval] = []
     trends: list[MemoryTrend] = []
-    all_samples: list[Sample] = []
+    ordered_per_process: list[list[Sample]] = []
 
     for samples in per_process:
         ordered = sorted(samples, key=lambda s: s.t)
-        all_samples.extend(ordered)
+        ordered_per_process.append(ordered)
         if len(ordered) < 2:
             continue
         intervals.extend(_intervals_of(ordered))
@@ -174,7 +193,7 @@ def analyse_processes(
 
     _fill_io_from_intervals(analysis, intervals)
     analysis.memory = _combine_trends(trends)
-    _fill_gpu(analysis, all_samples)
+    _fill_gpu(analysis, ordered_per_process)
     analysis.read_series = _rate_series(intervals, "read", series_width)
     analysis.write_series = _rate_series(intervals, "write", series_width)
     return analysis
@@ -324,12 +343,68 @@ def _trend(samples: list[Sample]) -> MemoryTrend:
     return trend
 
 
-def _fill_gpu(analysis: SampleAnalysis, ordered: list[Sample]) -> None:
-    analysis.peak_cuda_alloc = max((s.cuda_alloc for s in ordered), default=0)
-    analysis.peak_cuda_reserved = max((s.cuda_reserved for s in ordered), default=0)
-    utilisations = [s.gpu_util for s in ordered if s.gpu_util >= 0]
+def _fill_gpu(analysis: SampleAnalysis, per_process: list[list[Sample]]) -> None:
+    pooled = [sample for samples in per_process for sample in samples]
+    analysis.peak_cuda_alloc = max((s.cuda_alloc for s in pooled), default=0)
+    analysis.peak_cuda_reserved = max((s.cuda_reserved for s in pooled), default=0)
+    utilisations = [s.gpu_util for s in pooled if s.gpu_util >= 0]
     if utilisations:
         analysis.gpu_util_mean = sum(utilisations) / len(utilisations)
+    analysis.gpu_devices = _gpu_devices(per_process)
+
+
+def _gpu_devices(per_process: list[list[Sample]]) -> list[GpuDevice]:
+    """Per-device utilisation: the device's own busy share, and this run's share of it.
+
+    The two are combined differently on purpose. Every process observes the same device, so
+    pooling their whole-device readings averages the same quantity and stays a percentage.
+    The per-process readings are disjoint — each is one worker's slice — so they are summed,
+    which is what makes sixteen actors on one device add up to the load they actually place
+    on it.
+    """
+    busy: dict[int, list[float]] = {}
+    shares: dict[int, list[float]] = {}
+    for samples in per_process:
+        for index, value in _process_shares(samples).items():
+            shares.setdefault(index, []).append(value)
+        for sample in samples:
+            for index, value in sample.gpu_utils.items():
+                busy.setdefault(index, []).append(value)
+
+    devices = []
+    for index in sorted(set(busy) | set(shares)):
+        devices.append(
+            GpuDevice(
+                index=index,
+                busy_mean=_mean(busy.get(index, [])),
+                ours_mean=sum(shares[index]) if index in shares else -1.0,
+            ),
+        )
+    return devices
+
+
+def _process_shares(samples: list[Sample]) -> dict[int, float]:
+    """One process's mean SM utilisation per device, over the samples where it was readable.
+
+    A window in which NVML attributed no kernels to this pid means the process did no GPU
+    work then, so it is averaged in as a zero rather than skipped — dividing only by the
+    windows that reported would turn a worker busy one second in ten into a busy worker. A
+    device the process never got a single reading for is left out entirely: that is missing
+    data, not idleness.
+    """
+    totals: dict[int, float] = {}
+    readable: dict[int, int] = {}
+    for sample in samples:
+        for index in sample.gpu_utils:
+            readable[index] = readable.get(index, 0) + 1
+        for index, value in sample.gpu_proc_utils.items():
+            totals[index] = totals.get(index, 0.0) + value
+    return {index: total / max(1, readable.get(index, 0)) for index, total in totals.items()}
+
+
+def _mean(values: list[float]) -> float:
+    """Arithmetic mean, or ``-1.0`` for "never measured" — the convention for utilisation."""
+    return sum(values) / len(values) if values else -1.0
 
 
 def _rate_series(intervals: list[_Interval], attribute: str, width: int) -> list[float]:
