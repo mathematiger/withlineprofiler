@@ -23,6 +23,7 @@ import pytest
 from lineprofiler import accounting
 from lineprofiler.accounting import Profiler, merge_run
 from lineprofiler.accounting.profiler import ENV_ENABLE, ENV_RUN_DIR
+from lineprofiler.accounting.snapshot import new_run_id
 
 START_METHODS = ["spawn", "fork", "forkserver"]
 UNITS_PER_WORKER = 7
@@ -36,11 +37,12 @@ def _context(method: str) -> multiprocessing.context.DefaultContext:
     return context
 
 
-def worker_records_units(run_dir: str, rank: int) -> None:
+def worker_records_units(run_dir: str, rank: int, run_id: str) -> None:
     """A worker doing a known, countable amount of work."""
     profiler = Profiler(
         run_dir=run_dir,
         role="actor",
+        run_id=run_id,
         enabled=True,
         snapshot_interval_s=None,
         sample_interval_s=None,
@@ -52,7 +54,7 @@ def worker_records_units(run_dir: str, rank: int) -> None:
     profiler.close()
 
 
-def worker_from_environment(_run_dir: str, rank: int) -> None:
+def worker_from_environment(_run_dir: str, rank: int, _run_id: str) -> None:
     """A worker configured entirely by the environment its parent exported."""
     profiler = Profiler(role="actor")
     with profiler.phase("inherited"):
@@ -60,7 +62,7 @@ def worker_from_environment(_run_dir: str, rank: int) -> None:
     profiler.close()
 
 
-def worker_uses_the_ambient_profiler(run_dir: str, rank: int) -> None:
+def worker_uses_the_ambient_profiler(run_dir: str, rank: int, run_id: str) -> None:
     """A worker instrumented only through the module-level functions.
 
     Under ``fork`` this is the case that goes wrong silently: the child inherits the parent's
@@ -68,7 +70,7 @@ def worker_uses_the_ambient_profiler(run_dir: str, rank: int) -> None:
     not re-point it at the child's own.
     """
     profiler = Profiler(
-        run_dir=run_dir, role="actor", enabled=True, install=True,
+        run_dir=run_dir, role="actor", run_id=run_id, enabled=True, install=True,
         snapshot_interval_s=None, sample_interval_s=None,
     )
     for _ in range(UNITS_PER_WORKER):
@@ -78,10 +80,10 @@ def worker_uses_the_ambient_profiler(run_dir: str, rank: int) -> None:
     profiler.close()
 
 
-def worker_raises(run_dir: str, rank: int) -> None:
+def worker_raises(run_dir: str, rank: int, run_id: str) -> None:
     """A worker that records some work and then dies with an exception."""
     profiler = Profiler(
-        run_dir=run_dir, role="doomed", enabled=True, snapshot_interval_s=None,
+        run_dir=run_dir, role="doomed", run_id=run_id, enabled=True, snapshot_interval_s=None,
         sample_interval_s=None,
     )
     with profiler.phase("before_crash"):
@@ -90,10 +92,10 @@ def worker_raises(run_dir: str, rank: int) -> None:
     raise RuntimeError("worker failed on purpose")
 
 
-def worker_is_killed(run_dir: str, rank: int) -> None:
+def worker_is_killed(run_dir: str, rank: int, run_id: str) -> None:
     """A worker that never gets to flush: SIGKILL cannot be caught."""
     profiler = Profiler(
-        run_dir=run_dir, role="killed", enabled=True, snapshot_interval_s=None,
+        run_dir=run_dir, role="killed", run_id=run_id, enabled=True, snapshot_interval_s=None,
         sample_interval_s=None,
     )
     with profiler.phase("doomed"):
@@ -105,12 +107,20 @@ def _run_workers(
     method: str,
     run_dir: Path,
     count: int,
-    target: Callable[[str, int], None] = worker_records_units,
+    target: Callable[[str, int, str], None] = worker_records_units,
+    run_id: str | None = None,
 ) -> list[int | None]:
-    """Start ``count`` workers, join them, and return their exit codes."""
+    """Start ``count`` workers sharing one run id, join them, and return their exit codes.
+
+    The run id is minted here (or passed in, to join an attempt already in progress) and
+    handed to every worker explicitly rather than left to environment inheritance, which a
+    ``forkserver`` daemon's frozen environment cannot receive after it has started.
+    """
     context = _context(method)
+    run_id = run_id or new_run_id()
     processes = [
-        context.Process(target=target, args=(str(run_dir), rank)) for rank in range(count)
+        context.Process(target=target, args=(str(run_dir), rank, run_id))
+        for rank in range(count)
     ]
     for process in processes:
         process.start()
@@ -140,8 +150,9 @@ def test_every_worker_is_recorded_exactly_once(method: str, workers: int, tmp_pa
 @pytest.mark.parametrize("method", START_METHODS)
 def test_worker_files_are_unique_even_when_pids_repeat(method: str, tmp_path: Path) -> None:
     """Two waves of workers can reuse pids; the uuid is what keeps their files apart."""
-    _run_workers(method, tmp_path, 4)
-    _run_workers(method, tmp_path, 4)
+    run_id = new_run_id()
+    _run_workers(method, tmp_path, 4, run_id=run_id)
+    _run_workers(method, tmp_path, 4, run_id=run_id)
 
     run = merge_run(tmp_path)
 
@@ -163,7 +174,7 @@ def test_children_never_overwrite_the_parents_file(method: str, tmp_path: Path) 
     parent.snapshot()
     parent_path = parent._writer.path if parent._writer else None  # noqa: SLF001
 
-    _run_workers(method, tmp_path, 4)
+    _run_workers(method, tmp_path, 4, run_id=parent.run_id)
     parent.close()
 
     run = merge_run(tmp_path)
@@ -294,7 +305,9 @@ def test_forkserver_children_need_the_environment_set_before_the_daemon_starts(
     ``run_dir`` to the worker's ``Profiler`` explicitly.
     """
     context = _context("forkserver")
-    warm_up = context.Process(target=worker_records_units, args=(str(tmp_path / "warmup"), 0))
+    warm_up = context.Process(
+        target=worker_records_units, args=(str(tmp_path / "warmup"), 0, new_run_id()),
+    )
     warm_up.start()
     warm_up.join(timeout=60)
 
@@ -325,8 +338,9 @@ def test_forkserver_children_need_the_environment_set_before_the_daemon_starts(
 
 @pytest.mark.parametrize("method", START_METHODS)
 def test_a_worker_that_raises_still_contributes_its_work(method: str, tmp_path: Path) -> None:
-    _run_workers(method, tmp_path, 2)
-    exit_codes = _run_workers(method, tmp_path, 1, target=worker_raises)
+    run_id = new_run_id()
+    _run_workers(method, tmp_path, 2, run_id=run_id)
+    exit_codes = _run_workers(method, tmp_path, 1, target=worker_raises, run_id=run_id)
     assert exit_codes[0] != 0
 
     run = merge_run(tmp_path)
@@ -339,8 +353,9 @@ def test_a_worker_that_raises_still_contributes_its_work(method: str, tmp_path: 
 @pytest.mark.parametrize("method", START_METHODS)
 def test_a_sigkilled_worker_does_not_break_the_merge(method: str, tmp_path: Path) -> None:
     """SIGKILL cannot be caught, so that worker's work is simply absent — not corrupt."""
-    _run_workers(method, tmp_path, 2)
-    exit_codes = _run_workers(method, tmp_path, 1, target=worker_is_killed)
+    run_id = new_run_id()
+    _run_workers(method, tmp_path, 2, run_id=run_id)
+    exit_codes = _run_workers(method, tmp_path, 1, target=worker_is_killed, run_id=run_id)
     assert exit_codes[0] == -signal.SIGKILL
 
     run = merge_run(tmp_path)
@@ -366,10 +381,10 @@ def test_a_truncated_worker_file_is_counted_as_lost(tmp_path: Path) -> None:
 # ── imbalance ───────────────────────────────────────────────────────────────
 
 
-def worker_with_variable_load(run_dir: str, rank: int) -> None:
+def worker_with_variable_load(run_dir: str, rank: int, run_id: str) -> None:
     """Worker ``rank`` sleeps proportionally longer, producing a known imbalance."""
     profiler = Profiler(
-        run_dir=run_dir, role="actor", enabled=True, snapshot_interval_s=None,
+        run_dir=run_dir, role="actor", run_id=run_id, enabled=True, snapshot_interval_s=None,
         sample_interval_s=None,
     )
     with profiler.phase("work"):
@@ -457,7 +472,9 @@ def test_a_forked_child_resolves_its_own_profiler_not_the_parents(tmp_path: Path
     assert writer is not None
     parent_file = writer.path
 
-    _run_workers("fork", tmp_path, 2, target=worker_uses_the_ambient_profiler)
+    _run_workers(
+        "fork", tmp_path, 2, target=worker_uses_the_ambient_profiler, run_id=parent.run_id,
+    )
     parent.close()
     accounting.uninstall_profiler()
 

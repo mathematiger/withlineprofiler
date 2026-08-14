@@ -64,6 +64,17 @@ is what it cost on the way in.
   — for the life of the interpreter. One registration per process now dispatches over weak
   references, and a closed or dropped profiler can actually be collected. This suite alone
   constructs over a hundred.
+- **`close()` no longer leaves `LINEPROFILER_RUN_ID` (and the other propagated variables)
+  in the environment for whoever constructs the next profiler.** `_propagate_to_children`
+  only fills in what was unset; `close()` now removes exactly those keys and nothing a real
+  launcher or an outer profiler had already exported. A process that opens and closes several
+  profilers in turn — a sweep script running one config after another, or this test suite —
+  used to hand the second profiler the first one's run id, which is what let unrelated workers
+  read as one attempt purely by accident. Fixing the leak exposed that nothing had ever
+  actually propagated a shared run id to workers that don't overlap a still-open parent, so
+  `Profiler(run_id=...)` is new: pass it explicitly to correlate several workers into one
+  attempt, which is also the only way to do it under `forkserver`, whose daemon environment is
+  frozen before any later export can reach it.
 
 ### Added — instrumenting without threading an argument
 

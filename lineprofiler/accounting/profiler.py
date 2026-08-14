@@ -196,6 +196,12 @@ class Profiler:
             because in a pipeline where sixteen actors run alongside one learner, a single
             global percentage tells you nothing. Defaults to ``LINEPROFILER_ROLE``, then to
             ``"main"``.
+        run_id: Identifies one attempt, so :func:`merge_run` groups workers from the same
+            attempt and supersedes an earlier one instead of merging both into one inflated
+            total. Defaults to ``LINEPROFILER_RUN_ID``, then to a fresh id. Pass this
+            explicitly when several workers must share an id but cannot receive it through
+            the environment — a ``forkserver`` daemon freezes its environment at start, so
+            variables exported after that never reach children it forks.
         enabled: Master switch. When ``False`` every method is a no-op with no clock reads,
             no allocation and no thread. Defaults to the truthiness of the
             ``LINEPROFILER_PROFILE`` environment variable.
@@ -250,6 +256,7 @@ class Profiler:
         self,
         run_dir: str | Path | None = None,
         role: str | None = None,
+        run_id: str | None = None,
         enabled: bool | None = None,
         snapshot_interval_s: float | None = 30.0,
         sample_interval_s: float | None = 1.0,
@@ -267,7 +274,7 @@ class Profiler:
         self.strict_names: bool = strict_names
         self.thread_names: bool = thread_names
         self.run_dir: Path = _resolve_run_dir(run_dir)
-        self.run_id: str = os.environ.get(ENV_RUN_ID, "") or new_run_id()
+        self.run_id: str = run_id or os.environ.get(ENV_RUN_ID, "") or new_run_id()
         self.role: str = role or os.environ.get(ENV_ROLE, "") or "main"
         self.backend: Backend = Backend.parse(backend)
 

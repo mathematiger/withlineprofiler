@@ -25,16 +25,25 @@ from lineprofiler.accounting.backend import BackendWindow
 from lineprofiler.accounting.cli import main as cli_main
 from lineprofiler.accounting.compare import compare, comparison_as_dict, render_comparison
 from lineprofiler.accounting.sampler import ResourceSampler, Sample, _compact, read_samples
-from lineprofiler.accounting.snapshot import imbalance_of
+from lineprofiler.accounting.snapshot import imbalance_of, new_run_id
 
 # ── roles ───────────────────────────────────────────────────────────────────
 
 
-def _run_worker(run_dir: Path, role: str, phases: dict[str, float]) -> None:
-    """Record one process's worth of phases under a role, then close cleanly."""
+def _run_worker(
+    run_dir: Path, role: str, phases: dict[str, float], run_id: str | None = None,
+) -> None:
+    """Record one process's worth of phases under a role, then close cleanly.
+
+    Each call opens and closes its own ``Profiler``, so nothing here is still open by the
+    time the next call constructs its own — the two mint unrelated run ids unless the
+    caller pins one, in which case they read as one run with several roles rather than two
+    superseding attempts of the same directory.
+    """
     profiler = Profiler(
         run_dir=run_dir,
         role=role,
+        run_id=run_id,
         enabled=True,
         snapshot_interval_s=None,
         sample_interval_s=None,
@@ -46,8 +55,9 @@ def _run_worker(run_dir: Path, role: str, phases: dict[str, float]) -> None:
 
 
 def test_roles_are_reported_separately(tmp_path: Path) -> None:
-    _run_worker(tmp_path, "learner", {"train_step": 0.02})
-    _run_worker(tmp_path, "actor", {"self_play": 0.01})
+    run_id = new_run_id()
+    _run_worker(tmp_path, "learner", {"train_step": 0.02}, run_id=run_id)
+    _run_worker(tmp_path, "actor", {"self_play": 0.01}, run_id=run_id)
 
     run = merge_run(tmp_path)
 
@@ -78,8 +88,9 @@ def test_explicit_role_beats_the_environment(monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_report_shows_a_block_per_role(tmp_path: Path) -> None:
-    _run_worker(tmp_path, "learner", {"train_step": 0.02})
-    _run_worker(tmp_path, "actor", {"self_play": 0.01})
+    run_id = new_run_id()
+    _run_worker(tmp_path, "learner", {"train_step": 0.02}, run_id=run_id)
+    _run_worker(tmp_path, "actor", {"self_play": 0.01}, run_id=run_id)
 
     text = render(merge_run(tmp_path))
 
