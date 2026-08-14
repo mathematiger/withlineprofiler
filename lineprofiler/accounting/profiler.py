@@ -48,7 +48,7 @@ from lineprofiler.accounting.sampler import (
 )
 from lineprofiler.accounting.selfio import bytes_written as selfio_bytes_written
 from lineprofiler.accounting.selfio import reset as selfio_reset
-from lineprofiler.accounting.snapshot import SnapshotWriter
+from lineprofiler.accounting.snapshot import SnapshotWriter, new_run_id
 
 ENV_ENABLE = "LINEPROFILER_PROFILE"
 """Environment variable consulted once, at construction, for the default of ``enabled``."""
@@ -59,8 +59,25 @@ ENV_ROLE = "LINEPROFILER_ROLE"
 ENV_RUN_DIR = "LINEPROFILER_RUN_DIR"
 """Environment variable pointing a child process at the run directory its parent opened."""
 
+ENV_RUN_ID = "LINEPROFILER_RUN_ID"
+"""Environment variable joining a child to its parent's *attempt*, so that a rerun into the
+same directory is a separate run rather than extra workers on the previous one."""
+
 MAX_DEPTH = 32
 """Phases nested deeper than this are folded into their ancestor, bounding the tree size."""
+
+MAX_PHASES = 4096
+"""Distinct phase paths one thread may create before further names fold into their parent.
+
+Bounds memory: each node holds a dense 512-bucket histogram and is re-serialised into every
+snapshot, so an uncapped tree fed from a dynamic name is both a leak and a growing write.
+Well above what any hand-written instrumentation reaches — a tree this wide means names are
+being built from data, which the warning says outright."""
+
+_EXIT_SIGNALS = (signal.SIGTERM, signal.SIGUSR1, signal.SIGHUP)
+"""Signals that mean "this process is ending" on a batch system, in the order they are
+installed. Slurm sends SIGUSR1 ahead of preemption and SIGHUP on a lost allocation; both
+terminate by default without running atexit."""
 
 _ROOT: PhasePath = ()
 
@@ -132,6 +149,7 @@ class Profiler:
         self.enabled: bool = _resolve_enabled(enabled)
         self.measure_cpu: bool = measure_cpu
         self.run_dir: Path = _resolve_run_dir(run_dir)
+        self.run_id: str = os.environ.get(ENV_RUN_ID, "") or new_run_id()
         self.role: str = role or os.environ.get(ENV_ROLE, "") or "main"
         self.backend: Backend = Backend.parse(backend)
 
@@ -143,6 +161,8 @@ class Profiler:
         self._flush_timer: threading.Timer | None = None
         self._snapshot_interval_s = snapshot_interval_s
         self._closed = False
+        self._snapshot_failures = 0
+        self._phase_overflow = 0
         self._window: BackendWindow | None = None
         self._process: ProcessHandle | None = open_process()
         self._sample_interval_s = sample_interval_s
@@ -156,8 +176,8 @@ class Profiler:
             return
 
         _warn_if_already_live(self.run_dir)
-        _propagate_to_children(self.run_dir)
-        self._writer = SnapshotWriter(self.run_dir, role=self.role)
+        _propagate_to_children(self.run_dir, self.run_id)
+        self._writer = SnapshotWriter(self.run_dir, role=self.role, run_id=self.run_id)
         self._start_backend_window(backend_window, window_phase)
         self._start_sampler(sample_interval_s)
         self._install_exit_hooks()
@@ -339,6 +359,21 @@ class Profiler:
 
     # ── internals ───────────────────────────────────────────────────────────
 
+    def _note_phase_overflow(self, path: PhasePath) -> None:
+        """Warn once that the phase tree is full, naming a path that did not fit."""
+        if self._phase_overflow:
+            self._phase_overflow += 1
+            return
+        self._phase_overflow = 1
+        warnings.warn(
+            f"accounting phase tree reached {MAX_PHASES} distinct paths; further phases are "
+            f"folded into their parent. The first that did not fit was {'/'.join(path)!r}. "
+            "This usually means a phase name is built from data — use a fixed name and "
+            "count() for the varying part.",
+            RuntimeWarning,
+            stacklevel=4,
+        )
+
     def _thread_state(self) -> _ThreadState:
         """Return this thread's phase stack, creating and registering it on first use.
 
@@ -410,7 +445,7 @@ class Profiler:
         selfio_reset()
         _live_profilers.clear()
         _live_profilers.append(str(self.run_dir))
-        self._writer = SnapshotWriter(self.run_dir, role=self.role)
+        self._writer = SnapshotWriter(self.run_dir, role=self.role, run_id=self.run_id)
         self._sampler = None
         self._flush_timer = None
         self._start_sampler(self._sample_interval_s)
@@ -434,20 +469,40 @@ class Profiler:
         self._window = BackendWindow(self.backend, window, phase_name, self.run_dir)
 
     def _install_exit_hooks(self) -> None:
-        """Flush at interpreter exit and on SIGTERM, chaining any existing handler."""
+        """Flush at interpreter exit and on every signal a scheduler uses to end a job.
+
+        ``SIGTERM`` alone was not enough on a cluster. Slurm's preemption and time-limit
+        warning is ``SIGUSR1`` (``--signal=USR1@120``, the standard checkpoint-before-eviction
+        idiom) and its default disposition kills the process without running ``atexit``, so
+        everything since the last periodic flush was lost precisely in the runs where you most
+        wanted the numbers. ``SIGHUP`` covers a dropped allocation.
+
+        ``SIGKILL`` remains unreachable by design: the last periodic snapshot is what survives
+        it, which is why the flush cadence matters.
+        """
         atexit.register(self.close)
+        for signum in _EXIT_SIGNALS:
+            self._chain_signal(signum)
+
+    def _chain_signal(self, signum: signal.Signals) -> None:
+        """Install a flushing handler for one signal, preserving whatever was there."""
         try:
-            previous = signal.getsignal(signal.SIGTERM)
+            previous = signal.getsignal(signum)
         except ValueError:  # not on the main thread
             return
 
-        def handler(signum: int, frame: FrameType | None) -> None:
+        def handler(number: int, frame: FrameType | None) -> None:
             self.close()
             if callable(previous):
-                previous(signum, frame)
+                previous(number, frame)
+            elif previous == signal.SIG_DFL:
+                # Restoring the default and re-raising is what makes the process actually die
+                # with the right status; returning from here would swallow the signal.
+                signal.signal(number, signal.SIG_DFL)
+                os.kill(os.getpid(), number)
 
-        with contextlib.suppress(ValueError):
-            signal.signal(signal.SIGTERM, handler)
+        with contextlib.suppress(ValueError, OSError):
+            signal.signal(signum, handler)
 
     def _start_flush_timer(self) -> None:
         """Schedule the next background snapshot, if a cadence was configured."""
@@ -459,8 +514,19 @@ class Profiler:
         timer.start()
 
     def _on_timer(self) -> None:
-        self.snapshot()
-        self._start_flush_timer()
+        """Snapshot, then re-arm — and re-arm even if the snapshot raised.
+
+        The re-arm used to follow the snapshot unguarded, so a single exception ended
+        periodic flushing for the rest of the process. The worker file then froze at whatever
+        it held at that moment, still parsing as a complete result, and the run under-reported
+        by however many hours remained with nothing in the output to say so.
+        """
+        try:
+            self.snapshot()
+        except Exception:  # noqa: BLE001 - a failed flush must not stop the ones after it
+            self._snapshot_failures += 1
+        finally:
+            self._start_flush_timer()
 
 
 class _ThreadState:
@@ -514,9 +580,12 @@ class _PhaseScope:
             path = state.paths[-1] + (self._name,)
             stats = state.tree.get(path)
             if stats is None:
-                stats = PhaseStats()
-                state.tree[path] = stats
-            self._stats = stats
+                stats = self._admit(state, path)
+            if stats is None:
+                self._stats = state.nodes[-1]  # tree is full; fold, exactly as at MAX_DEPTH
+                path = state.paths[-1]
+            else:
+                self._stats = stats
         state.names.append(self._name)
         state.paths.append(path)
         state.nodes.append(self._stats)
@@ -543,6 +612,23 @@ class _PhaseScope:
             self._sync()
         self._cpu0 = thread_time_ns() if self._profiler.measure_cpu else 0
         self._wall0 = perf_counter_ns()
+
+    def _admit(self, state: _ThreadState, path: PhasePath) -> PhaseStats | None:
+        """Create the node for a newly seen path, or ``None`` when the tree is full.
+
+        A phase name built from data — ``phase(f"episode_{i}")``, ``phase(f"load {filename}")``
+        — grows the tree for the life of the process, and every node carries a dense
+        512-bucket histogram that is also rewritten into every snapshot. That was an unbounded
+        memory leak whose only symptom was a process slowly getting fatter, with nothing
+        pointing at the cause. Past the cap, phases fold into their parent and the profiler
+        says so once, naming the path that overflowed.
+        """
+        if len(state.tree) >= MAX_PHASES:
+            self._profiler._note_phase_overflow(path)
+            return None
+        stats = PhaseStats()
+        state.tree[path] = stats
+        return stats
 
     def __exit__(self, *exc: object) -> None:
         if self._sync is not None:
@@ -587,6 +673,10 @@ class _PhaseScope:
     def _record_io(self, stats: PhaseStats) -> None:
         """Attribute the bytes this phase moved, measured at its own boundaries.
 
+        Records nothing at all when either boundary reading failed — a phase with no I/O
+        counters is indistinguishable from one that moved no bytes, and that is the correct
+        answer, where a fabricated delta is not.
+
         The profiler's own writes are deducted at the layer they were measured on: the
         syscall figure from ``write_chars`` and the bracketed block figure from
         ``write_bytes``. Deducting the syscall figure from both would leave most of the
@@ -594,6 +684,11 @@ class _PhaseScope:
         for data, inode and journal — measured at eight times the bytes handed to ``write``.
         """
         now = self._profiler.io_counters()
+        if not (now.available and self._io0.available):
+            # Cumulative counters: differencing against a reading that never happened would
+            # bill this phase for the process's entire lifetime of traffic, in the block the
+            # report presents as exactly measured. Record nothing instead.
+            return
         chars_before, blocks_before = self._self_io0
         chars_after, blocks_after = selfio_bytes_written()
         self._add_delta(stats, "io_read_bytes", now.read_bytes - self._io0.read_bytes)
@@ -648,7 +743,7 @@ def _truthy(value: str) -> bool:
     return bool(value.strip()) and value not in {"0", "false", "False"}
 
 
-def _propagate_to_children(run_dir: Path) -> None:
+def _propagate_to_children(run_dir: Path, run_id: str) -> None:
     """Export the switch and run directory so child processes enable themselves.
 
     A worker started with ``spawn`` inherits the environment but not the parent's objects,
@@ -663,6 +758,7 @@ def _propagate_to_children(run_dir: Path) -> None:
     """
     os.environ.setdefault(ENV_ENABLE, "1")
     os.environ.setdefault(ENV_RUN_DIR, str(run_dir))
+    os.environ.setdefault(ENV_RUN_ID, run_id)
 
 
 def _warn_if_already_live(run_dir: Path) -> None:

@@ -68,13 +68,21 @@ class PhaseStats:
         return clone
 
     def merge(self, other: PhaseStats) -> None:
-        """Add ``other``'s totals into this instance, in place."""
+        """Add ``other``'s totals into this instance, in place.
+
+        ``other`` may be a node another thread is still writing to — snapshots are taken from
+        a background thread while the owning threads keep recording. Iterating its counters
+        directly raised ``RuntimeError: dictionary changed size during iteration`` the moment
+        the owner introduced a new counter name mid-merge, which killed the flush thread.
+        ``list()`` takes the items in one bytecode, so the snapshot sees a coherent set and
+        anything added after it is simply picked up by the next flush.
+        """
         self.calls += other.calls
         self.wall_ns += other.wall_ns
         self.cpu_ns += other.cpu_ns
         self.child_wall_ns += other.child_wall_ns
         self.hist.merge(other.hist)
-        for name, amount in other.counters.items():
+        for name, amount in list(other.counters.items()):
             self.add_count(name, amount)
 
     def to_dict(self) -> dict[str, Any]:

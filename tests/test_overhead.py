@@ -1,0 +1,161 @@
+"""Upper bounds on the phase hot path, so the numbers the README quotes cannot rot silently.
+
+The entire value proposition of the accounting layer is that it is cheap enough to leave on
+for twelve hours. That claim lived only in a hand-copied table, so a ten-fold regression in
+``_PhaseScope`` would have merged unnoticed.
+
+The bounds are deliberately loose — roughly 4x the measured figures — because these run on
+shared CI hardware where a neighbour's build shows up as jitter. They are here to catch an
+order-of-magnitude regression, an accidental syscall or lock on the hot path, not a 10%
+drift. Tightening them until they fail on a busy runner would make the suite a liability.
+"""
+
+from __future__ import annotations
+
+import sys
+import tempfile
+from collections.abc import Callable, Iterator
+from pathlib import Path
+from time import perf_counter_ns
+
+import pytest
+
+from lineprofiler.accounting import Profiler
+from lineprofiler.accounting.capabilities import cuda_synchronize
+
+pytestmark = [
+    pytest.mark.overhead,
+    # Coverage installs a global trace function that instruments every line, inflating these
+    # by an order of magnitude. Timing assertions under it measure the instrumentation.
+    pytest.mark.skipif(
+        sys.gettrace() is not None,
+        reason="a tracer is active (coverage?); hot-path timings are meaningless under one",
+    ),
+]
+
+ITERATIONS = 20_000
+
+# Measured on an Intel Xeon at Python 3.12: 322 / 2286 / 3877 / 347 ns.
+BUDGET_NS = {
+    "disabled": 1_600,
+    "no_cpu": 9_000,
+    "with_cpu": 15_000,
+    "count": 1_600,
+}
+
+
+def _per_call_ns(action: Callable[[], None], iterations: int = ITERATIONS) -> float:
+    """Best of three runs, to take the machine's quietest moment rather than its average."""
+    best = float("inf")
+    for _ in range(3):
+        action()  # warm up
+        start = perf_counter_ns()
+        for _ in range(iterations):
+            action()
+        best = min(best, (perf_counter_ns() - start) / iterations)
+    return best
+
+
+@pytest.fixture
+def run_dir() -> Iterator[Path]:
+    with tempfile.TemporaryDirectory() as directory:
+        yield Path(directory)
+
+
+def test_a_disabled_phase_is_nearly_free(run_dir: Path) -> None:
+    """``enabled=False`` must cost no clock reads and no allocation — it is what lets a
+    codebase leave the calls in permanently."""
+    profiler = Profiler(run_dir=run_dir, enabled=False)
+
+    def action() -> None:
+        with profiler.phase("p"):
+            pass
+
+    assert _per_call_ns(action) < BUDGET_NS["disabled"]
+
+
+def test_a_phase_without_cpu_time_stays_under_budget(run_dir: Path) -> None:
+    profiler = Profiler(
+        run_dir=run_dir, enabled=True, snapshot_interval_s=None,
+        sample_interval_s=None, measure_cpu=False,
+    )
+
+    def action() -> None:
+        with profiler.phase("p"):
+            pass
+
+    try:
+        assert _per_call_ns(action) < BUDGET_NS["no_cpu"]
+    finally:
+        profiler.close()
+
+
+def test_a_phase_with_cpu_time_stays_under_budget(run_dir: Path) -> None:
+    """``measure_cpu`` roughly doubles the cost — ``thread_time_ns`` is a real syscall — and
+    that ratio is the thing worth defending, not the absolute number."""
+    profiler = Profiler(
+        run_dir=run_dir, enabled=True, snapshot_interval_s=None,
+        sample_interval_s=None, measure_cpu=True,
+    )
+
+    def action() -> None:
+        with profiler.phase("p"):
+            pass
+
+    try:
+        assert _per_call_ns(action) < BUDGET_NS["with_cpu"]
+    finally:
+        profiler.close()
+
+
+def test_counting_is_cheaper_than_a_phase(run_dir: Path) -> None:
+    """The documented advice — ``count()`` in inner loops, ``phase()`` around them — is only
+    true while this holds."""
+    profiler = Profiler(
+        run_dir=run_dir, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+
+    def counting() -> None:
+        profiler.count("units", 1)
+
+    def phasing() -> None:
+        with profiler.phase("p"):
+            pass
+
+    try:
+        count_ns = _per_call_ns(counting)
+        phase_ns = _per_call_ns(phasing)
+        assert count_ns < BUDGET_NS["count"]
+        assert count_ns * 2 < phase_ns, (
+            f"count() at {count_ns:.0f}ns is no longer meaningfully cheaper than "
+            f"phase() at {phase_ns:.0f}ns; the README's advice depends on this"
+        )
+    finally:
+        profiler.close()
+
+
+def test_a_synchronising_phase_costs_nothing_without_cuda(run_dir: Path) -> None:
+    """``sync=True`` resolves to ``None`` on a CPU box, so it must not cost a Python call.
+
+    Skipped where CUDA is present, because there the call is real and *should* cost: draining
+    the queue is the entire point. Its correctness is covered in ``test_gpu_hardware.py``.
+    """
+    if cuda_synchronize() is not None:
+        pytest.skip("CUDA present: sync=True does real work here, so it is not free")
+    profiler = Profiler(
+        run_dir=run_dir, enabled=True, snapshot_interval_s=None,
+        sample_interval_s=None, measure_cpu=False,
+    )
+
+    def plain() -> None:
+        with profiler.phase("p"):
+            pass
+
+    def syncing() -> None:
+        with profiler.phase("p", sync=True):
+            pass
+
+    try:
+        assert _per_call_ns(syncing) < _per_call_ns(plain) * 1.5
+    finally:
+        profiler.close()

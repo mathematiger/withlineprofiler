@@ -15,7 +15,8 @@ The two share nothing but the distribution. `accounting` never imports `LineProf
 
 The repo root is `withlineprofiler/` (the parent folder is not a git repo). Run everything from there.
 
-- Install (dev): `poetry install` (creates `.venv` with the `dev` + `test` dependency groups)
+- Install (dev): `poetry install --extras resources` (creates `.venv` with the `dev` + `test` groups; **install psutil or the I/O and memory paths silently degrade to their absent-capability branches and stop being tested**)
+- Install for GPU validation: `poetry install --extras all` plus `torch`. The torch wheels need their CUDA libs on `LD_LIBRARY_PATH`; see the `nvidia/*/lib` trick in CI.
 - Lint: `poetry run ruff check lineprofiler tests` (config in `pyproject.toml`: line-length 100, target py312, rules `E,F,W,I,N,UP,ANN,B,C4,SIM`, ignoring `ANN101/ANN102` for ruff `^0.5`)
 - Type-check: `poetry run mypy lineprofiler tests` (configured `strict = true`, `python_version = 3.12`)
 - Test: `poetry run pytest tests/`
@@ -24,16 +25,21 @@ The repo root is `withlineprofiler/` (the parent folder is not a git repo). Run 
 
 - Benchmark: `poetry run python benchmarks/bench_accounting.py` (the numbers quoted in the README come from here; re-run and update them if the hot path changes)
 - Regenerate report golden files: `LINEPROFILER_UPDATE_GOLDEN=1 poetry run pytest tests/test_accounting_report_golden.py`
+- Coverage: `poetry run pytest tests/ --cov=lineprofiler --cov-report=term-missing`
+- CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs ruff, mypy, pytest on 3.12/3.13, coverage, the overhead job, and a build job that runs the suite from the unpacked sdist.
 
-Tests (162 total, ~10 s):
+Tests (197 total, ~15 s; plus 8 GPU-only in `test_gpu_hardware.py`):
 
 - [tests/test_profiler.py](tests/test_profiler.py) — the line profiler (27). Several tests reach into private state (`_is_in_project_folder`, `_project_cache`, `_source_cache`, `_function_stats`), so renaming those attributes breaks tests.
 - [tests/test_accounting.py](tests/test_accounting.py) — histogram, phase tree, counters, snapshots, merge.
 - [tests/test_accounting_resources.py](tests/test_accounting_resources.py) — roles, sampler, analysis, compare, backends, annotation, per-device GPU utilisation, synchronised phases, and a parametrised settings matrix. The GPU tests drive a `SimpleNamespace` stub of pynvml, so they run without a device.
 - [tests/test_accounting_multiprocess.py](tests/test_accounting_multiprocess.py) — `{spawn, fork, forkserver}` × `{1, 4, 16}` workers, fork safety, failure modes.
 - [tests/test_accounting_report_golden.py](tests/test_accounting_report_golden.py) — byte-for-byte report/compare output, built from fixed numbers so it is deterministic.
+- [tests/test_accounting_resilience.py](tests/test_accounting_resilience.py) — the failures that used to produce *wrong* numbers rather than missing ones: I/O counter gaps, flush-thread death, attempt merging, invalid worker files, multi-node identity, scheduler signals, phase cardinality.
+- [tests/test_overhead.py](tests/test_overhead.py) — loose upper bounds on the hot path so the README's ns/call table cannot rot. Bounds are ~4x measured; they catch order-of-magnitude regressions, not drift.
+- [tests/test_gpu_hardware.py](tests/test_gpu_hardware.py) — needs a real GPU, driver and torch. Skips cleanly without them. This is what validates the pynvml stub's assumptions.
 
-The version number lives in **two** places that must be bumped together: `[project].version` in `pyproject.toml` and `__version__` in [lineprofiler/__init__.py](lineprofiler/__init__.py). Both are currently 0.2.0.
+The version number lives in **two** places that must be bumped together: `[project].version` in `pyproject.toml` and `__version__` in [lineprofiler/__init__.py](lineprofiler/__init__.py). Both are currently 0.3.0. [CHANGELOG.md](CHANGELOG.md) records what changed and why.
 
 Everything targets Python 3.12 — `requires-python`, mypy, ruff and the checked-in `.venv`.
 
@@ -65,6 +71,25 @@ Layered bottom-up; each module imports only from the ones above it in this list.
 - `profiler.py` — the `Profiler` itself. Statistics are **per thread**, merged only at snapshot time, so the hot path takes no locks. `_PhaseScope.__exit__` inlines `record()` and `observe()`, and the annotation guards, because at ~3 µs per phase a Python-level call is measurable.
 - `report.py` / `compare.py` / `cli.py` — rendering. The report groups by role and descends past any single-phase level to find where the work actually branches.
 
+### The wrong-numbers class of bug
+
+This layer's worst failure mode is not crashing — it is continuing, writing a file that parses,
+and reporting a result that looks complete. Four such defects have been fixed and each has a
+regression test; the *pattern* is what to watch for when changing this code:
+
+- **Never let "unmeasured" be represented by a valid value.** `IoSnapshot.available` exists
+  because an all-zero snapshot was indistinguishable from a real reading, and the counters are
+  cumulative, so one failed read fabricated the process's entire lifetime of traffic on one
+  phase. Anything differenced needs the same treatment.
+- **Never let a background thread die silently.** `_on_timer` re-arms in a `finally`;
+  `SnapshotWriter.write` returns `False` rather than raising; the sampler survives a bad row.
+  A frozen worker file is valid JSON and is invisible without the staleness check in
+  `_degraded_rows`.
+- **Never merge two attempts.** Worker files carry a `run_id`; `_split_by_attempt` keeps the
+  newest and reports the rest.
+- **Never let one bad file cost the run.** `_read_worker` guards everything after the JSON
+  parse, not just the parse.
+
 ### Accounting gotchas
 
 - The hot path is the product. Before changing `_PhaseScope`, run the benchmark; a method call costs ~80 ns there.
@@ -72,6 +97,10 @@ Layered bottom-up; each module imports only from the ones above it in this list.
 - The profiler stops its own threads around a `fork` (`os.register_at_fork`) so enabling it never adds fork-deadlock risk, and re-initialises fully in the child so it does not inherit the parent's file or tree.
 - Environment propagation (`LINEPROFILER_PROFILE`, `LINEPROFILER_RUN_DIR`) reaches `spawn` children but **not** `forkserver` children, whose daemon froze its environment at start. There is a test asserting this limitation.
 - `io_*` counters hold bytes, not work units, so `_counter_rows` skips them; they are rendered by `_exact_io_block`.
+- Worker files live at `workers/<host>/w_<run_id>_<pid>_<uuid8>.json`. `merge_run` uses `rglob`; anything reaching into that layout (several tests do) must too.
+- `MAX_PHASES` (4096) bounds distinct paths per thread; past it phases fold into the parent and `_note_phase_overflow` warns once. `MAX_DEPTH` (32) bounds nesting. **Both fold silently in the sense that folded phases record nothing at all** — not their time into the ancestor.
+- `identity.py` is the only place that reads scheduler environment variables. It imports no scheduler library and never will.
+- `selfio._lock` is an `RLock` on purpose — a signal handler runs on the main thread, which may already hold it inside an `io=True` phase boundary.
 - `phase(name, sync=True)` calls `torch.cuda.synchronize` at **both** ends. Exit-only would bill the phase for kernels an earlier phase queued. The callable is resolved once into `Profiler._cuda_sync` and bound at scope construction, so a phase that does not synchronise costs one `is not None` test; `torch.cuda.is_available()` initialises the driver, so it must never be called per phase.
 - A missing NVML/CUDA capability is expressed as `None`, never as a no-op lambda — the hot path skips on identity rather than paying for a call that does nothing.
 - `nvmlDeviceGetProcessUtilization` **raises** when its window held no samples; that is the ordinary idle case, not an error worth logging. The timestamp cursor (`_proc_util_since`) advances so each NVML sample is counted once.

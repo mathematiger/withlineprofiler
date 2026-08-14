@@ -23,6 +23,11 @@ _RULE = "─" * _WIDTH
 _CACHE_NOISE_FLOOR = 64 * 1024
 """Below one readahead window, cached reads are interpreter noise rather than your data."""
 
+_STALE_AFTER_S = 300.0
+"""How far a worker's last snapshot may trail the run's before it is called out. Wide enough
+that an ordinary staggered shutdown stays quiet, tight enough to catch a worker whose flushes
+died hours ago — the failure that used to be invisible."""
+
 
 def render(run: MergedRun) -> str:
     """Return the full text report for a merged run.
@@ -63,15 +68,30 @@ def format_ns(value: float) -> str:
 
 
 def _header(run: MergedRun) -> str:
-    """Runtime, process and worker counts, and what the sampler could measure."""
+    """Runtime, process and worker counts, the nodes involved, and the run's identity."""
     runtime = max((w.written_at - w.started_at for w in run.workers), default=0.0)
     roles = ", ".join(f"{role} x{len(run.workers_of(role))}" for role in run.roles) or "none"
     return (
         f"Runtime {format_ns(runtime * 1e9)}   "
-        f"Processes {len({w.pid for w in run.workers})}   "
+        # One worker file is one process. Counting distinct pids undercounted every
+        # multi-node run: pid namespaces are per-node, so ranks on different nodes collide.
+        f"Processes {len(run.workers)}   "
         f"Roles {roles}\n"
-        f"Host {run.metadata.get('host', '?')}"
+        f"{_hosts_line(run)}"
     )
+
+
+def _hosts_line(run: MergedRun) -> str:
+    """Name the nodes involved, and the attempt, so a report cannot be mistaken for another."""
+    hosts = run.hosts
+    run_id = run.metadata.get("run_id")
+    suffix = f"   Run {run_id}" if run_id else ""
+    if len(hosts) > 4:
+        return f"Hosts {', '.join(hosts[:4])} +{len(hosts) - 4} more ({len(hosts)} nodes){suffix}"
+    if len(hosts) > 1:
+        return f"Hosts {', '.join(hosts)} ({len(hosts)} nodes){suffix}"
+    single = hosts[0] if hosts else str(run.metadata.get("host", "?"))
+    return f"Host {single}{suffix}"
 
 
 def _role_block(run: MergedRun, role: str) -> str:
@@ -240,8 +260,13 @@ def _exact_io_total(stats: PhaseStats) -> int:
 def _io_block(analysis: SampleAnalysis) -> str:
     """Bytes moved, the phases that moved them, and a sparkline of when."""
     totals = analysis.totals
-    if not (totals.read_bytes or totals.write_bytes or totals.read_chars or totals.write_chars):
-        return ""
+    moved = totals.read_bytes or totals.write_bytes or totals.read_chars or totals.write_chars
+    if not moved:
+        # Still render when every interval was discarded: "no I/O measured" and "I/O happened
+        # but we could not read it" are opposite findings, and silence would show the first.
+        return "\n".join(["", "I/O", _RULE, *_io_gap_note(analysis)]) if (
+            analysis.io_gap_intervals
+        ) else ""
 
     lines = ["", "I/O", _RULE]
     lines.append(f"{'Read (from disk)':<28}{format_bytes(totals.read_bytes):>14}"
@@ -296,7 +321,26 @@ def _io_attribution_note(analysis: SampleAnalysis) -> list[str]:
             f"  {reads:.0%} of reads and {writes:.0%} of writes moved while no phase was",
         )
         lines.append("   open — too coarse to attribute. Wrap those regions in io=True.")
+    lines.extend(_io_gap_note(analysis))
     return lines
+
+
+def _io_gap_note(analysis: SampleAnalysis) -> list[str]:
+    """Declare intervals whose bytes were dropped because a counter read failed.
+
+    Printed whenever it happens at all, with no threshold: the totals above become a floor
+    rather than a measurement, and a reader has no other way to learn that.
+    """
+    gaps = analysis.io_gap_intervals
+    if not gaps:
+        return []
+    share = gaps / analysis.io_intervals if analysis.io_intervals else 0.0
+    return [
+        "",
+        f"  ⚠ {gaps} of {analysis.io_intervals} sample intervals ({share:.0%}) could not read",
+        "   the process counters. Their bytes are excluded, so the totals above are a",
+        "   lower bound.",
+    ]
 
 
 def _io_sparklines(analysis: SampleAnalysis) -> list[str]:
@@ -400,12 +444,62 @@ def _backend_block(run: MergedRun) -> str:
 
 
 def _losses_block(run: MergedRun) -> str:
-    """Name any worker whose data could not be read, rather than quietly under-reporting."""
-    if not run.unreadable:
+    """Everything this report is *not* telling you: lost files, stale workers, other attempts.
+
+    Kept as one block at the end, printed only when there is something to say, because a
+    report that under-reports silently is worse than one that reports nothing.
+    """
+    sections = [
+        _unreadable_rows(run),
+        _superseded_rows(run),
+        _degraded_rows(run),
+    ]
+    body = [line for section in sections for line in section]
+    if not body:
         return ""
-    lines = ["", f"LOST: {len(run.unreadable)} worker file(s) unreadable", _RULE]
-    lines.extend(f"  {path.name}" for path in run.unreadable)
-    return "\n".join(lines)
+    return "\n".join(["", "CAVEATS", _RULE, *body])
+
+
+def _unreadable_rows(run: MergedRun) -> list[str]:
+    if not run.unreadable:
+        return []
+    rows = [f"{len(run.unreadable)} worker file(s) unreadable — their work is missing:"]
+    rows.extend(f"  {path.name}" for path in run.unreadable)
+    return rows
+
+
+def _superseded_rows(run: MergedRun) -> list[str]:
+    """Declare workers from an earlier attempt in the same directory, and exclude them."""
+    if not run.superseded:
+        return []
+    attempts = sorted({worker.run_id for worker in run.superseded})
+    return [
+        f"{len(run.superseded)} worker file(s) belong to {len(attempts)} earlier attempt(s)",
+        "  in this directory and are excluded from every total above:",
+        *(f"  {attempt}" for attempt in attempts),
+    ]
+
+
+def _degraded_rows(run: MergedRun) -> list[str]:
+    """Name workers whose own snapshots were failing, and workers that stopped early.
+
+    A worker whose flushes fail keeps a file that parses perfectly and is simply out of date,
+    so staleness has to be derived here rather than trusted from the file itself.
+    """
+    failing = [w for w in run.workers if w.write_failures]
+    latest = max((w.written_at for w in run.workers), default=0.0)
+    stale = [w for w in run.workers if latest - w.written_at > _STALE_AFTER_S]
+    rows: list[str] = []
+    if failing:
+        rows.append(f"{len(failing)} worker(s) reported failed snapshot writes:")
+        rows.extend(f"  {w.label}  {w.write_failures} failure(s)" for w in failing[:8])
+    if stale:
+        rows.append(f"{len(stale)} worker(s) stopped writing well before the run ended:")
+        rows.extend(
+            f"  {w.label}  last wrote {format_ns((latest - w.written_at) * 1e9)} early"
+            for w in stale[:8]
+        )
+    return rows
 
 
 def _label(path: PhasePath) -> str:

@@ -17,6 +17,7 @@ still runs and the rest of the report is unaffected.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import threading
@@ -61,12 +62,19 @@ class IoSnapshot(NamedTuple):
     Keeping both is what makes a page-cached read visible. A training run whose dataset fits
     in RAM moves no disk bytes at all, so ``read_bytes`` alone reports its data loading as
     idle — correctly, and uselessly.
+
+    ``available`` separates "the counters read as zero" from "the counters could not be
+    read". They are not the same fact, and conflating them is dangerous: these values are
+    cumulative, so a failed read that reports zero is differenced against the *next* real
+    reading as though the process had rewound to the start of time, fabricating the whole
+    cumulative total as one interval's traffic.
     """
 
     read_bytes: int = 0
     write_bytes: int = 0
     read_chars: int = 0
     write_chars: int = 0
+    available: bool = True
 
     def is_empty(self) -> bool:
         """Whether every counter is zero, which is how an unsupported platform reports."""
@@ -87,17 +95,19 @@ class ProcessHandle(Protocol):
 
 
 def read_io_snapshot(process: ProcessHandle | None) -> IoSnapshot:
-    """Read both layers of byte counter at once, degrading to zeros when unavailable.
+    """Read both layers of byte counter at once, flagging a failure rather than faking a zero.
 
-    Zeros when psutil is absent or the platform has no per-process counters (macOS), which
-    makes an ``io=True`` phase degrade to an ordinary phase.
+    Returns ``available=False`` when psutil is absent, when the platform has no per-process
+    counters (macOS), or when the read itself failed — which happens transiently on a process
+    the kernel is tearing down. Callers must never difference an unavailable reading; see
+    :class:`IoSnapshot`.
     """
     if process is None:
-        return IoSnapshot()
+        return IoSnapshot(available=False)
     try:
         counters = process.io_counters()
     except Exception:  # noqa: BLE001 - the counter can vanish on a dying process
-        return IoSnapshot()
+        return IoSnapshot(available=False)
     return IoSnapshot(
         read_bytes=counters.read_bytes,
         write_bytes=counters.write_bytes,
@@ -128,6 +138,9 @@ class Sample:
     gpu_util: float = -1.0
     gpu_utils: dict[int, float] = field(default_factory=dict)
     gpu_proc_utils: dict[int, float] = field(default_factory=dict)
+    io_ok: bool = True
+    """Whether the byte counters in this row were actually read. A row with ``False`` carries
+    zeros that mean nothing, and analysis must not difference across it."""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Sample:
@@ -147,6 +160,7 @@ class Sample:
             gpu_util=data.get("gpu_util", -1.0),
             gpu_utils=_device_map(data.get("gpu_utils")),
             gpu_proc_utils=_device_map(data.get("gpu_proc_utils")),
+            io_ok=bool(data.get("io_ok", True)),
         )
 
 
@@ -192,6 +206,7 @@ class ResourceSampler:
         self.capabilities = _detect_capabilities(self._process)
         self._devices: list[tuple[int, Any]] = _open_devices()
         self._proc_util_since = 0
+        self.write_failures = 0
 
     def start(self) -> None:
         """Begin sampling in a daemon thread.
@@ -227,24 +242,41 @@ class ResourceSampler:
         first row is taken after the work has already started reports nothing for that work.
         The baseline row is taken before any interval elapses, and the final row after the
         stop signal, so bytes moved at either end of the run are still counted.
+
+        A row that fails to write is counted and skipped rather than ending the thread. A
+        full or flaky filesystem used to stop sampling permanently and silently, after which
+        every I/O, memory and GPU number came from a truncated series that looked complete.
         """
-        with self.path.open("a", encoding="utf-8") as handle:
+        try:
+            handle = self.path.open("a", encoding="utf-8")
+        except OSError:
+            self.write_failures += 1
+            return
+        try:
             self._write_row(handle)
             while not self._stop.wait(self.interval_s):
                 self._write_row(handle)
             self._write_row(handle)
+        finally:
+            with contextlib.suppress(OSError):
+                handle.close()
 
     def _write_row(self, handle: TextIO) -> None:
         """Append one row, declaring what it cost so no phase is billed for the profiler."""
         line = json.dumps(_compact(self.take())) + "\n"
         before = read_io_snapshot(self._process)
-        handle.write(line)
-        handle.flush()
+        try:
+            handle.write(line)
+            handle.flush()
+        except OSError:
+            self.write_failures += 1
+            return
         after = read_io_snapshot(self._process)
-        record_bytes_written(
-            len(line.encode("utf-8")),
-            max(0, after.write_bytes - before.write_bytes),
-        )
+        if before.available and after.available:
+            record_bytes_written(
+                len(line.encode("utf-8")),
+                max(0, after.write_bytes - before.write_bytes),
+            )
 
     def _add_process_metrics(self, sample: Sample) -> None:
         if self._process is None:
@@ -253,6 +285,9 @@ class ResourceSampler:
             sample.rss = self._process.memory_info().rss
         if self.capabilities.io:
             counters = read_io_snapshot(self._process)
+            sample.io_ok = counters.available
+            if not counters.available:
+                return
             sample.read_bytes = counters.read_bytes
             sample.write_bytes = counters.write_bytes
             sample.read_chars = counters.read_chars
@@ -422,4 +457,6 @@ def _compact(sample: Sample) -> dict[str, Any]:
         row["gpu_utils"] = sample.gpu_utils
     if sample.gpu_proc_utils:
         row["gpu_proc_utils"] = sample.gpu_proc_utils
+    if not sample.io_ok:
+        row["io_ok"] = False
     return row

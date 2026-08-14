@@ -57,6 +57,7 @@ with profiler.phase("checkpoint", io=True):            # exact byte attribution
 
 ```
 lineprofiler report profile/
+lineprofiler report profile/ --no-samples     # phases only; skips the resource blocks
 lineprofiler compare profile_a/ profile_b/ [--json]
 ```
 
@@ -65,6 +66,7 @@ percentage whether or not they are the bottleneck:
 
 ```
 Runtime 4h 12m   Processes 17   Roles actor x16, learner x1
+Hosts node07, node08 (2 nodes)   Run 20260813T2241-471c94
 
 ACTOR  (16 processes, imbalance 1.22)
 ──────────────────────────────────────────────────────────────
@@ -165,7 +167,8 @@ renumbers what torch sees but not what appears here.
 #### Phase timings and asynchronous CUDA
 
 CUDA launches are asynchronous, so by default a phase around a forward pass measures the time
-to *enqueue* its kernels. Their real cost surfaces later, as `wait%` on whichever phase
+to *enqueue* its kernels. Measured on an A100, the same matmul chain reports **0.40 ms**
+unsynchronised against **687 ms** synchronised — a factor of 1,718. Their real cost surfaces later, as `wait%` on whichever phase
 happens to synchronise — usually one that copies a result back and did nothing wrong. When you
 want a phase's wall time to mean GPU time:
 
@@ -186,6 +189,21 @@ sync shows up as wait, a spinning one burns CPU and shows up as none.
 
 Kernel-level attribution is still `backend="torch"`; this only fixes which phase the time
 lands on.
+
+### When a measurement is missing
+
+The layer distinguishes "measured zero" from "could not measure", because conflating them
+produces confident wrong numbers rather than obvious gaps:
+
+- A sample interval whose OS counters could not be read contributes **no** bytes, and the I/O
+  block says how many intervals were dropped. Differencing across such a gap used to bill a
+  phase for the process's whole cumulative traffic — hundreds of gigabytes from one failed
+  `/proc` read.
+- A `phase(io=True)` whose boundary read failed records nothing rather than a fabricated
+  delta.
+- A worker whose snapshots were failing, or that stopped writing well before the run ended, is
+  named under `CAVEATS`. Its file still parses, so staleness is derived at report time.
+- A worker file that cannot be read costs that worker, not the run.
 
 ### Overhead
 
@@ -212,10 +230,30 @@ At around a microsecond per phase, put `phase()` around searches, env steps and 
 steps — not inside an inner simulation loop. Use `count()` there instead; it is five times
 cheaper and gives you the rate anyway.
 
-### Multiple processes
+### Multiple processes, and multiple nodes
 
-Every process writes its own `w_<pid>_<uuid8>.json`; `report` merges them. The uuid matters
-because a restarted worker reuses its rank but not its pid.
+Every process writes its own `workers/<host>/w_<run>_<pid>_<uuid8>.json`; `report` merges
+them. The uuid matters because a restarted worker reuses its rank but not its pid, and the
+per-host directory keeps a large run from concentrating two files per rank — plus a rename
+per flush — into one directory, which is a metadata hot spot on Lustre.
+
+Each worker records the node it ran on and its rank, read from whichever launcher is present
+(`SLURM_PROCID`, `RANK`, `OMPI_COMM_WORLD_RANK`, `PMI_RANK`) along with the batch job id.
+That is what makes *which node is slow?* answerable; the report names the nodes involved and
+counts processes by worker file rather than by pid, which collides across nodes.
+
+**Runs are identified.** A rerun into the same directory is a separate attempt: `report` shows
+the newest and names the superseded ones rather than merging them, which used to inflate every
+total for a requeued job. Children inherit the attempt through `LINEPROFILER_RUN_ID`.
+
+**On preemption**, `SIGUSR1` and `SIGHUP` flush before exit alongside `SIGTERM` — Slurm's
+`--signal=USR1@120` idiom terminates without running `atexit`, so the last interval used to be
+lost exactly when you wanted it. `SIGKILL` remains unreachable; the periodic snapshot is what
+survives it.
+
+**On a large run**, pass `--no-samples`. Resource samples dominate merge memory — a 12-hour
+worker holds roughly 28 MB of them, about 1.8 GB across 64 workers, and the derived intervals
+roughly double the peak. Phase trees for the same run are a few megabytes.
 
 `spawn`, `fork` and `forkserver` are all supported and tested at 1, 4 and 16 workers. A
 worker that raises still contributes everything it recorded before dying; a worker

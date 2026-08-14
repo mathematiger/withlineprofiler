@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  POETRY_VERSION: "2.1.3"
+
+jobs:
+  lint:
+    name: ruff + mypy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install poetry
+        run: pipx install poetry==${{ env.POETRY_VERSION }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: poetry
+      - run: poetry install --with dev,test --extras resources
+      - run: poetry run ruff check lineprofiler tests
+      - run: poetry run mypy lineprofiler tests
+
+  test:
+    name: pytest (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install poetry
+        run: pipx install poetry==${{ env.POETRY_VERSION }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: poetry
+      # psutil is installed on purpose: without it the I/O and memory paths degrade to
+      # their absent-capability branches and the suite silently stops testing them.
+      - run: poetry install --with dev,test --extras resources
+      - run: poetry run pytest tests/ -q
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install poetry
+        run: pipx install poetry==${{ env.POETRY_VERSION }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: poetry
+      - run: poetry install --with dev,test --extras resources
+      - run: poetry run pytest tests/ --cov=lineprofiler --cov-report=term-missing --cov-report=xml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+
+  overhead:
+    name: hot-path overhead
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install poetry
+        run: pipx install poetry==${{ env.POETRY_VERSION }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: poetry
+      - run: poetry install --with dev,test --extras resources
+      # The whole value proposition is a ns/call number; without this a 10x regression in
+      # _PhaseScope would merge unnoticed. Bounds are deliberately loose — a shared runner is
+      # noisy — so this catches order-of-magnitude regressions, not percentages.
+      - run: poetry run pytest tests/test_overhead.py -q
+
+  build:
+    name: build + install the wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install poetry
+        run: pipx install poetry==${{ env.POETRY_VERSION }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: poetry
+      - run: poetry build
+      # A packaged sdist that cannot be tested is a packaging bug for Spack and EasyBuild,
+      # so the sdist ships tests and this proves they run from it.
+      - name: pytest from the sdist
+        run: |
+          mkdir -p /tmp/sdist && tar -xzf dist/*.tar.gz -C /tmp/sdist --strip-components=1
+          cd /tmp/sdist
+          python -m pip install --upgrade pip
+          python -m pip install ".[resources]" pytest
+          python -m pytest tests/ -q

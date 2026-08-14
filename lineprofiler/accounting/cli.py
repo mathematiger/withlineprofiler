@@ -20,7 +20,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command == "report":
-        print(render(merge_run(args.run_dir)))  # noqa: T201
+        print(render(merge_run(args.run_dir, with_samples=not args.no_samples)))  # noqa: T201
     elif args.command == "compare":
         print(_render_compare(args))  # noqa: T201
     return 0
@@ -32,6 +32,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     report = subcommands.add_parser("report", help="merge a run directory and print its report")
     report.add_argument("run_dir", help="directory passed to Profiler(run_dir=...)")
+    report.add_argument(
+        "--no-samples",
+        action="store_true",
+        help=(
+            "skip the resource samples and report phases only. Samples dominate memory: a "
+            "12-hour worker holds ~28 MB of them, so a large run can exhaust a login node. "
+            "Drops the I/O, memory and GPU blocks."
+        ),
+    )
 
     compare = subcommands.add_parser("compare", help="show what changed between two runs")
     compare.add_argument("run_a")

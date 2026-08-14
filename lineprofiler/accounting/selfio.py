@@ -20,7 +20,14 @@ from __future__ import annotations
 
 import threading
 
-_lock = threading.Lock()
+_lock = threading.RLock()
+"""Reentrant on purpose. A signal handler runs on the main thread between bytecodes, and the
+main thread holds this lock at both ends of every ``io=True`` phase. With a plain ``Lock`` a
+``SIGTERM`` arriving inside that window deadlocked the process permanently on the profiler's
+own final flush — which reads as "the run hung on shutdown and lost its last snapshot", a
+symptom nobody would trace back to here. Re-entry can let a handler's write land inside an
+enclosing read; the cost is a few bytes of overhead accounting, against a hang."""
+
 _chars = 0
 _block_bytes = 0
 

@@ -297,9 +297,21 @@ def test_reprofile_after_clear() -> None:
 # Auto-detection of the project folder
 # --------------------------------------------------------------------------- #
 def test_autodetect_project_folder_is_repo_root() -> None:
+    """Autodetection walks up to the repo root, and falls back to a *directory* without one.
+
+    Both halves matter and the environment decides which applies: run from a git checkout the
+    first holds, run from an unpacked sdist (as a downstream packager does) only the second
+    does. Asserting the repo root unconditionally passed for the wrong reason — it happened to
+    be true wherever the suite was usually run — and hid a fallback that returned a file path.
+    """
     profiler = LineProfiler()
-    # The repo root contains the lineprofiler package and a .git directory.
-    assert (profiler._project_folder / "lineprofiler").is_dir()
+    detected = profiler._project_folder
+
+    assert detected.is_dir(), "the fallback must never be a file path"
+    if (Path(THIS_DIR).parent / ".git").exists():
+        assert (detected / "lineprofiler").is_dir()
+    else:
+        assert detected == Path(THIS_DIR).resolve()
 
 
 # --------------------------------------------------------------------------- #
@@ -342,3 +354,72 @@ def test_print_global_top_stats(capsys: pytest.CaptureFixture[str]) -> None:
 def test_print_global_top_stats_empty(capsys: pytest.CaptureFixture[str]) -> None:
     LineProfiler(project_folder=THIS_DIR).print_global_top_stats()
     assert "No profiling data above the threshold." in capsys.readouterr().out
+
+
+# ── defects that used to corrupt the process, not just the numbers ──────────
+
+
+def test_nesting_the_same_profiler_is_refused(tmp_path: Path) -> None:
+    """It used to leave the trace function installed for the lifetime of the process.
+
+    The inner __enter__ saved the profiler's own callback as the tracer to restore, so the
+    outer __exit__ reinstalled it. _enabled was False, so it early-returned on every event —
+    but a global trace function was still dispatched on every Python call, forever.
+    """
+    profiler = LineProfiler(project_folder=THIS_DIR)
+
+    incumbent = sys.gettrace()
+
+    # The nesting is the subject of the test, so it is written out rather than combined.
+    with profiler:  # noqa: SIM117
+        with pytest.raises(RuntimeError, match="already active"), profiler:
+            pass
+
+    assert sys.gettrace() is incumbent, "the profiler leaked its tracer"
+
+
+def test_two_different_profilers_may_nest(tmp_path: Path) -> None:
+    """Only re-entering one instance is unsafe; distinct instances restore each other."""
+    incumbent = sys.gettrace()
+    outer = LineProfiler(project_folder=THIS_DIR)
+    inner = LineProfiler(project_folder=THIS_DIR)
+
+    with outer, inner:
+        add(1, 2)
+
+    assert sys.gettrace() is incumbent
+
+
+def test_the_tracer_is_cleared_after_an_exception(tmp_path: Path) -> None:
+    incumbent = sys.gettrace()
+    profiler = LineProfiler(project_folder=THIS_DIR)
+
+    with pytest.raises(ValueError, match="expected"), profiler:
+        raise ValueError("expected")
+
+    assert sys.gettrace() is incumbent
+    assert profiler._enabled is False
+
+
+def test_repo_root_falls_back_to_a_directory_not_a_file(tmp_path: Path) -> None:
+    """Outside a git checkout the fallback returned the *file*, so relative_to matched only
+    that one module and the profiler silently profiled a single file."""
+    module = tmp_path / "sub" / "mod.py"
+    module.parent.mkdir(parents=True)
+    module.write_text("x = 1", encoding="utf-8")
+    profiler = LineProfiler(project_folder=THIS_DIR)
+
+    root = profiler._find_repo_root(str(module))
+
+    assert root.is_dir()
+    assert root == module.parent
+
+
+def test_repo_root_still_finds_a_git_directory(tmp_path: Path) -> None:
+    module = tmp_path / "pkg" / "mod.py"
+    module.parent.mkdir(parents=True)
+    module.write_text("x = 1", encoding="utf-8")
+    (tmp_path / ".git").mkdir()
+    profiler = LineProfiler(project_folder=THIS_DIR)
+
+    assert profiler._find_repo_root(str(module)) == tmp_path.resolve()

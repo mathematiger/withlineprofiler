@@ -101,7 +101,23 @@ class LineProfiler:
                 self._project_folder = Path.cwd()
 
     def __enter__(self) -> Self:
-        """Enable profiling, registering the trace callback."""
+        """Enable profiling, registering the trace callback.
+
+        Re-entering an instance that is already active is refused rather than allowed to
+        corrupt it. The nested ``__enter__`` used to save *this profiler's own callback* as
+        the tracer to restore, so the outer ``__exit__`` reinstalled the profiler instead of
+        clearing it — leaving a global trace function dispatched on every Python call for the
+        rest of the process, invisibly, since ``_enabled`` was by then ``False``.
+
+        Note that the body of the ``with`` block is not itself profiled: ``sys.settrace``
+        only affects frames created after it is installed, so only functions *called* from
+        the block appear. Put the code you want measured in a function.
+        """
+        if self._enabled:
+            raise RuntimeError(
+                "this LineProfiler is already active; nesting the same instance would leak "
+                "its trace function for the lifetime of the process. Use a second instance.",
+            )
         self._enabled = True
         self._old_trace = sys.gettrace()
         self._last_key = None
@@ -119,6 +135,7 @@ class LineProfiler:
         """Disable profiling and restore the previous trace function."""
         self._enabled = False
         sys.settrace(self._old_trace)
+        self._old_trace = None
 
     def _trace_callback(
         self,
@@ -211,15 +228,21 @@ class LineProfiler:
         return lines
 
     def _find_repo_root(self, start_path: str) -> Path:
-        """Return the git repo root (directory containing .git)."""
+        """Return the git repo root (directory containing .git), else the caller's directory.
+
+        The fallback returns the *directory*, not the file. Returning the file path meant
+        ``relative_to`` matched only that one module, so outside a git checkout — a
+        pip-installed application, an sdist, a container built without ``.git`` — the
+        profiler silently narrowed to the single file that had constructed it, and reported
+        nothing about the rest of the project.
+        """
         p = Path(start_path).resolve()
 
         for parent in [p, *p.parents]:
             if (parent / ".git").exists():
                 return parent
 
-        # No git repo found → fallback to start_path
-        return p
+        return p.parent if p.is_file() else p
 
     def _is_in_project_folder(self, filename: str) -> bool:
         """Return whether ``filename`` lives inside the project folder (cached)."""

@@ -100,6 +100,10 @@ class SampleAnalysis:
     gpu_devices: list[GpuDevice] = field(default_factory=list)
     read_series: list[float] = field(default_factory=list)
     write_series: list[float] = field(default_factory=list)
+    io_gap_intervals: int = 0
+    """Intervals whose bytes were discarded because a counter read failed at one end. Any
+    non-zero value means the I/O totals below are a floor, not a measurement."""
+    io_intervals: int = 0
 
     @property
     def has_samples(self) -> bool:
@@ -143,6 +147,7 @@ class _Interval:
     write: int
     read_chars: int
     write_chars: int
+    measured: bool = True
 
 
 def analyse(samples: list[Sample], series_width: int = 48) -> SampleAnalysis:
@@ -230,9 +235,16 @@ def _intervals_of(ordered: list[Sample]) -> list[_Interval]:
 
     Writes the profiler itself performed between the two rows are deducted, so its own
     sample and snapshot files never appear as the workload's I/O.
+
+    An interval touching a row whose counters could not be read carries no bytes. The
+    counters are cumulative, so differencing against a failed read would charge the process's
+    entire lifetime traffic to one interval — hundreds of gigabytes materialising on whatever
+    phase happened to be open. Losing one interval's bytes is the honest failure; the count
+    of intervals dropped this way is reported so the loss is visible rather than assumed.
     """
     intervals = []
     for previous, current in zip(ordered, ordered[1:], strict=False):
+        measured = previous.io_ok and current.io_ok
         blocks = max(0, current.self_write_bytes - previous.self_write_bytes)
         chars = max(0, current.self_write_chars - previous.self_write_chars)
         intervals.append(
@@ -240,10 +252,19 @@ def _intervals_of(ordered: list[Sample]) -> list[_Interval]:
                 start=previous.t,
                 seconds=max(0.0, current.t - previous.t),
                 phase=previous.phase or NO_PHASE,
-                read=max(0, current.read_bytes - previous.read_bytes),
-                write=max(0, current.write_bytes - previous.write_bytes - blocks),
-                read_chars=max(0, current.read_chars - previous.read_chars),
-                write_chars=max(0, current.write_chars - previous.write_chars - chars),
+                read=max(0, current.read_bytes - previous.read_bytes) if measured else 0,
+                write=(
+                    max(0, current.write_bytes - previous.write_bytes - blocks)
+                    if measured
+                    else 0
+                ),
+                read_chars=max(0, current.read_chars - previous.read_chars) if measured else 0,
+                write_chars=(
+                    max(0, current.write_chars - previous.write_chars - chars)
+                    if measured
+                    else 0
+                ),
+                measured=measured,
             ),
         )
     return intervals
@@ -251,6 +272,8 @@ def _intervals_of(ordered: list[Sample]) -> list[_Interval]:
 
 def _fill_io_from_intervals(analysis: SampleAnalysis, intervals: list[_Interval]) -> None:
     """Sum intervals into run totals and per-phase totals."""
+    analysis.io_intervals = len(intervals)
+    analysis.io_gap_intervals = sum(1 for interval in intervals if not interval.measured)
     for interval in intervals:
         analysis.totals.read_bytes += interval.read
         analysis.totals.write_bytes += interval.write

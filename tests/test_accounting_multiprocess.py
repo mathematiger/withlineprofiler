@@ -333,7 +333,7 @@ def test_a_sigkilled_worker_does_not_break_the_merge(method: str, tmp_path: Path
 def test_a_truncated_worker_file_is_counted_as_lost(tmp_path: Path) -> None:
     """A half-written file is reported explicitly rather than silently under-counting."""
     _run_workers("spawn", tmp_path, 2)
-    victim = sorted((tmp_path / "workers").glob("w_*.json"))[0]
+    victim = sorted((tmp_path / "workers").rglob("w_*.json"))[0]
     victim.write_text(victim.read_text(encoding="utf-8")[:40], encoding="utf-8")
 
     run = merge_run(tmp_path)

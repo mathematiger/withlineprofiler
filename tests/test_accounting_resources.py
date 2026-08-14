@@ -734,7 +734,7 @@ def _write_samples(run_dir: Path, samples: list[Sample]) -> None:
     Goes through the sampler's own compaction, so the report is fed exactly the JSON a real
     run would have produced rather than a hand-written approximation of it.
     """
-    worker = next(iter((run_dir / "workers").glob("w_*.json")))
+    worker = next(iter((run_dir / "workers").rglob("w_*.json")))
     rows = "\n".join(json.dumps(_compact(sample)) for sample in samples)
     worker.with_suffix(".samples").write_text(rows + "\n", encoding="utf-8")
 
