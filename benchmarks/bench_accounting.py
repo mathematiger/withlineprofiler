@@ -12,6 +12,7 @@ from __future__ import annotations
 import tempfile
 import time
 
+from lineprofiler import accounting
 from lineprofiler.accounting import Profiler
 
 ITERATIONS = 200_000
@@ -62,6 +63,14 @@ def main() -> None:
         def count_only() -> None:
             with_cpu.count("units")
 
+        def phase_sampled() -> None:
+            with with_cpu.phase("sampled", sample=0.01):
+                pass
+
+        def phase_ambient_uninstalled() -> None:
+            with accounting.phase("p"):
+                pass
+
         print(f"\n=== accounting overhead ({ITERATIONS:,} iterations) ===")  # noqa: T201
         baseline = measure("baseline: empty function call", empty)
         measure("phase(), enabled=False", phase_disabled)
@@ -70,6 +79,9 @@ def main() -> None:
         # Two /proc reads per end, so this runs at a fraction of the iteration count.
         measure("phase(io=True)", phase_with_io, iterations=ITERATIONS // 20)
         measure("count()", count_only)
+        measure("phase(sample=0.01), skipped entry", phase_sampled)
+        accounting.uninstall_profiler()
+        measure("accounting.phase(), nothing installed", phase_ambient_uninstalled)
         print(f"\n(baseline call overhead of {baseline:.0f} ns is included in every row)")  # noqa: T201
 
         for profiler in (with_cpu, no_cpu):

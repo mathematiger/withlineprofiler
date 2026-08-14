@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import shutil
 import signal
 import time
 from collections.abc import Callable
@@ -19,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from lineprofiler import accounting
 from lineprofiler.accounting import Profiler, merge_run
 from lineprofiler.accounting.profiler import ENV_ENABLE, ENV_RUN_DIR
 
@@ -55,6 +57,24 @@ def worker_from_environment(_run_dir: str, rank: int) -> None:
     profiler = Profiler(role="actor")
     with profiler.phase("inherited"):
         profiler.count("units", 1)
+    profiler.close()
+
+
+def worker_uses_the_ambient_profiler(run_dir: str, rank: int) -> None:
+    """A worker instrumented only through the module-level functions.
+
+    Under ``fork`` this is the case that goes wrong silently: the child inherits the parent's
+    installed profiler, and would write into the parent's worker file if the fork handlers did
+    not re-point it at the child's own.
+    """
+    profiler = Profiler(
+        run_dir=run_dir, role="actor", enabled=True, install=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    for _ in range(UNITS_PER_WORKER):
+        with accounting.phase("iteration"), accounting.phase("step"):
+            accounting.count("units", 1)
+    assert accounting.installed_profiler() is profiler
     profiler.close()
 
 
@@ -402,3 +422,156 @@ def _profiler_threads() -> list[str]:
     import threading
 
     return [t.name for t in threading.enumerate() if t.name.startswith("lineprofiler")]
+
+
+# ── the ambient profiler across start methods ───────────────────────────────
+
+
+@pytest.mark.parametrize("method", START_METHODS)
+def test_ambient_phases_are_recorded_by_every_worker(method: str, tmp_path: Path) -> None:
+    """Each child must record onto its *own* profiler, whatever the start method."""
+    exit_codes = _run_workers(
+        method, tmp_path, 4, target=worker_uses_the_ambient_profiler,
+    )
+    assert exit_codes == [0, 0, 0, 0]
+
+    run = merge_run(tmp_path)
+
+    assert len(run.workers) == 4
+    assert run.tree[("iteration", "step")].counters == {"units": 4 * UNITS_PER_WORKER}
+
+
+def test_a_forked_child_resolves_its_own_profiler_not_the_parents(tmp_path: Path) -> None:
+    """A fork copies the module global along with everything else, so the installed profiler
+    in the child is the child's re-initialised copy. If that ever stops holding, the child
+    writes into the parent's worker file and both runs are wrong."""
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("fork is unavailable on this platform")
+    parent = Profiler(
+        run_dir=tmp_path, role="learner", enabled=True, install=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    with accounting.phase("parent_only"):
+        accounting.count("units", 1)
+    writer = parent._writer  # noqa: SLF001
+    assert writer is not None
+    parent_file = writer.path
+
+    _run_workers("fork", tmp_path, 2, target=worker_uses_the_ambient_profiler)
+    parent.close()
+    accounting.uninstall_profiler()
+
+    run = merge_run(tmp_path)
+    assert len(run.workers) == 3, "the parent and both children each wrote their own file"
+    assert run.tree[("parent_only",)].counters == {"units": 1}, "recorded exactly once"
+    assert run.tree[("iteration", "step")].counters == {"units": 2 * UNITS_PER_WORKER}
+    assert sum(w.path == parent_file for w in run.workers) == 1
+
+
+# ── a closed profiler must not come back in a forked child ──────────────────
+
+
+@pytest.mark.skipif(
+    "fork" not in multiprocessing.get_all_start_methods(), reason="fork unavailable",
+)
+def test_a_fork_after_close_does_not_resurrect_the_profiler(tmp_path: Path) -> None:
+    """``os.register_at_fork`` callbacks cannot be unregistered, so a closed profiler was still
+    called in every later child — and set ``_closed`` back to ``False``, giving the child a live
+    writer, a sampler and a flush timer for a profiler the process had finished with. The new
+    writer even re-created the run directory, so a test that deleted it got it back.
+    """
+    run_dir = tmp_path / "run"
+    profiler = Profiler(
+        run_dir=run_dir, role="parent", enabled=True,
+        snapshot_interval_s=0.05, sample_interval_s=0.05,
+    )
+    profiler.close()
+    shutil.rmtree(run_dir)
+
+    read_fd, write_fd = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:  # pragma: no cover - runs only in the forked child
+        os.close(read_fd)
+        time.sleep(0.3)  # long enough for a resurrected flush timer to fire twice
+        report = f"{profiler._closed}|{_profiler_threads()}"  # noqa: SLF001
+        os.write(write_fd, report.encode())
+        os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    child_says = os.read(read_fd, 4096).decode()
+    os.close(read_fd)
+    os.waitpid(child_pid, 0)
+
+    assert child_says == "True|[]", f"child resurrected the profiler: {child_says}"
+    assert not run_dir.exists(), "the child re-created the run directory it was finished with"
+
+
+@pytest.mark.skipif(
+    "fork" not in multiprocessing.get_all_start_methods(), reason="fork unavailable",
+)
+def test_a_fork_after_close_does_not_resurrect_the_ambient_profiler(tmp_path: Path) -> None:
+    """``close()`` uninstalls, but the fork callback never re-installed — so a resurrected
+    profiler wrote files that module-level ``accounting.phase()`` could not see. The two halves
+    of the ambient API disagreed about whether a profiler existed.
+    """
+    profiler = Profiler(
+        run_dir=tmp_path / "run", enabled=True, install=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    profiler.close()
+    assert accounting.installed_profiler() is None
+
+    read_fd, write_fd = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:  # pragma: no cover - runs only in the forked child
+        os.close(read_fd)
+        with accounting.phase("after_close"):
+            pass
+        report = f"{accounting.installed_profiler()}|{profiler._closed}"  # noqa: SLF001
+        os.write(write_fd, report.encode())
+        os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    child_says = os.read(read_fd, 4096).decode()
+    os.close(read_fd)
+    os.waitpid(child_pid, 0)
+
+    assert child_says == "None|True", f"ambient state diverged in the child: {child_says}"
+
+
+@pytest.mark.skipif(
+    "fork" not in multiprocessing.get_all_start_methods(), reason="fork unavailable",
+)
+def test_a_live_profiler_still_reinitialises_in_a_forked_child(tmp_path: Path) -> None:
+    """The guard above must not cost the ordinary case: an *open* profiler still gives its
+    child a fresh identity, and the child's ambient lookup still resolves to it."""
+    profiler = Profiler(
+        run_dir=tmp_path / "run", enabled=True, install=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    try:
+        read_fd, write_fd = os.pipe()
+        child_pid = os.fork()
+        if child_pid == 0:  # pragma: no cover - runs only in the forked child
+            os.close(read_fd)
+            resolved = accounting.installed_profiler() is profiler
+            with accounting.phase("child_work"):
+                pass
+            profiler.close()
+            os.write(write_fd, str(resolved).encode())
+            os.close(write_fd)
+            os._exit(0)
+
+        os.close(write_fd)
+        child_says = os.read(read_fd, 4096).decode()
+        os.close(read_fd)
+        os.waitpid(child_pid, 0)
+
+        assert child_says == "True"
+    finally:
+        profiler.close()
+
+    tree = merge_run(tmp_path / "run").tree
+    assert ("child_work",) in tree, "the forked child of a live profiler wrote nothing"

@@ -39,6 +39,13 @@ class PhaseStats:
     child_wall_ns: int = 0
     hist: DurationHistogram = field(default_factory=DurationHistogram)
     counters: dict[str, int] = field(default_factory=dict)
+    sample_stride: int = 0
+    """``0`` when every entry was measured; ``n`` when one entry in ``n`` was, and the totals
+    above are scaled estimates rather than measurements.
+
+    Kept as a field rather than inferred, because an estimate that cannot be told apart from a
+    measurement is precisely the failure this layer exists to avoid. Merging takes the largest
+    stride: one sampled contributor makes the merged node an estimate too."""
 
     @property
     def self_ns(self) -> int:
@@ -47,7 +54,14 @@ class PhaseStats:
 
     @property
     def wait_ns(self) -> int:
-        """Wall time during which the thread was not executing on a CPU."""
+        """Wall time during which the thread was not executing on a CPU.
+
+        **Pairs with ``wall_ns``, never with ``self_ns``.** Wait spans the whole phase,
+        including the time spent inside children, whereas ``self_ns`` excludes it — so
+        ``wait_ns / self_ns`` exceeds 100% for any parent that waits inside a child, which is
+        the ordinary case for a phase wrapping a blocking call. The share the report prints
+        is ``wait_ns / wall_ns``.
+        """
         return max(0, self.wall_ns - self.cpu_ns)
 
     def record(self, wall_ns: int, cpu_ns: int) -> None:
@@ -82,8 +96,32 @@ class PhaseStats:
         self.cpu_ns += other.cpu_ns
         self.child_wall_ns += other.child_wall_ns
         self.hist.merge(other.hist)
+        # Any sampled contributor taints the total: presenting a partly-estimated sum as
+        # measured is the wrong-number failure, so the coarsest stride wins.
+        self.sample_stride = max(self.sample_stride, other.sample_stride)
         for name, amount in list(other.counters.items()):
             self.add_count(name, amount)
+
+    def difference(self, baseline: PhaseStats) -> PhaseStats:
+        """Return the work recorded since ``baseline`` was taken.
+
+        Every field is clamped at zero. A cumulative counter cannot legitimately go backwards,
+        so a negative difference means the baseline came from a merge this one did not include
+        — reporting it as negative work would be worse than reporting none.
+        """
+        result = PhaseStats(
+            calls=max(0, self.calls - baseline.calls),
+            wall_ns=max(0, self.wall_ns - baseline.wall_ns),
+            cpu_ns=max(0, self.cpu_ns - baseline.cpu_ns),
+            child_wall_ns=max(0, self.child_wall_ns - baseline.child_wall_ns),
+            sample_stride=self.sample_stride,
+        )
+        result.hist = self.hist.difference(baseline.hist)
+        for name, amount in list(self.counters.items()):
+            delta = amount - baseline.counters.get(name, 0)
+            if delta > 0:
+                result.counters[name] = delta
+        return result
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable view of this node."""
@@ -94,11 +132,16 @@ class PhaseStats:
             "child_wall_ns": self.child_wall_ns,
             "hist": self.hist.to_sparse(),
             "counters": self.counters,
+            "sample_stride": self.sample_stride,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PhaseStats:
-        """Rebuild a node from :meth:`to_dict` output."""
+        """Rebuild a node from :meth:`to_dict` output.
+
+        ``sample_stride`` defaults to ``0`` so a worker file written before sampling existed
+        reads back as fully measured, which it was.
+        """
         return cls(
             calls=data["calls"],
             wall_ns=data["wall_ns"],
@@ -106,6 +149,7 @@ class PhaseStats:
             child_wall_ns=data["child_wall_ns"],
             hist=DurationHistogram.from_sparse(data["hist"]),
             counters=dict(data["counters"]),
+            sample_stride=data.get("sample_stride", 0),
         )
 
 

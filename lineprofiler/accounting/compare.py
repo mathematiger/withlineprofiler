@@ -11,8 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from lineprofiler.accounting.phase import PhaseStats
-from lineprofiler.accounting.report import format_ns
+from lineprofiler.accounting.phasetree import PhaseStats
+from lineprofiler.accounting.report import format_label, format_ns
 from lineprofiler.accounting.snapshot import MergedRun, merge_run
 
 THIN_EVIDENCE = 30
@@ -161,7 +161,7 @@ def _comparison_notes(deltas: list[PhaseDelta]) -> list[str]:
         notes.append("      change is in the tail rather than a shift of the whole phase:")
         for delta in tails[:4]:
             notes.append(
-                f"      {delta.phase[-24:]:<24}"
+                f"      {format_label(delta.phase, 23):<24}"
                 f"mean {delta.ratio:.2f}x   median {delta.p50_ratio:.2f}x",
             )
     return notes
@@ -198,7 +198,7 @@ def compare_dirs(dir_a: str, dir_b: str) -> str:
 
 
 def _delta_row(delta: PhaseDelta) -> str:
-    name = delta.phase[-27:]
+    name = format_label(delta.phase, 27)
     if delta.only_in == "A":
         return (
             f"{name:<28}{format_ns(delta.per_call_a):>12}{'—':>12}"

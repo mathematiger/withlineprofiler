@@ -95,6 +95,27 @@ class DurationHistogram:
                 buckets[index] += value
         self.count += other.count
 
+    def difference(self, baseline: DurationHistogram) -> DurationHistogram:
+        """Return the counts accumulated since ``baseline`` was taken.
+
+        Bucket-wise subtraction, which is exactly what makes quantiles derivable for an
+        interval rather than only for the run so far: these are counts, so the difference of
+        two cumulative histograms is the histogram of what happened in between.
+
+        Clamped at zero per bucket. A baseline can legitimately exceed the current value when
+        it was taken from a merge that included a thread which has since been folded, and a
+        negative count would corrupt every quantile derived from it.
+        """
+        result = DurationHistogram()
+        total = 0
+        for index, value in enumerate(self.buckets):
+            delta = value - baseline.buckets[index]
+            if delta > 0:
+                result.buckets[index] = delta
+                total += delta
+        result.count = total
+        return result
+
     def quantile(self, q: float) -> float:
         """Return the estimated ``q``-quantile in nanoseconds (``q`` in [0, 1]).
 

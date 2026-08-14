@@ -17,9 +17,17 @@ from lineprofiler.accounting.analysis import SampleAnalysis, analyse
 from lineprofiler.accounting.backend import Backend
 from lineprofiler.accounting.compare import PhaseDelta, compare, render_comparison
 from lineprofiler.accounting.histogram import DurationHistogram
-from lineprofiler.accounting.phase import PhaseStats, PhaseTree, merge_trees
-from lineprofiler.accounting.profiler import Profiler
-from lineprofiler.accounting.report import render
+from lineprofiler.accounting.phasetree import PhaseStats, PhaseTree, merge_trees
+from lineprofiler.accounting.profiler import (
+    Profiler,
+    count,
+    current,
+    install_profiler,
+    installed_profiler,
+    phase,
+    uninstall_profiler,
+)
+from lineprofiler.accounting.report import render, report_as_dict
 from lineprofiler.accounting.sampler import ResourceSampler, Sample
 from lineprofiler.accounting.snapshot import MergedRun, WorkerSnapshot, merge_run
 
@@ -37,8 +45,15 @@ __all__ = [
     "WorkerSnapshot",
     "analyse",
     "compare",
+    "count",
+    "current",
+    "install_profiler",
+    "installed_profiler",
     "merge_run",
     "merge_trees",
+    "phase",
     "render",
     "render_comparison",
+    "report_as_dict",
+    "uninstall_profiler",
 ]

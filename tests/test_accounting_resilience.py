@@ -7,6 +7,7 @@ each assertion checks not only that the number is right, but that the loss is de
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import signal
@@ -15,15 +16,29 @@ import sys
 import threading
 import time
 import warnings
+import weakref
 from pathlib import Path
 
 import pytest
 
 from lineprofiler.accounting import Profiler, merge_run, render
-from lineprofiler.accounting.analysis import analyse
+from lineprofiler.accounting.analysis import NO_PHASE, analyse
+from lineprofiler.accounting.compare import PhaseDelta, _comparison_notes, _delta_row
 from lineprofiler.accounting.identity import hostname
-from lineprofiler.accounting.phase import PhaseStats, PhaseTree
-from lineprofiler.accounting.profiler import MAX_PHASES
+from lineprofiler.accounting.phasetree import PhaseStats, PhaseTree
+from lineprofiler.accounting.profiler import (
+    _NAME_SHAPE_WARN,
+    ENV_RUN_DIR,
+    MAX_PHASES,
+    _resolve_run_dir,
+)
+from lineprofiler.accounting.report import (
+    _counter_rows,
+    _io_attribution_note,
+    _io_phase_rows,
+    _label,
+    format_label,
+)
 from lineprofiler.accounting.sampler import IoSnapshot, Sample, read_io_snapshot
 from lineprofiler.accounting.snapshot import SnapshotWriter, new_run_id
 
@@ -501,3 +516,595 @@ def test_the_merge_reads_every_shard(tmp_path: Path) -> None:
 
     assert run.tree[("act",)].calls == 4
     assert run.hosts == ["node01", "node02"]
+
+
+# ── a share must not divide one counter layer by the other ──────────────────
+
+
+def _mixed_layer_series() -> list[Sample]:
+    """Cache-only reads while no phase is open, then a disk read inside one.
+
+    Reproduces the reviewer's run: 110.3 MB served from page cache with no phase open, over
+    816.0 KB that reached the device. Both figures are correct and both are printed correctly
+    in the rows above the note; only the share mixed them.
+    """
+    return [
+        Sample(t=0.0, phase="", rss=1_000, read_bytes=0, read_chars=0),
+        Sample(t=1.0, phase="train", rss=1_000, read_bytes=0, read_chars=110_300_000),
+        Sample(t=2.0, phase="train", rss=1_000, read_bytes=816_000, read_chars=111_116_000),
+    ]
+
+
+def test_unattributed_share_never_exceeds_one() -> None:
+    """The defect: the two ``or`` fallbacks resolved independently, so page-cache chars were
+    divided by disk bytes and the report printed ``13845% of reads``."""
+    analysis = analyse(_mixed_layer_series())
+
+    assert analysis.totals.read_bytes == 816_000, "the block layer is unchanged"
+    assert analysis.io_by_phase[NO_PHASE].read_chars == 110_300_000
+    assert analysis.io_by_phase[NO_PHASE].read_bytes == 0, "none of it reached the device"
+    assert 0.0 <= analysis.unattributed_read_share <= 1.0
+    assert analysis.unattributed_read_share == pytest.approx(110_300_000 / 111_116_000)
+
+
+def test_unattributed_share_falls_back_to_the_block_layer_together() -> None:
+    """Without a syscall layer both operands drop to bytes — never one of each."""
+    samples = [
+        Sample(t=0.0, phase="", rss=1_000, read_bytes=0),
+        Sample(t=1.0, phase="train", rss=1_000, read_bytes=4_000),
+        Sample(t=2.0, phase="train", rss=1_000, read_bytes=10_000),
+    ]
+
+    analysis = analyse(samples)
+
+    assert analysis.unattributed_read_share == pytest.approx(4_000 / 10_000)
+
+
+def test_the_report_names_the_layer_its_share_is_measured_in() -> None:
+    """A bare percentage over two layers is unreadable; the note has to say which one."""
+    note = "\n".join(_io_attribution_note(analyse(_mixed_layer_series())))
+
+    assert "syscall layer" in note
+    assert "13845%" not in note
+
+
+# ── a truncated phase label must not read as a real phase ───────────────────
+
+
+def test_a_long_phase_label_is_marked_and_keeps_its_leaf() -> None:
+    """The defect: ``phase[-26:]`` printed ``train_step/forward_backward`` as
+    ``rain_step/forward_backward`` — a name the reader can neither find nor grep."""
+    samples = [
+        Sample(t=0.0, phase="train_step/forward_backward", rss=1_000, read_bytes=0),
+        Sample(t=1.0, phase="train_step/forward_backward", rss=1_000, read_bytes=1_300_000),
+        Sample(t=2.0, phase="train_step/forward_backward", rss=1_000, read_bytes=1_300_000),
+    ]
+
+    row = _io_phase_rows(analyse(samples))[1]
+
+    assert row.startswith("  …in_step/forward_backward"), "truncation is marked, tail kept"
+    assert "rain_step" not in row, "an unmarked cut invents a phase that does not exist"
+    assert row[27] == " ", "the label can never abut the column beside it"
+    assert row[28] == "r"
+
+
+def test_a_label_short_enough_to_fit_is_left_alone() -> None:
+    assert format_label("train_step", 25) == "train_step"
+    assert format_label("x" * 25, 25) == "x" * 25
+
+
+def test_label_truncation_keeps_the_leaf_not_the_head() -> None:
+    """``_label`` used to cut with ``[:27]``, discarding the end that identifies the phase."""
+    label = _label(("optimisation_step", "forward_backward"))
+
+    assert label.endswith("forward_backward"), "the leaf survives"
+    assert label.startswith("…")
+    assert len(label) <= 27
+
+
+def test_the_comparison_table_marks_a_truncated_phase_too() -> None:
+    """The same defect lived in ``compare.py``, where ``[-27:]`` turned
+    ``iteration/checkpoint_to_object_store`` into ``/checkpoint_to_object_store`` — a label
+    that reads as a top-level phase whose name begins with a slash."""
+    delta = PhaseDelta(
+        phase="iteration/checkpoint_to_object_store",
+        calls_a=2, calls_b=2, per_call_a=1_000, per_call_b=1_000,
+        p50_a=1_000, p50_b=1_000,
+    )
+
+    row = _delta_row(delta)
+
+    assert row.startswith("…"), "truncation is marked"
+    assert not row.startswith("/"), "an unmarked cut invents a top-level phase"
+    assert row[27] == " ", "the label can never abut the column beside it"
+
+
+def test_the_comparison_tail_note_marks_a_truncated_phase_too() -> None:
+    """The tail-change note used ``[-24:]`` in a 24-wide field: unmarked, and no column gap."""
+    delta = PhaseDelta(
+        phase="iteration/checkpoint_to_object_store",
+        calls_a=40, calls_b=40, per_call_a=1_000, per_call_b=2_000,
+        p50_a=1_000, p50_b=1_000,
+    )
+    assert delta.tail_moved, "the fixture must reach the tail note at all"
+
+    note = "\n".join(_comparison_notes([delta]))
+
+    assert "…kpoint_to_object_store mean" in note, "marked, and the column gap survives"
+
+
+# ── one run must not scatter across per-worker working directories ──────────
+
+
+def test_a_relative_run_dir_is_resolved_before_it_is_propagated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The defect: ``Path("profile")`` was exported verbatim through LINEPROFILER_RUN_DIR, so
+    a child with its own working directory wrote its worker file somewhere else entirely.
+    One run merged as several short ones, each missing most of its workers."""
+    monkeypatch.delenv("SLURM_SUBMIT_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    resolved = _resolve_run_dir("profile")
+
+    assert resolved.is_absolute()
+    assert resolved == tmp_path / "profile"
+
+
+def test_a_relative_run_dir_ignores_the_submit_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``$SLURM_SUBMIT_DIR`` is whatever launched the job, not where the user works.
+
+    Under Open OnDemand it is the dashboard's own installation directory — observed as
+    ``/var/www/ood/apps/sys/dashboard`` — which is typically not writable. Resolving a
+    relative ``run_dir`` there would relocate the user's output somewhere less predictable
+    than the working directory they typed it against.
+    """
+    monkeypatch.setenv("SLURM_SUBMIT_DIR", "/var/www/ood/apps/sys/dashboard")
+    monkeypatch.chdir(tmp_path)
+
+    assert _resolve_run_dir("profile") == tmp_path / "profile"
+
+
+def test_an_absolute_run_dir_is_left_alone(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    assert _resolve_run_dir(tmp_path) == tmp_path
+
+
+def test_a_child_in_another_directory_joins_the_same_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What the resolution is actually for: two processes, two working directories, one run."""
+    monkeypatch.delenv("SLURM_SUBMIT_DIR", raising=False)
+    monkeypatch.delenv(ENV_RUN_DIR, raising=False)
+    parent_cwd, child_cwd = tmp_path / "rank0", tmp_path / "rank1"
+    parent_cwd.mkdir()
+    child_cwd.mkdir()
+
+    monkeypatch.chdir(parent_cwd)
+    parent = Profiler(
+        run_dir="profile", role="learner", enabled=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    monkeypatch.chdir(child_cwd)
+    child = Profiler(
+        role="actor", enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+
+    assert child.run_dir == parent.run_dir == parent_cwd / "profile"
+    parent.close()
+    child.close()
+
+
+def test_a_fast_counter_does_not_collide_with_its_rate() -> None:
+    """The defect: ``{rate:>12,.1f}`` exactly fills its field at eight figures, so the count
+    ran straight into it and ``64`` at ``19,161,676.6/s`` printed as ``6419,161,676.6/s``."""
+    row = _counter_rows({"samples": 64}, wall_ns=3_340)[0]
+
+    assert "6419,161,676.6" not in row
+    assert "64 " in row, "the count is separated from the rate by a literal space"
+    assert "/s " in row, "and the rate from the per-each figure"
+
+
+def test_a_counter_number_is_never_truncated_to_fit() -> None:
+    """Truncating a number prints a wrong one. An overflowing field pushes the row right."""
+    row = _counter_rows({"steps": 12_345_678_901}, wall_ns=1_000_000_000)[0]
+
+    assert "12,345,678,901" in row
+
+
+# ── a phase name built from data must not degrade the report silently ───────
+
+
+def test_strict_names_rejects_a_name_built_from_data(tmp_path: Path) -> None:
+    """``count()`` raises on a float; a generated phase name was the more damaging mistake
+    and had no equivalent protection — it degrades the report rather than raising."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, strict_names=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    try:
+        with profiler.phase("episode_1"):
+            pass
+        with pytest.raises(ValueError, match="built from data"), profiler.phase("episode_2"):
+            pass
+    finally:
+        profiler.close()
+
+
+def test_strict_names_allows_a_fixed_vocabulary_containing_digits(tmp_path: Path) -> None:
+    """One name in isolation says nothing: ``conv2d`` and ``resnet50`` are good names.
+    What gives a generated name away is repetition of a *shape*."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, strict_names=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    try:
+        for name in ("conv2d", "resnet50", "fp16_cast", "train_step"):
+            with profiler.phase(name):
+                pass
+    finally:
+        profiler.close()
+
+    assert set(merge_run(tmp_path).tree) >= {("conv2d",), ("resnet50",), ("fp16_cast",)}
+
+
+def test_generated_names_warn_before_the_tree_folds(tmp_path: Path) -> None:
+    """The warning has to arrive while the report is still readable — MAX_PHASES is far too
+    late, because by then the run is already unusable."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            for index in range(_NAME_SHAPE_WARN + 40):
+                with profiler.phase(f"episode_{index}"):
+                    pass
+    finally:
+        profiler.close()
+
+    messages = [str(w.message) for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert len(messages) == 1, "warned once, not once per name"
+    assert "episode_#" in messages[0]
+    assert _NAME_SHAPE_WARN < MAX_PHASES, "the warning must precede the fold"
+
+
+def test_a_fixed_vocabulary_never_warns(tmp_path: Path) -> None:
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            for _ in range(500):
+                with profiler.phase("train_step"), profiler.phase("forward"):
+                    pass
+    finally:
+        profiler.close()
+
+    assert [w for w in caught if issubclass(w.category, RuntimeWarning)] == []
+
+
+# ── a sampled phase must never read as a measured one ───────────────────────
+
+
+def test_a_sampled_phase_estimates_the_unsampled_total(tmp_path: Path) -> None:
+    """The estimate has to be right, or the option is worthless."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    try:
+        for _ in range(1_000):
+            with profiler.phase("sampled", sample=0.01):
+                pass
+            with profiler.phase("measured"):
+                pass
+    finally:
+        profiler.close()
+
+    tree = profiler.merged_tree()
+    assert tree[("sampled",)].calls == 1_000, "10 measured entries scaled by a stride of 100"
+    assert tree[("measured",)].calls == 1_000
+    assert tree[("sampled",)].hist.count == 1_000
+
+
+def test_a_sampled_phase_is_marked_as_an_estimate(tmp_path: Path) -> None:
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    try:
+        for _ in range(200):
+            with profiler.phase("sampled", sample=0.01):
+                pass
+            with profiler.phase("measured"):
+                pass
+    finally:
+        profiler.close()
+
+    tree = profiler.merged_tree()
+    assert tree[("sampled",)].sample_stride == 100
+    assert tree[("measured",)].sample_stride == 0, "measurement must stay distinguishable"
+
+
+def test_merging_a_sampled_node_into_a_measured_one_marks_the_result() -> None:
+    """Otherwise a merged total presents partly-estimated numbers as measured."""
+    measured = PhaseStats(calls=10, wall_ns=1_000)
+    sampled = PhaseStats(calls=100, wall_ns=10_000, sample_stride=100)
+
+    measured.merge(sampled)
+
+    assert measured.sample_stride == 100
+
+
+def test_nothing_under_a_skipped_sampled_entry_is_recorded(tmp_path: Path) -> None:
+    """The subtle one. If children kept recording at full rate under a parent measured at one
+    in n, the tree would mix two rates and every share derived from it would be wrong — a
+    plausible wrong number rather than an obvious one."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    try:
+        for _ in range(100):
+            with profiler.phase("outer", sample=0.1), profiler.phase("inner"):
+                profiler.count("units", 1)
+    finally:
+        profiler.close()
+
+    tree = profiler.merged_tree()
+    assert tree[("outer",)].calls == 100
+    assert tree[("outer", "inner")].calls == 100, (
+        "the child must be scaled with its parent, not counted at full rate"
+    )
+    assert tree[("outer", "inner")].counters == {"units": 100}
+    assert tree[("outer", "inner")].sample_stride == 10, "the child is an estimate too"
+
+
+def test_counters_outside_a_selected_entry_are_not_recorded(tmp_path: Path) -> None:
+    """count() inside a skipped entry must be dropped, not attributed to the ancestor."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    try:
+        with profiler.phase("root"):
+            for _ in range(100):
+                with profiler.phase("sampled", sample=0.1):
+                    profiler.count("units", 1)
+    finally:
+        profiler.close()
+
+    tree = profiler.merged_tree()
+    assert tree[("root", "sampled")].counters == {"units": 100}
+    assert "units" not in tree[("root",)].counters, "a skipped body must not bill its parent"
+
+
+def test_the_report_marks_and_explains_a_sampled_row(tmp_path: Path) -> None:
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    try:
+        for _ in range(200):
+            with profiler.phase("uct_search", sample=0.01):
+                time.sleep(0.0001)
+    finally:
+        profiler.close()
+
+    text = render(merge_run(tmp_path))
+
+    assert "~uct_search" in text
+    assert "estimated from a sample, not measured" in text
+    assert "1 entry in 100" in text
+
+
+def test_an_unsampled_run_says_nothing_about_sampling(tmp_path: Path) -> None:
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    try:
+        with profiler.phase("train_step"):
+            time.sleep(0.001)
+    finally:
+        profiler.close()
+
+    text = render(merge_run(tmp_path))
+
+    assert "estimated from a sample" not in text
+    assert "~" not in text
+
+
+def test_an_impossible_sample_rate_raises(tmp_path: Path) -> None:
+    """``sample=0`` means "measure nothing" — a mistake worth hearing about immediately."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    try:
+        for bad in (0.0, -0.5, 1.5):
+            with pytest.raises(ValueError, match="sample must be in"):
+                profiler.phase("x", sample=bad)
+    finally:
+        profiler.close()
+
+
+def test_sample_stride_survives_the_snapshot_round_trip(tmp_path: Path) -> None:
+    """An estimate that reads back as a measurement is the failure being prevented."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    try:
+        for _ in range(200):
+            with profiler.phase("sampled", sample=0.01):
+                pass
+    finally:
+        profiler.close()
+
+    assert merge_run(tmp_path).tree[("sampled",)].sample_stride == 100
+
+
+def test_a_worker_file_without_sample_stride_reads_as_measured(tmp_path: Path) -> None:
+    """0.3.0 worker files predate the field, and everything in them really was measured."""
+    stats = PhaseStats.from_dict({
+        "calls": 4, "wall_ns": 40, "cpu_ns": 20, "child_wall_ns": 0,
+        "hist": {"8": 4}, "counters": {},
+    })
+
+    assert stats.sample_stride == 0
+
+
+# ── an enabled profiler must not outlive itself ─────────────────────────────
+#
+# close() used to stop the threads and write the final snapshot but leave every process-global
+# hook it installed in place: the atexit registration, the three scheduler signal handlers, and
+# the os.register_at_fork callbacks. A process that merely constructed and closed a profiler was
+# permanently altered, and the damage surfaced far from the cause — in the reported case, two
+# in-process profiler tests left the interpreter unable to terminate its own forked children,
+# and the failures appeared in an unrelated file several hundred tests away.
+
+
+@pytest.mark.parametrize("signame", ["SIGTERM", "SIGUSR1", "SIGHUP"])
+def test_close_restores_the_signal_handler_it_replaced(tmp_path: Path, signame: str) -> None:
+    """A closed profiler must leave the process's signal dispositions as it found them."""
+    signum = getattr(signal, signame)
+    before = signal.getsignal(signum)
+
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    assert signal.getsignal(signum) is not before, "the profiler did not chain the signal"
+    profiler.close()
+
+    assert signal.getsignal(signum) is before
+
+
+def test_close_does_not_clobber_a_handler_installed_after_the_profiler(tmp_path: Path) -> None:
+    """The profiler is no longer top of the chain, so restoring would delete the host's handler.
+
+    Leaving ours installed is the safe side of the trade: it still chains correctly to whatever
+    was there, it is merely no longer removable.
+    """
+    original = signal.getsignal(signal.SIGUSR1)
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+
+    def host_handler(number: int, frame: object) -> None:  # pragma: no cover - never raised
+        pass
+
+    signal.signal(signal.SIGUSR1, host_handler)
+    try:
+        profiler.close()
+        assert signal.getsignal(signal.SIGUSR1) is host_handler
+    finally:
+        signal.signal(signal.SIGUSR1, original)
+
+
+def test_closing_twice_restores_once_and_does_not_raise(tmp_path: Path) -> None:
+    """Idempotence matters: close() is reachable from atexit, a signal and an explicit call."""
+    before = signal.getsignal(signal.SIGTERM)
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    profiler.close()
+    profiler.close()
+
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+def test_a_closed_profiler_can_be_garbage_collected(tmp_path: Path) -> None:
+    """The fork callbacks used to be three bound methods per profiler, and
+    ``os.register_at_fork`` has no counterpart that unregisters — so every enabled profiler
+    was immortal, holding its phase trees, thread states and writer for the life of the
+    interpreter. A suite that constructs one per test paid for all of them at once.
+    """
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    ref = weakref.ref(profiler)
+    profiler.close()
+    del profiler
+    gc.collect()
+
+    assert ref() is None
+
+
+def test_close_unregisters_the_atexit_hook(tmp_path: Path) -> None:
+    """Asserted through reachability rather than ``atexit._ncallbacks()``, which does not
+    shrink on unregister and so cannot tell a removed callback from a retained one."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    ref = weakref.ref(profiler)
+    profiler.close()
+    del profiler
+    gc.collect()
+
+    # atexit holds the bound method strongly; if it were still registered the object would live.
+    assert ref() is None
+
+
+def test_closing_out_of_order_still_leaves_the_process_as_it_was(tmp_path: Path) -> None:
+    """Handlers chain, so the profiler currently installed is the last one constructed — but
+    closing order need not match construction order, and a parent closed before the child it
+    made is ordinary code. The parent is no longer on top, so it cannot simply restore; it
+    hands its predecessor to the child instead. Without that splice the parent's handler stayed
+    in the process for good, which is how this suite leaked one per test.
+    """
+    before = signal.getsignal(signal.SIGTERM)
+    parent = Profiler(
+        run_dir=tmp_path, role="learner", enabled=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    child = Profiler(
+        run_dir=tmp_path, role="actor", enabled=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+
+    parent.close()
+    assert signal.getsignal(signal.SIGTERM) is not before, "the child is still live"
+    child.close()
+
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+def test_a_signal_still_flushes_while_an_out_of_order_close_is_pending(
+    tmp_path: Path,
+) -> None:
+    """The splice rewrites a restore target, not a live handler, so the chain must still run
+    end to end while the closed profiler is technically still installed.
+
+    A sentinel is installed at the bottom of the chain first, both to prove the chain reaches
+    all the way down and because the real bottom is ``SIG_DFL``, which would kill the test
+    process rather than return.
+    """
+    original = signal.getsignal(signal.SIGUSR1)
+    reached: list[str] = []
+
+    def sentinel(number: int, frame: object) -> None:
+        reached.append("bottom")
+
+    signal.signal(signal.SIGUSR1, sentinel)
+    try:
+        parent = Profiler(
+            run_dir=tmp_path / "p", enabled=True,
+            snapshot_interval_s=None, sample_interval_s=None,
+        )
+        child = Profiler(
+            run_dir=tmp_path / "c", enabled=True,
+            snapshot_interval_s=None, sample_interval_s=None,
+        )
+        with child.phase("work"):
+            pass
+        parent.close()
+
+        handler = signal.getsignal(signal.SIGUSR1)
+        assert callable(handler)
+        handler(int(signal.SIGUSR1), None)  # walk the chain without raising a real signal
+
+        assert reached == ["bottom"], "the chain did not reach the handler underneath"
+        assert merge_run(tmp_path / "c").tree[("work",)].calls == 1
+
+        child.close()
+        assert signal.getsignal(signal.SIGUSR1) is sentinel
+    finally:
+        signal.signal(signal.SIGUSR1, original)

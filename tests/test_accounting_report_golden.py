@@ -102,7 +102,9 @@ def _build_fixed_run(run_dir: Path) -> None:
         {
             "iteration": _phase(10, 500.0, 480.0, 495.0),
             "iteration/train_step": _phase(10, 400.0, 390.0, 0.0, {"train_samples": 1280}),
-            "iteration/checkpoint": _phase(
+            # Deliberately longer than either label column, so the golden pins the
+            # truncation. An unmarked cut used to print a phase name that does not exist.
+            "iteration/checkpoint_to_object_store": _phase(
                 2, 95.0, 10.0, 0.0, {"io_write_bytes": 41_943_040},
             ),
         },

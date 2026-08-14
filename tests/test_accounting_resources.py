@@ -444,6 +444,35 @@ def test_cli_report_and_compare(tmp_path: Path, capsys: pytest.CaptureFixture[st
     assert json.loads(capsys.readouterr().out)["phases"]
 
 
+def test_cli_report_json_is_a_usable_assertion_target(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``compare`` had ``--json`` and ``report`` did not, so the CLI could not gate CI or
+    diff sweep arms without re-implementing every derivation in the caller."""
+    _run_worker(tmp_path, "main", {"step": 0.01})
+
+    assert cli_main(["report", str(tmp_path), "--json"]) == 0
+    document = json.loads(capsys.readouterr().out)
+
+    assert document["run"]["roles"] == ["main"]
+    assert document["run"]["processes"] == 1
+    phases = {row["phase"]: row for row in document["roles"][0]["phases"]}
+    assert phases["step"]["calls"] == 1
+    assert phases["step"]["wall_ns"] > 0
+    assert document["caveats"] == {"unreadable": [], "superseded": [], "stale": []}
+
+
+def test_cli_report_json_honours_no_samples(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Omitted rather than zeroed: a caller must not read "no samples read" as "no I/O"."""
+    _run_worker(tmp_path, "main", {"step": 0.01})
+
+    assert cli_main(["report", str(tmp_path), "--json", "--no-samples"]) == 0
+
+    assert "resources" not in json.loads(capsys.readouterr().out)
+
+
 # ── exact per-phase I/O ─────────────────────────────────────────────────────
 
 
@@ -936,3 +965,44 @@ def test_sync_is_ignored_when_the_profiler_is_disabled(tmp_path: Path) -> None:
     assert profiler._cuda_sync is None  # noqa: SLF001
     with profiler.phase("train", sync=True):
         pass
+
+
+# ── the pattern the README documents under "Using it in tests" ──────────────
+
+
+def test_a_merged_run_is_a_usable_assertion_target(tmp_path: Path) -> None:
+    """Pins the README's "Using it in tests" example, so the section cannot rot.
+
+    The point of the section is that a merged run records cross-process behaviour that no
+    other artifact does — a role that never started, a phase that never ran, a worker that
+    died before its first flush.
+    """
+    profiler = Profiler(
+        run_dir=tmp_path, role="evaluator", enabled=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    with profiler.phase("iteration"), profiler.phase("mcts"):
+        profiler.count("simulations", 64)
+    profiler.close()
+
+    run = merge_run(tmp_path, with_samples=False)
+
+    assert "evaluator" in run.roles
+    assert run.tree[("iteration", "mcts")].calls == 1
+    assert run.tree[("iteration", "mcts")].counters == {"simulations": 64}
+    assert run.unreadable == []
+    latest = max(w.written_at for w in run.workers)
+    assert all(latest - w.written_at < 300 for w in run.workers)
+
+
+def test_a_role_that_never_started_is_visibly_absent(tmp_path: Path) -> None:
+    """The evaluator incident: the supervisor logged it as alive, and it did no work."""
+    profiler = Profiler(
+        run_dir=tmp_path, role="learner", enabled=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    with profiler.phase("train_step"):
+        pass
+    profiler.close()
+
+    assert "evaluator" not in merge_run(tmp_path, with_samples=False).roles

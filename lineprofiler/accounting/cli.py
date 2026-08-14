@@ -1,6 +1,6 @@
 """Command-line entry point.
 
-    lineprofiler report <run_dir>
+    lineprofiler report <run_dir> [--no-samples] [--json]
     lineprofiler compare <run_a> <run_b> [--json]
 """
 
@@ -11,7 +11,7 @@ import json
 import sys
 
 from lineprofiler.accounting.compare import comparison_as_dict, render_comparison
-from lineprofiler.accounting.report import render
+from lineprofiler.accounting.report import render, report_as_dict
 from lineprofiler.accounting.snapshot import merge_run
 
 
@@ -20,7 +20,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command == "report":
-        print(render(merge_run(args.run_dir, with_samples=not args.no_samples)))  # noqa: T201
+        print(_render_report(args))  # noqa: T201
     elif args.command == "compare":
         print(_render_compare(args))  # noqa: T201
     return 0
@@ -42,11 +42,27 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    report.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "emit JSON instead of a table, so a run can gate CI or be diffed across sweep "
+            "arms without re-deriving the shares and quantiles"
+        ),
+    )
+
     compare = subcommands.add_parser("compare", help="show what changed between two runs")
     compare.add_argument("run_a")
     compare.add_argument("run_b")
     compare.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     return parser
+
+
+def _render_report(args: argparse.Namespace) -> str:
+    run = merge_run(args.run_dir, with_samples=not args.no_samples)
+    if args.json:
+        return json.dumps(report_as_dict(run), indent=2)
+    return render(run)
 
 
 def _render_compare(args: argparse.Namespace) -> str:

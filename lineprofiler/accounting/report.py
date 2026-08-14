@@ -8,14 +8,16 @@ dominate a global pie chart, whether or not self-play is the bottleneck.
 
 from __future__ import annotations
 
+from typing import Any
+
 from lineprofiler.accounting.analysis import (
     SampleAnalysis,
     analyse_processes,
     format_bytes,
     sparkline,
 )
-from lineprofiler.accounting.phase import PhasePath, PhaseStats, PhaseTree
-from lineprofiler.accounting.snapshot import MergedRun, imbalance_of
+from lineprofiler.accounting.phasetree import PhasePath, PhaseStats, PhaseTree
+from lineprofiler.accounting.snapshot import MergedRun, WorkerSnapshot, imbalance_of
 
 _WIDTH = 62
 _RULE = "─" * _WIDTH
@@ -51,6 +53,117 @@ def render(run: MergedRun) -> str:
     return "\n".join(block for block in blocks if block)
 
 
+def report_as_dict(run: MergedRun) -> dict[str, Any]:
+    """Return the same run as JSON-serialisable data, for asserting on rather than reading.
+
+    A merged run is a machine-readable record of what actually executed — which roles
+    started, which phases ran, how much work each did — so it makes a usable assertion target
+    in a test or a CI gate. The text report answers that question for a human; this answers it
+    for a script, without a caller having to re-derive the quantiles and shares itself.
+
+    ``caveats`` is deliberately part of the document rather than a log line: a run that lost a
+    worker, or merged a stale one, must not read as a complete result to a program either.
+
+    Test specifically:
+        - every phase in the text report appears here with the same numbers
+        - a run read with ``with_samples=False`` omits ``resources`` rather than zeroing it
+        - the document survives ``json.dumps`` with no custom encoder
+    """
+    document: dict[str, Any] = {
+        "run": {
+            "run_id": run.metadata.get("run_id"),
+            "hosts": run.hosts,
+            "processes": len(run.workers),
+            "roles": run.roles,
+            "runtime_s": max((w.written_at - w.started_at for w in run.workers), default=0.0),
+            "imbalance": run.imbalance,
+        },
+        "roles": [
+            {
+                "role": role,
+                "processes": len(run.workers_of(role)),
+                "imbalance": imbalance_of(run.workers_of(role)),
+                "phases": _phases_as_list(run.tree_of(role)),
+            }
+            for role in run.roles
+        ],
+        "workers": [
+            {
+                "pid": worker.pid,
+                "role": worker.role,
+                "host": worker.host,
+                "rank": worker.rank,
+                "started_at": worker.started_at,
+                "written_at": worker.written_at,
+                "wall_ns": worker.wall_ns,
+                "write_failures": worker.write_failures,
+            }
+            for worker in run.workers
+        ],
+        "caveats": {
+            "unreadable": [str(path) for path in run.unreadable],
+            "superseded": [str(worker.path) for worker in run.superseded],
+            "stale": [worker.label for worker in _stale_workers(run)],
+        },
+    }
+    samples = run.samples_by_process()
+    if samples:
+        document["resources"] = _resources_as_dict(analyse_processes(samples))
+    return document
+
+
+def _phases_as_list(tree: PhaseTree) -> list[dict[str, Any]]:
+    """Flatten a phase tree into rows, deepest-costing first, with derived quantiles."""
+    return [
+        {
+            "phase": "/".join(path),
+            "calls": stats.calls,
+            "wall_ns": stats.wall_ns,
+            "cpu_ns": stats.cpu_ns,
+            "self_ns": stats.self_ns,
+            # Pairs with wall_ns, never with self_ns: wait spans the whole phase, including
+            # time inside children, so wait/self exceeds 100% for any parent that waits.
+            "wait_ns": stats.wait_ns,
+            "p50_ns": stats.hist.quantile(0.5),
+            "p99_ns": stats.hist.quantile(0.99),
+            "counters": dict(stats.counters),
+        }
+        for path, stats in sorted(tree.items(), key=lambda item: -item[1].self_ns)
+        if path
+    ]
+
+
+def _resources_as_dict(analysis: SampleAnalysis) -> dict[str, Any]:
+    """The sampled blocks: I/O at both counter layers, memory, and per-device GPU."""
+    return {
+        "io": {
+            "read_bytes": analysis.totals.read_bytes,
+            "write_bytes": analysis.totals.write_bytes,
+            "read_chars": analysis.totals.read_chars,
+            "write_chars": analysis.totals.write_chars,
+            "cached_read_bytes": analysis.totals.cached_read_bytes,
+            "unattributed_read_share": analysis.unattributed_read_share,
+            "unattributed_write_share": analysis.unattributed_write_share,
+            "gap_intervals": analysis.io_gap_intervals,
+            "intervals": analysis.io_intervals,
+        },
+        "memory": {
+            "peak_rss": analysis.memory.peak_rss,
+            "last_rss": analysis.memory.last_rss,
+            "growth_bytes": analysis.memory.growth_bytes,
+            "slope_bytes_per_s": analysis.memory.slope_bytes_per_s,
+        },
+        "gpu": {
+            "peak_cuda_alloc": analysis.peak_cuda_alloc,
+            "peak_cuda_reserved": analysis.peak_cuda_reserved,
+            "devices": [
+                {"index": d.index, "busy_mean": d.busy_mean, "ours_mean": d.ours_mean}
+                for d in analysis.gpu_devices
+            ],
+        },
+    }
+
+
 def format_ns(value: float) -> str:
     """Render a nanosecond duration with a unit that keeps three significant digits."""
     if value >= 3.6e12:
@@ -65,6 +178,26 @@ def format_ns(value: float) -> str:
     if value >= 1e3:
         return f"{value / 1e3:.1f}us"
     return f"{value:.0f}ns"
+
+
+def format_label(text: str, width: int) -> str:
+    """Truncate a phase label from the left to ``width``, keeping the tail and marking the cut.
+
+    The tail is the informative end of a phase path — the leaf is what a reader greps for —
+    so an over-long path loses its head rather than its leaf. The ellipsis is what makes that
+    safe: an unmarked left-truncation prints a name that does not exist. A plain ``[-26:]``
+    turned ``train_step/forward_backward`` into ``rain_step/forward_backward``, and a plain
+    ``[-27:]`` in the comparison table turned ``iteration/checkpoint_to_object_store`` into
+    ``/checkpoint_to_object_store``.
+
+    Callers pad the result into a field at least one column wider than ``width``. That is the
+    second half of the fix and the ellipsis does not replace it: at exactly the column width
+    the old label also swallowed the gap and ran into the heading beside it, printing
+    ``…forward_backwardr        0 B``.
+    """
+    if len(text) <= width:
+        return text
+    return "…" + text[-(width - 1):]
 
 
 def _header(run: MergedRun) -> str:
@@ -156,6 +289,9 @@ def _dominant_rows(tree: PhaseTree, limit: int = 6) -> list[str]:
 
     Ranked by self time rather than wall time, so a wrapper phase that merely contains its
     children never outranks the child doing the work.
+
+    A row derived from a sampled phase is prefixed with ``~``: its numbers are scaled
+    estimates, and every other number in this report is measured.
     """
     ranked = sorted(tree.items(), key=lambda item: -item[1].self_ns)
     rows = [f"{'DOMINANT PHASES':<28}{'self':>12}{'wait':>8}{'p50':>10}{'p99':>10}"]
@@ -163,13 +299,38 @@ def _dominant_rows(tree: PhaseTree, limit: int = 6) -> list[str]:
         if not path or stats.self_ns <= 0:
             continue
         wait_share = 100.0 * stats.wait_ns / stats.wall_ns if stats.wall_ns else 0.0
+        mark = "~" if stats.sample_stride else ""
         rows.append(
-            f"{_label(path):<28}{format_ns(stats.self_ns):>12}{wait_share:>7.0f}%"
+            f"{mark}{_label(path):<{28 - len(mark)}}{format_ns(stats.self_ns):>12}"
+            f"{wait_share:>7.0f}%"
             f"{format_ns(stats.hist.quantile(0.5)):>10}"
             f"{format_ns(stats.hist.quantile(0.99)):>10}",
         )
         rows.extend(_counter_rows(stats.counters, stats.wall_ns))
-    return rows if len(rows) > 1 else []
+    if len(rows) <= 1:
+        return []
+    rows.extend(_sampling_note(tree))
+    return rows
+
+
+def _sampling_note(tree: PhaseTree) -> list[str]:
+    """Say outright which phases were estimated, and at what rate.
+
+    The ``~`` prefix alone is a symbol a reader has to guess at. Naming the rate is what makes
+    the distinction actionable: a phase measured one entry in a hundred is a different kind of
+    number from the rest of the report, not a slightly noisier one.
+    """
+    sampled = sorted(
+        {"/".join(path): stats.sample_stride
+         for path, stats in tree.items() if stats.sample_stride}.items(),
+    )
+    if not sampled:
+        return []
+    return [
+        "",
+        "  ~ = estimated from a sample, not measured. Totals are scaled by the rate:",
+        *(f"      {format_label(name, 23):<24}1 entry in {stride:,}" for name, stride in sampled),
+    ]
 
 
 def _iteration_rows(tree: PhaseTree) -> list[str]:
@@ -198,6 +359,11 @@ def _counter_rows(counters: dict[str, int], wall_ns: int) -> list[str]:
 
     The ``io_*`` counters are skipped: they hold bytes, not work units, so a "per each"
     figure would be nonsense. They are rendered by :func:`_exact_io_block` instead.
+
+    Every column is separated by a literal space rather than by trusting its width. A number
+    is never truncated to fit — that would print a wrong one — so a field it overflows pushes
+    the rest of the row right instead of running into it. A fast counter on a short phase did
+    exactly that: 64 entries at 19,161,676.6/s rendered as ``6419,161,676.6/s``.
     """
     seconds = wall_ns / 1e9
     rows = []
@@ -206,7 +372,10 @@ def _counter_rows(counters: dict[str, int], wall_ns: int) -> list[str]:
             continue
         rate = total / seconds if seconds else 0.0
         per_unit = wall_ns / total if total else 0.0
-        rows.append(f"    + {name:<22}{total:>10,}{rate:>12,.1f}/s{format_ns(per_unit):>10}/ea")
+        rows.append(
+            f"    + {format_label(name, 21):<22}{total:>9,} "
+            f"{rate:>11,.1f}/s {format_ns(per_unit):>8}/ea",
+        )
     return rows
 
 
@@ -239,7 +408,7 @@ def _exact_io_rows(path: PhasePath, stats: PhaseStats) -> list[str]:
     seconds = stats.wall_ns / 1e9
     rate = format_bytes((read + write) / seconds) + "/s" if seconds else "-"
     rows = [
-        f"  {'/'.join(path)[-26:]:<26}"
+        f"  {format_label('/'.join(path), 25):<26}"
         f"r {format_bytes(read):>10}   w {format_bytes(write):>10}{rate:>14}",
     ]
     cached = max(0, stats.counters.get("io_read_chars", 0) - read)
@@ -295,7 +464,7 @@ def _io_phase_rows(analysis: SampleAnalysis, limit: int = 5) -> list[str]:
             totals.cached_read_bytes
         ) else ""
         rows.append(
-            f"  {phase[-26:]:<26}"
+            f"  {format_label(phase, 25):<26}"
             f"r {format_bytes(totals.read_bytes):>10}   "
             f"w {format_bytes(totals.write_bytes):>10}{cached}",
         )
@@ -318,9 +487,9 @@ def _io_attribution_note(analysis: SampleAnalysis) -> list[str]:
     writes = analysis.unattributed_write_share
     if max(reads, writes) > 0.05:
         lines.append(
-            f"  {reads:.0%} of reads and {writes:.0%} of writes moved while no phase was",
+            f"  {reads:.0%} of reads and {writes:.0%} of writes (syscall layer) moved while",
         )
-        lines.append("   open — too coarse to attribute. Wrap those regions in io=True.")
+        lines.append("   no phase was open — too coarse to attribute. Wrap those in io=True.")
     lines.extend(_io_gap_note(analysis))
     return lines
 
@@ -428,7 +597,7 @@ def _memory_phase_rows(analysis: SampleAnalysis, limit: int = 3) -> list[str]:
         if trend.slope_bytes_per_s <= 0:
             continue
         rate = format_bytes(trend.slope_bytes_per_s) + "/s"
-        rows.append(f"  growing under {phase[-24:]:<24}{rate:>14}")
+        rows.append(f"  growing under {format_label(phase, 23):<24}{rate:>14}")
     return [""] + rows if rows else []
 
 
@@ -480,6 +649,17 @@ def _superseded_rows(run: MergedRun) -> list[str]:
     ]
 
 
+def _stale_workers(run: MergedRun) -> list[WorkerSnapshot]:
+    """Workers whose last snapshot trails the run's by more than the staleness window.
+
+    One definition, shared by the text report and ``report_as_dict``: a worker that stopped
+    writing hours ago leaves a file that parses perfectly, so a caller reading the JSON needs
+    to be told exactly what a reader of the text is told.
+    """
+    latest = max((w.written_at for w in run.workers), default=0.0)
+    return [w for w in run.workers if latest - w.written_at > _STALE_AFTER_S]
+
+
 def _degraded_rows(run: MergedRun) -> list[str]:
     """Name workers whose own snapshots were failing, and workers that stopped early.
 
@@ -487,8 +667,8 @@ def _degraded_rows(run: MergedRun) -> list[str]:
     so staleness has to be derived here rather than trusted from the file itself.
     """
     failing = [w for w in run.workers if w.write_failures]
+    stale = _stale_workers(run)
     latest = max((w.written_at for w in run.workers), default=0.0)
-    stale = [w for w in run.workers if latest - w.written_at > _STALE_AFTER_S]
     rows: list[str] = []
     if failing:
         rows.append(f"{len(failing)} worker(s) reported failed snapshot writes:")
@@ -506,4 +686,4 @@ def _label(path: PhasePath) -> str:
     """Render a phase path compactly: the leaf, with its parent when that disambiguates."""
     if len(path) == 1:
         return path[0]
-    return f"{path[-2]}/{path[-1]}"[:27]
+    return format_label(f"{path[-2]}/{path[-1]}", 27)

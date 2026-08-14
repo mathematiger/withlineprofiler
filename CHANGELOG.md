@@ -4,6 +4,142 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0]
+
+Driven by a review from integrating 0.3.0 into a MuZero/AlphaZero training pipeline — 16
+actors, a learner, an evaluator, an inference server and a reanalyse worker under Slurm. The
+integration replaced five hand-rolled timing accumulators and net *removed* code; what follows
+is what it cost on the way in.
+
+### Fixed — the report printed labels and shares that were wrong
+
+- **A share no longer divides one I/O counter layer by the other.**
+  `unattributed_read_share` took its numerator and denominator through independent `or`
+  fallbacks, so unattributed traffic that was entirely page-cache (no block bytes) was divided
+  by a total that stayed on the block layer. A run with 110.3 MB of cached reads over 816.0 KB
+  of disk reads printed **`13845% of reads`**. Over 100% is at least visibly broken; the same
+  expression returned a *plausible* wrong number whenever both layers were non-zero, which is
+  the common case. Both operands now come from one layer — the syscall layer, which is what the
+  process actually asked for and the only one a warm dataset populates — and the report names
+  which layer the percentage is in.
+- **Truncated phase labels no longer print names that do not exist.** Six sites across
+  `report.py` and `compare.py` cut a label to a fixed width with no marker and no guaranteed
+  column gap. `train_step/forward_backward` rendered as `rain_step/forward_backwardr` — a name
+  the reader can neither find nor grep, run into the heading beside it — and the comparison
+  table turned `iteration/checkpoint_to_object_store` into `/checkpoint_to_object_store`. One
+  `format_label` now keeps the tail (the leaf is the informative end), marks the cut with an
+  ellipsis, and reserves a column so a label can never abut its neighbour. `_label` was also
+  cutting from the wrong end, discarding the leaf it exists to show.
+- **A fast counter no longer collides with its own rate.** The rate field filled exactly at
+  eight figures, so 64 entries at 19,161,676.6/s printed as `6419,161,676.6/s`. Columns are now
+  separated by a literal space, and a number that overflows its field pushes the row right
+  rather than being truncated — a truncated number is a wrong number.
+- **A relative `run_dir` is resolved before it is propagated.** The default `"profile"` was
+  exported to children verbatim through `LINEPROFILER_RUN_DIR`, so a worker with its own
+  working directory — which is what a batch system hands each rank — wrote its file somewhere
+  else entirely and one run merged as several short ones. Resolved against the constructing
+  process's working directory, and deliberately **not** against `$SLURM_SUBMIT_DIR`: portals
+  set that to their own installation directory (Open OnDemand reports
+  `/var/www/ood/apps/sys/dashboard`), which is neither chosen by the user nor usually writable.
+- **`close()` now un-does what an enabled profiler did to the process.** It wrote the final
+  snapshot and stopped its threads, but left every process-global hook in place: the `atexit`
+  registration, the chained `SIGTERM`/`SIGUSR1`/`SIGHUP` handlers, and the
+  `os.register_at_fork` callbacks. A process that merely constructed and closed a profiler was
+  permanently altered, and the damage surfaced nowhere near its cause — in the report that
+  found this, two in-process profiler tests left the interpreter unable to terminate its own
+  forked children, and the failures appeared in an unrelated file several hundred tests away,
+  reproducing only in a full run. `close()` now unregisters the `atexit` hook and restores each
+  signal disposition, splicing itself out of the chain when something else has chained on top,
+  so closing a parent before the child it constructed no longer strands a handler. A handler
+  the host installed above the profiler is never clobbered.
+- **A `fork()` after `close()` no longer resurrects the profiler.** `os.register_at_fork`
+  callbacks cannot be unregistered — CPython offers no API — and the child's callback set
+  `_closed` back to `False` unconditionally. Every later fork therefore handed the child a
+  *live* profiler: a new writer that re-created the run directory it had finished with, a
+  sampler thread and a flush timer, writing files nothing had asked for and, since `close()`
+  uninstalls, invisible to the module-level `phase()` that was supposed to resolve it. Closed
+  is now terminal, and the callbacks go inert instead.
+- **An enabled profiler is no longer immortal.** The three fork callbacks were bound methods,
+  so `os.register_at_fork` held every profiler — and its phase trees, thread states and writer
+  — for the life of the interpreter. One registration per process now dispatches over weak
+  references, and a closed or dropped profiler can actually be collected. This suite alone
+  constructs over a hundred.
+
+### Added — instrumenting without threading an argument
+
+- **`Profiler(..., install=True)` and module-level `accounting.phase()`, `count()`, `current()`
+  and `installed_profiler()`.** `phase()` being an instance method meant that instrumenting a
+  function five levels down required adding a `profiler` parameter to every caller in between,
+  and the reviewer wrote a 70-line process-global shim instead — as, they observed, every real
+  integration would. With nothing installed the calls cost ~350 ns, the same as
+  `enabled=False`, so library code can carry them permanently. Resolving the installed profiler
+  costs ~38 ns on an enabled phase. `close()` uninstalls, a second install warns, and a forked
+  child resolves its own profiler rather than the parent's dead one.
+
+### Added — reading a run while it is still running, and afterwards
+
+- **`Profiler.deltas()` and `Profiler.on_snapshot(callback)`.** `merged_tree()` is cumulative,
+  so exporting a per-interval figure to W&B or TensorBoard meant every user keeping their own
+  copy of the last reading and subtracting it. Quantiles survive the subtraction because
+  histograms are bucket counts. A phase idle over the interval is absent rather than present at
+  zero, so an exporter never publishes a flat line as activity. Callbacks fire only on the
+  periodic flush — not from `close()` or a signal handler, where arbitrary user code could
+  deadlock the process on its own final flush — and one that raises is counted and skipped
+  rather than stopping the flush timer.
+- **`lineprofiler report --json`.** `compare` had it and `report` did not, so the CLI could not
+  gate CI or diff sweep arms without re-deriving every share and quantile in the caller.
+  `caveats` is part of the document on purpose: a run that lost a worker must not read as
+  complete to a program either.
+- **A "Using it in tests" section in the README**, for machinery that already existed and was
+  undocumented. `merge_run(run_dir, with_samples=False)` makes a run an assertion target for
+  cross-process behaviour that unit tests structurally cannot see — a role that never started,
+  a phase that never ran, a worker that went quiet. The reviewer found four real incidents that
+  way.
+
+### Added — saying which numbers are estimates, and which names are generated
+
+- **`phase(name, sample=0.01)`**, for a region worth breaking down but too hot to measure at
+  full rate. Everything derived from one is an **estimate** and is reported as one: the node
+  carries its stride, the report prefixes the row with `~` and names the rate, and merging a
+  sampled node into a measured one marks the result too. Sampling a phase samples its whole
+  subtree — counting children at full rate beneath a parent counted at one in *n* would mix two
+  rates in one tree, which is the plausible-wrong-number failure this layer exists to avoid.
+  **The saving is about 3.4x, not the sampling rate** (3909 → 1156 ns/call): what a phase costs
+  is mostly Python, and sampling can only avoid the measurement, not the call. `count()` at
+  384 ns remains the right answer when a rate is all you need.
+- **A warning when phase names look generated**, and `strict_names=True` to make it an error.
+  `count()` raises on a float; a name built from data was the more damaging mistake and had no
+  equivalent protection — it degraded the report rather than raising, and only announced itself
+  at `MAX_PHASES`, by which point the run was unreadable. One name in isolation says nothing
+  (`conv2d` is a good name), so the check counts distinct names per *shape* and fires at 128,
+  well before the fold. It runs only when a path is first admitted, never on the hot path.
+- **`thread_names=True`**, nesting each thread's phases under its thread name. `role` is per
+  process, and a learner taking gradient steps beside a collector draining a queue is one
+  process with two very different answers to "where did the time go?" — both were reported as
+  `learner`. The prefixing happens at merge time, so it costs nothing per phase.
+
+### Changed
+
+- **`os._exit()` is documented beside the signal handling.** It skips `atexit` *and* never
+  delivers a signal, so neither existing hook fires, and it is the ordinary way a
+  multiprocessing entrypoint tears a worker down. The run still parses and looks complete; it
+  is simply missing its tail.
+- **`wait_ns` is documented as pairing with `wall_ns`, never `self_ns`.** Waiting inside a
+  child counts towards the parent, so `wait / self` exceeds 100% for any phase wrapping a
+  blocking call — a bug the reviewer hit on their first pass at an exporter.
+- **The overhead guidance is a budget, not a rule about loops.** "Keep phase overhead under ~1%
+  of the region you are measuring" replaces "not inside an inner simulation loop", which had
+  told the reviewer not to do the most useful measurement in the integration: 250 simulations ×
+  3 phases × ~2 µs is 1.5 ms against a 2.4 s search.
+- **The README leads with the accounting layer**, and says which of the two tools a reader
+  wants. The distribution is still `with-line-profiler` and the module still `lineprofiler`; a
+  rename would break every existing import to fix what is a documentation problem.
+- `enabled=False` no longer constructs a `psutil.Process`: `open_process()` ran unconditionally,
+  one line above the check that skips everything else.
+- `lineprofiler/accounting/phase.py` is now `phasetree.py`, freeing the name for the
+  module-level `phase()` function. Importing a submodule and a function under one name is an
+  import-order-dependent trap.
+
 ## [0.3.0]
 
 Hardening pass for multi-node HPC use. Three of the fixes below correct cases where the

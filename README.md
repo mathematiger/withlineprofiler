@@ -1,34 +1,27 @@
-# lineprofiler
-Statistical profiler to find lines that take a long time to compute. One can specify a folder, wherein the profiler traces lines.
-The profiler can be bound using `with`.
+# with-line-profiler
 
-## Features
-- **Zero configuration** – just wrap code in a `with` block
-- **Line-level timing** – see exactly which lines are slow
-- **Auto-filtering** – only profiles code in your project (auto-detects git repo root)
-- **Flexible output** – sort by time, hits, or line number; filter by threshold
+Two independent profiling tools in one distribution. Install as `with-line-profiler`,
+import as `lineprofiler`:
+
+| Tool | What it does | Use it when |
+|---|---|---|
+| **`lineprofiler.accounting`** | Semantic accounting for regions *you* name. Aggregates only — counts, sums, a fixed-bucket histogram — at ~2 µs per phase, across every process in a pipeline. | You are profiling a long, multi-process training run and need to know which phase, which role and which node the time went to. |
+| **`lineprofiler.LineProfiler`** | Line-by-line tracing inside a `with` block, scoped to your project folder. | You have narrowed the problem to one region and want per-line timings inside it. |
+
+They share nothing but the distribution: `accounting` never imports `LineProfiler`. If you
+arrived here for a training run, you want the accounting layer — it is the one built to stay
+enabled for twelve hours.
 
 ## Installation
-`pip install with-line-profiler`
 
-## Workflow
-```python
-from lineprofiler import LineProfiler
-profiler = LineProfiler(project_folder="path/to/your/project")
-profiler.clear()
-with profiler:
-  your_function()
-profiler.print_global_top_stats(min_time_us=0.01, top_n=40)
+```
+pip install with-line-profiler
 ```
 
-| Method | Description |
-|--------|-------------|
-| `print_stats(min_time_us, top_n_lines, sort_by)` | Print per-function statistics |
-| `print_global_top_stats(top_n, min_time_us, sort_by)` | Print top N lines across all functions |
-| `get_stats()` | Get raw `FunctionStats` dictionary |
-| `clear()` / `reset()` | Clear all collected data |
+See [Optional dependencies](#optional-dependencies) for the extras that enable the memory,
+I/O and GPU blocks.
 
-## Accounting layer (for long RL runs)
+## Accounting layer (`lineprofiler.accounting`)
 
 `lineprofiler.accounting` is a separate, always-on layer for multi-hour, multi-process
 training runs, where line-level tracing is far too expensive. You name the regions; it
@@ -58,6 +51,7 @@ with profiler.phase("checkpoint", io=True):            # exact byte attribution
 ```
 lineprofiler report profile/
 lineprofiler report profile/ --no-samples     # phases only; skips the resource blocks
+lineprofiler report profile/ --json           # the same run as data, for CI gates and diffs
 lineprofiler compare profile_a/ profile_b/ [--json]
 ```
 
@@ -104,7 +98,47 @@ VRAM reserved (peak)                8.4 GB
 
 `wait%` is the share of wall time the thread was not running on a CPU — blocked on a queue,
 a lock, the GIL or a syscall. In a queue-driven pipeline it is usually the number that
-explains the run.
+explains the run. It pairs with the phase's **wall** time, never with its self time: waiting
+inside a child still counts, so `wait / self` exceeds 100% for any phase wrapping a blocking
+call.
+
+### Instrumenting without threading a profiler argument
+
+`profiler.phase(...)` needs the object. Reaching a function five call levels down therefore
+means adding a `profiler` parameter to every caller in between — the search, the episode loop,
+the actor session, the inference server — for one phase.
+
+Pass `install=True` and use the module-level functions instead:
+
+```python
+from lineprofiler import accounting
+from lineprofiler.accounting import Profiler
+
+# once, wherever you set the run up
+profiler = Profiler(run_dir="profile", role="actor", install=True)
+
+# anywhere at all, with no argument threaded to it
+def uct_search(root):
+    with accounting.phase("mcts"):
+        accounting.count("simulations", 64)
+```
+
+**With no profiler installed these do nothing**, at ~300 ns per call — the same cost as
+`enabled=False` — so library code can carry the calls permanently whether or not anything is
+profiling it. Resolving the installed profiler costs ~38 ns on an enabled phase, about 1%,
+which is why this is not a reason to keep passing the object around.
+
+| Function | Equivalent |
+|---|---|
+| `accounting.phase(name, io=…, sync=…)` | `profiler.phase(...)` |
+| `accounting.count(name, n)` | `profiler.count(...)` |
+| `accounting.current()` | the deepest open phase, or `""` — useful on a log line |
+| `accounting.installed_profiler()` | the installed instance, or `None` |
+
+`close()` uninstalls, so a closed profiler is never resolvable and a second `install=True`
+warns rather than silently taking over. A forked child resolves *its own* profiler, not the
+parent's — the fork handlers re-point it along with the worker file. Explicit
+`profiler.phase(...)` keeps working unchanged; `install=True` only adds a second way in.
 
 ### Finding I/O bottlenecks
 
@@ -211,11 +245,14 @@ Measured on Python 3.12 with `benchmarks/bench_accounting.py`, per phase enter+e
 
 | | ns/call |
 |---|---|
-| `phase()`, `enabled=False` | 320 |
-| `phase()`, `enabled=True`, `measure_cpu=False` | 2280 |
-| `phase()`, `enabled=True`, `measure_cpu=True` | 3840 |
-| `phase(io=True)` | 44900 |
-| `count()` | 355 |
+| `phase()`, `enabled=False` | 359 |
+| `accounting.phase()`, nothing installed | 350 |
+| `accounting.phase()` vs `profiler.phase()`, enabled | +38 |
+| `phase()`, `enabled=True`, `measure_cpu=False` | 2349 |
+| `phase()`, `enabled=True`, `measure_cpu=True` | 3909 |
+| `phase(io=True)` | 44322 |
+| `phase(sample=0.01)`, skipped entry | 1156 |
+| `count()` | 384 |
 
 `sync=True` is absent from the table because its cost is not the profiler's: it is however
 long the GPU still had to run. Phases that do *not* set it are unaffected — the check is one
@@ -226,11 +263,207 @@ branch, inside the noise of the numbers above.
 call is a real syscall at roughly 590 ns. `io=True` costs two `/proc` reads and two reads of
 the overhead counter — negligible on a 10 ms checkpoint, ruinous on an inner loop.
 
-At around a microsecond per phase, put `phase()` around searches, env steps and train
-steps — not inside an inner simulation loop. Use `count()` there instead; it is five times
-cheaper and gives you the rate anyway.
+**Budget it as a ratio, not as a rule about loops: keep phase overhead under ~1% of the region
+you are measuring.** At ~2 µs per phase that means a phase is affordable around anything taking
+more than ~200 µs, and the table above is there so you can decide per call site without
+measuring.
+
+Worked example, from an MCTS search: 250 simulations × 3 phases (select / expand / backup) ×
+~2 µs is 1.5 ms against a 2.4 s search — 0.06%, comfortably worth it. And that select/expand/
+backup split is exactly what says *where* a slow search went, which `count()` cannot tell you:
+counters give rates, not attribution.
+
+So the rule is the budget, not the nesting depth. Where the ratio does not clear — a loop body
+of a few microseconds — use `count()` instead; it is five times cheaper and gives you the rate
+anyway.
+
+#### Sampled phases, when you want the split and cannot afford it
+
+`phase(name, sample=0.01)` measures one entry in a hundred and scales the result, for a region
+worth breaking down but too hot to instrument at full rate.
+
+```python
+for _ in range(250):
+    with profiler.phase("select", sample=0.01):
+        ...
+```
+
+**Read the measured saving before reaching for it — it is not the sampling rate:**
+
+| | ns/call |
+|---|---|
+| `phase()`, every entry measured (default `measure_cpu=True`) | 3909 |
+| `phase(sample=0.01)` | 1156 |
+| `count()` | 384 |
+
+About **3.4x**, not 100x. What a phase costs is mostly Python — the call, the scope object,
+the context-manager protocol — and sampling can only avoid the measurement, not the call. So:
+
+- If you want a **rate**, `count()` is still three times cheaper than a sampled phase. Use it.
+- If you want **attribution** — *which* of select/expand/backup the search went into, which a
+  counter cannot answer — a sampled phase buys you that for a third of the price.
+
+Everything derived from a sampled phase is an **estimate**, and the report says so: the row is
+prefixed `~` and a note names the rate.
+
+```
+DOMINANT PHASES                     self    wait       p50       p99
+~uct_search                       2h 31m     18%     9.4ms    18.5ms
+
+  ~ = estimated from a sample, not measured. Totals are scaled by the rate:
+      uct_search              1 entry in 100
+```
+
+That labelling is the condition on which the option exists. Every other number here is
+measured, and merging a sampled phase into a measured one marks the result as estimated too —
+a partly-estimated total presented as measured is exactly the failure this layer is built
+around.
+
+Two things follow from how it works:
+
+- **Sampling a phase samples its whole subtree.** A skipped entry records nothing for itself
+  or anything beneath it. Counting children at full rate under a parent counted at one in `n`
+  would leave two rates mixed in one tree — a plausible wrong number rather than an obvious
+  one. Counters and `io=True` bytes inside the phase are scaled by the same factor.
+- **Selection is a deterministic stride, not a random draw** — a draw costs about as much as
+  the phase it is avoiding. The cost is aliasing: a workload whose period lines up with the
+  stride keeps measuring the same point in it.
+
+### Phase names must not be built from data
+
+`phase(f"episode_{i}")` grows the phase tree for the life of the process — every node carries a
+dense 512-bucket histogram that is also rewritten into every snapshot — until it folds at 4096
+paths and the report stops being readable. `count()` raises on a float rather than truncating
+it; a generated name is the more damaging mistake and used to have no equivalent protection.
+
+One name in isolation says nothing: `conv2d` and `resnet50` are good names. What gives a
+generated one away is repetition of a *shape*, so the profiler counts distinct names per shape
+and warns once, well before the cap:
+
+```
+128 distinct phase names share the shape 'episode_#' (most recently 'episode_127').
+Names built from data grow the phase tree until it folds at 4096 paths and the report
+stops being readable — use a fixed name and count() for the varying part.
+```
+
+`Profiler(..., strict_names=True)` turns that into an error on the *second* name sharing a
+shape, which makes "my phase vocabulary is fixed" a guarantee the profiler checks rather than
+something to pin in a test by hand.
+
+### Two threads in one process
+
+`role` is per process. A learner taking gradient steps and a collector draining a queue into a
+replay buffer are one process with two very different answers to "where did the time go?", and
+both were reported as `learner`. `Profiler(..., thread_names=True)` nests each thread's phases
+under its thread name:
+
+```
+LEARNER  (1 process, imbalance 1.00)
+──────────────────────────────────────────────────────────────
+learner                        71.0%       2h 58m
+collector                      29.0%       1h 12m
+
+DOMINANT PHASES                     self    wait       p50       p99
+learner/train_step                2h 51m      4%    41.2ms    58.9ms
+collector/drain_queue             1h 09m     94%     2.1ms   210.4ms
+```
+
+which is what makes the 94% answerable: it is the collector blocked on the queue, not the
+learner. Off by default, because it changes the shape of the reported tree and most processes
+have only one interesting thread. The prefixing happens at merge time, so it costs nothing per
+phase — set `threading.current_thread().name` to something meaningful and it shows up.
+
+### Exporting to W&B or TensorBoard during the run
+
+`merged_tree()` is cumulative, so publishing a per-interval metric means keeping the last
+reading and subtracting. `deltas()` does that for you, and `on_snapshot()` gives you somewhere
+to put it:
+
+```python
+profiler = Profiler(run_dir="profile", role="learner", snapshot_interval_s=30.0)
+
+@profiler.on_snapshot
+def export(_tree):
+    for path, stats in profiler.deltas().items():
+        name = "/".join(path)
+        wandb.log({
+            f"profile/{name}/wall_s":  stats.wall_ns / 1e9,
+            f"profile/{name}/wait":    stats.wait_ns / stats.wall_ns,   # wall, not self
+            f"profile/{name}/p50_ms":  stats.hist.quantile(0.5) / 1e6,
+            f"profile/{name}/calls":   stats.calls,
+        })
+```
+
+Quantiles survive the subtraction — histograms are bucket counts, so the difference of two
+cumulative histograms is the histogram of the interval between them, and a slow interval's p50
+is not dragged down by the fast ones before it. A phase that did nothing in the interval is
+**absent** rather than present at zero, so an exporter never publishes a flat line as activity.
+
+Two things worth knowing:
+
+- **`deltas()` has its own cursor**, independent of `on_snapshot`. Calling it inside the
+  callback, as above, is the intended combination; calling it elsewhere as well will split the
+  intervals between the two call sites.
+- **Callbacks fire only on the periodic flush** — not from `close()`, and not from a snapshot
+  taken in a signal handler, where running arbitrary user code risks deadlocking the process on
+  its own final flush. You therefore lose the last partial interval; read the run directory
+  afterwards for the complete picture. A callback that raises is counted and skipped, never
+  propagated, so an exporter that loses its connection cannot stop the flush timer.
+
+### Using it in tests
+
+A merged run is a machine-readable record of *what actually executed* — which roles started,
+which phases ran, how much work each did, which workers went quiet. That makes it an assertion
+target, not just something to read:
+
+```python
+from lineprofiler.accounting import merge_run
+
+run = merge_run("profile", with_samples=False)   # phases only: fast, and megabytes smaller
+
+assert "evaluator" in run.roles                  # the process actually started
+assert run.tree[("iteration", "mcts")].calls > 0 # the code path actually ran
+assert run.unreadable == []                      # no worker died before its first flush
+```
+
+This catches a class of bug that unit tests structurally cannot, because no other artifact
+records cross-process behaviour. Real examples:
+
+| Symptom | Assertion that catches it |
+|---|---|
+| An evaluator process never spawned, while the supervisor logged "Evaluator ✓" (it was alive, just idle) | `"evaluator" in run.roles` |
+| A restarted actor silently ran a different environment | `run.tree[(...)]` phase vocabulary |
+| A 12-hour async run wedged with a dead collector, producing no output at all | `written_at` staleness, below |
+| Diagnostics behind a `getattr` default produced nothing while every test stayed green | `run.tree[(...)].counters` |
+
+Staleness and loss are derived at report time rather than trusted from the file, because a
+worker whose flushes died leaves a file that parses perfectly and is simply hours out of date:
+
+```python
+latest = max(w.written_at for w in run.workers)
+assert all(latest - w.written_at < 300 for w in run.workers), "a worker stopped writing"
+```
+
+For a CI gate outside Python, `lineprofiler report <dir> --json` gives the same document —
+`run`, `roles[].phases[]`, `workers[]` and `caveats` — with the shares and quantiles already
+derived. `caveats` is part of that document on purpose: a run that lost a worker must not read
+as a complete result to a program either.
+
+Set `enabled=True` explicitly in tests rather than relying on `LINEPROFILER_PROFILE`, and pass
+`snapshot_interval_s=None, sample_interval_s=None` to keep the run deterministic and
+thread-free; call `close()` to flush.
 
 ### Multiple processes, and multiple nodes
+
+**`run_dir` is resolved to an absolute path at construction**, before it is exported to
+children. A relative default like `"profile"` otherwise means a *different* directory in every
+process that has its own working directory — which is exactly what a batch system hands each
+rank — so one run scattered across the filesystem and merged as several short ones. A relative
+path resolves against the working directory of the process that constructed the profiler,
+which is what you meant by it; `$SLURM_SUBMIT_DIR` is deliberately *not* used, because portals
+set it to their own installation directory (Open OnDemand reports
+`/var/www/ood/apps/sys/dashboard`), which is somewhere you neither chose nor can usually write.
+Passing an absolute `run_dir` remains the clearest thing to do.
 
 Every process writes its own `workers/<host>/w_<run>_<pid>_<uuid8>.json`; `report` merges
 them. The uuid matters because a restarted worker reuses its rank but not its pid, and the
@@ -250,6 +483,49 @@ total for a requeued job. Children inherit the attempt through `LINEPROFILER_RUN
 `--signal=USR1@120` idiom terminates without running `atexit`, so the last interval used to be
 lost exactly when you wanted it. `SIGKILL` remains unreachable; the periodic snapshot is what
 survives it.
+
+**`os._exit()` is the other unreachable exit, and it is not exotic** — it is how a
+multiprocessing entrypoint normally tears a worker down, and how most "exit immediately without
+running cleanup" paths are written. It skips `atexit` *and* never delivers a signal, so neither
+hook above fires and everything since the last periodic flush is lost. If your teardown path
+calls it, call `close()` yourself first:
+
+```python
+profiler.close()
+os._exit(0)
+```
+
+The run still parses and still looks complete — it is simply missing its tail, which is the
+failure mode this layer works hardest to avoid elsewhere. Lower `snapshot_interval_s` if you
+cannot reach the exit path.
+
+**An enabled profiler changes the process, and `close()` changes it back.** Constructing one
+registers an `atexit` hook, chains the three signals above, and registers `os.register_at_fork`
+callbacks — all process-global, none of it scoped to the object. `close()` removes the `atexit`
+hook and puts the signal handlers back. The fork callbacks are the exception: CPython has no
+`unregister_at_fork`, so they stay registered for the life of the interpreter and instead go
+inert, dispatching over weak references and skipping any profiler that has closed.
+
+This matters most inside a test suite, where profilers are constructed and discarded in the same
+interpreter as everything else:
+
+```python
+def test_something(tmp_path):
+    profiler = Profiler(run_dir=tmp_path, enabled=True)
+    try:
+        ...
+    finally:
+        profiler.close()      # not optional: it is what un-does the above
+```
+
+Closing order need not match construction order — a parent closed before its child is handled —
+but a profiler that is *never* closed keeps its handlers for the rest of the process. If a host
+installs its own handler on top of a live profiler, `close()` deliberately leaves the profiler's
+handler in place rather than delete the host's; it is inert by then and still chains correctly.
+
+Better still, assert against a subprocess run rather than embedding a profiler in the test
+process at all — see [Using it in tests](#using-it-in-tests). That is the pattern this layer is
+built for, and it sidesteps the question entirely.
 
 **On a large run**, pass `--no-samples`. Resource samples dominate merge memory — a 12-hour
 worker holds roughly 28 MB of them, about 1.8 GB across 64 workers, and the derived intervals
@@ -365,6 +641,41 @@ enum value: `line_profiler`, `cProfile`, VizTracer and `torch.profiler` all cont
 interpreter's trace hook, so only one heavy profiler can run at a time. If the chosen
 package isn't installed, the window degrades to a no-op and records `unavailable_reason` in
 `metadata.json` instead of raising.
+
+## Line profiler (`lineprofiler.LineProfiler`)
+
+Line-by-line tracing for a bounded region: wrap code in a `with` block and it records
+per-line hit counts and timing. Only code under your project folder is traced — the folder
+is auto-detected by walking up to the nearest `.git` — so the output is your code, not the
+stdlib and site-packages.
+
+This is the expensive one. `sys.settrace` fires on every line of every in-project frame, so
+it is for a region you already suspect, not for a whole training run. For that, use the
+accounting layer above.
+
+- **Zero configuration** – just wrap code in a `with` block
+- **Line-level timing** – see exactly which lines are slow
+- **Auto-filtering** – only profiles code in your project (auto-detects git repo root)
+- **Flexible output** – sort by time, hits, or line number; filter by threshold
+
+```python
+from lineprofiler import LineProfiler
+profiler = LineProfiler(project_folder="path/to/your/project")
+profiler.clear()
+with profiler:
+  your_function()
+profiler.print_global_top_stats(min_time_us=0.01, top_n=40)
+```
+
+| Method | Description |
+|--------|-------------|
+| `print_stats(min_time_us, top_n_lines, sort_by)` | Print per-function statistics |
+| `print_global_top_stats(top_n, min_time_us, sort_by)` | Print top N lines across all functions |
+| `get_stats()` | Get raw `FunctionStats` dictionary |
+| `clear()` / `reset()` | Clear all collected data |
+
+`sys.settrace` is global and single-tracer, so this profiler is not thread-safe and cannot
+run alongside another tracing profiler (including `accounting`'s `backend=` window).
 
 ## Licence
 MIT

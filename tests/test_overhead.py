@@ -20,6 +20,7 @@ from time import perf_counter_ns
 
 import pytest
 
+from lineprofiler import accounting
 from lineprofiler.accounting import Profiler
 from lineprofiler.accounting.capabilities import cuda_synchronize
 
@@ -35,12 +36,14 @@ pytestmark = [
 
 ITERATIONS = 20_000
 
-# Measured on an Intel Xeon at Python 3.12: 322 / 2286 / 3877 / 347 ns.
+# Measured on an Intel Xeon at Python 3.12: 322 / 2286 / 3877 / 347 / 301 ns.
 BUDGET_NS = {
     "disabled": 1_600,
     "no_cpu": 9_000,
     "with_cpu": 15_000,
     "count": 1_600,
+    "ambient_uninstalled": 1_600,
+    "sampled": 6_000,
 }
 
 
@@ -157,5 +160,86 @@ def test_a_synchronising_phase_costs_nothing_without_cuda(run_dir: Path) -> None
 
     try:
         assert _per_call_ns(syncing) < _per_call_ns(plain) * 1.5
+    finally:
+        profiler.close()
+
+
+def test_an_ambient_phase_with_nothing_installed_is_nearly_free() -> None:
+    """What makes it safe to instrument library code that does not know whether it is being
+    profiled: with no profiler installed the call is a global load and an identity test."""
+    accounting.uninstall_profiler()
+
+    def action() -> None:
+        with accounting.phase("p"):
+            pass
+
+    assert _per_call_ns(action) < BUDGET_NS["ambient_uninstalled"]
+
+
+def test_resolving_the_installed_profiler_costs_almost_nothing(run_dir: Path) -> None:
+    """The indirection must not be a reason to keep threading a ``profiler`` argument through
+    every caller. Measured at ~38 ns on an enabled phase, about 1%."""
+    profiler = Profiler(
+        run_dir=run_dir, enabled=True, install=True,
+        snapshot_interval_s=None, sample_interval_s=None, measure_cpu=False,
+    )
+
+    def direct() -> None:
+        with profiler.phase("p"):
+            pass
+
+    def ambient() -> None:
+        with accounting.phase("p"):
+            pass
+
+    try:
+        assert _per_call_ns(ambient) < _per_call_ns(direct) * 1.5
+    finally:
+        profiler.close()
+        accounting.uninstall_profiler()
+
+
+def test_a_sampled_phase_is_cheaper_than_a_measured_one(run_dir: Path) -> None:
+    """Sampling only avoids the measurement, never the Python call around it, so the saving
+    is a factor of a few and not the sampling rate. The README quotes ~3.7x against the
+    default; this defends the direction, not the figure."""
+    profiler = Profiler(
+        run_dir=run_dir, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+
+    def measured() -> None:
+        with profiler.phase("m"):
+            pass
+
+    def sampled() -> None:
+        with profiler.phase("s", sample=0.01):
+            pass
+
+    try:
+        sampled_ns = _per_call_ns(sampled)
+        assert sampled_ns < BUDGET_NS["sampled"]
+        assert sampled_ns < _per_call_ns(measured), (
+            "sampling must at least be cheaper than measuring, or it buys nothing at all"
+        )
+    finally:
+        profiler.close()
+
+
+def test_counting_stays_cheaper_than_a_sampled_phase(run_dir: Path) -> None:
+    """The README tells readers to prefer count() when they only want a rate. That advice
+    holds only while this does."""
+    profiler = Profiler(
+        run_dir=run_dir, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+
+    def counting() -> None:
+        profiler.count("units", 1)
+
+    def sampled() -> None:
+        with profiler.phase("s", sample=0.01):
+            pass
+
+    try:
+        assert _per_call_ns(counting) < _per_call_ns(sampled)
     finally:
         profiler.close()

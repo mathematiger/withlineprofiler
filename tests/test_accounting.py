@@ -14,9 +14,10 @@ from pathlib import Path
 
 import pytest
 
+from lineprofiler import accounting
 from lineprofiler.accounting import DurationHistogram, PhaseStats, Profiler, merge_run
 from lineprofiler.accounting.histogram import BUCKET_COUNT, bucket_index, bucket_lower_ns
-from lineprofiler.accounting.phase import PhaseTree, merge_trees
+from lineprofiler.accounting.phasetree import PhaseTree, merge_trees
 from lineprofiler.accounting.report import render
 
 # ── histogram ───────────────────────────────────────────────────────────────
@@ -310,6 +311,15 @@ def test_disabled_profiler_creates_no_files_and_no_threads(tmp_path: Path) -> No
     assert profiler.merged_tree() == {}
 
 
+def test_a_disabled_profiler_opens_no_process_handle(tmp_path: Path) -> None:
+    """``open_process()`` constructs a psutil.Process and reads /proc. It used to run
+    unconditionally, above the enabled check, so "allocate nothing" was not quite true."""
+    profiler = Profiler(run_dir=tmp_path, enabled=False)
+
+    assert profiler._process is None  # noqa: SLF001
+    assert profiler.io_counters().is_empty(), "and it still answers rather than raising"
+
+
 def test_environment_variable_is_read_once(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("LINEPROFILER_PROFILE", "1")
     profiler = Profiler(
@@ -460,3 +470,307 @@ def test_sigterm_leaves_a_parseable_snapshot(tmp_path: Path) -> None:
     assert len(run.workers) == 1
     assert run.workers[0].written_at >= killed_at
     assert time.time() - run.workers[0].written_at < 5.0
+
+
+# ── the ambient (installed) profiler ────────────────────────────────────────
+
+
+def test_module_level_phase_is_a_no_op_with_nothing_installed() -> None:
+    """Library code can be instrumented without knowing whether it is being profiled."""
+    accounting.uninstall_profiler()
+
+    with accounting.phase("unobserved"):
+        accounting.count("units", 5)
+
+    assert accounting.installed_profiler() is None
+    assert accounting.current() == ""
+
+
+def test_module_level_phase_records_on_the_installed_profiler(tmp_path: Path) -> None:
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, install=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    try:
+        assert accounting.installed_profiler() is profiler
+        with accounting.phase("iteration"), accounting.phase("mcts"):
+            accounting.count("simulations", 64)
+            assert accounting.current() == "iteration/mcts"
+    finally:
+        profiler.close()
+
+    tree = profiler.merged_tree()
+    assert tree[("iteration", "mcts")].calls == 1
+    assert tree[("iteration", "mcts")].counters == {"simulations": 64}
+
+
+def test_closing_uninstalls_so_a_dead_profiler_is_never_resolvable(tmp_path: Path) -> None:
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, install=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    profiler.close()
+
+    assert accounting.installed_profiler() is None
+    with accounting.phase("after_close"):
+        accounting.count("ignored", 1)
+
+    assert ("after_close",) not in merge_run(tmp_path).tree
+
+
+def test_installing_a_second_profiler_warns(tmp_path: Path) -> None:
+    first = Profiler(
+        run_dir=tmp_path / "a", enabled=True, install=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    try:
+        with pytest.warns(RuntimeWarning, match="already installed"):
+            second = Profiler(
+                run_dir=tmp_path / "b", enabled=True, install=True,
+                snapshot_interval_s=None, sample_interval_s=None,
+            )
+        assert accounting.installed_profiler() is second
+        second.close()
+    finally:
+        first.close()
+        accounting.uninstall_profiler()
+
+
+def test_an_explicitly_disabled_profiler_still_installs_as_a_no_op(tmp_path: Path) -> None:
+    """``enabled=False`` must not leave module-level calls resolving to a stale profiler."""
+    profiler = Profiler(run_dir=tmp_path, enabled=False, install=True)
+    try:
+        with accounting.phase("noop"):
+            accounting.count("ignored", 1)
+        assert profiler.merged_tree() == {}
+    finally:
+        profiler.close()
+        accounting.uninstall_profiler()
+
+
+# ── live export ─────────────────────────────────────────────────────────────
+
+
+def test_two_successive_delta_reads_sum_to_the_cumulative_tree(tmp_path: Path) -> None:
+    """The property every hand-rolled delta cache is trying to have."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    for _ in range(3):
+        with profiler.phase("step"):
+            profiler.count("units", 2)
+    first = profiler.deltas()
+    for _ in range(4):
+        with profiler.phase("step"):
+            profiler.count("units", 2)
+    second = profiler.deltas()
+    profiler.close()
+
+    assert first[("step",)].calls == 3
+    assert second[("step",)].calls == 4
+    total = profiler.merged_tree()[("step",)]
+    assert first[("step",)].calls + second[("step",)].calls == total.calls
+    assert first[("step",)].counters["units"] + second[("step",)].counters["units"] == 14
+    assert first[("step",)].wall_ns + second[("step",)].wall_ns == total.wall_ns
+
+
+def test_a_phase_idle_over_the_interval_is_absent_from_the_deltas(tmp_path: Path) -> None:
+    """Absent, not present at zero: an exporter must not publish a flat line as activity."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    with profiler.phase("once"):
+        pass
+    profiler.deltas()
+    with profiler.phase("again"):
+        pass
+    deltas = profiler.deltas()
+    profiler.close()
+
+    assert ("again",) in deltas
+    assert ("once",) not in deltas
+
+
+def test_delta_quantiles_describe_the_interval_not_the_run(tmp_path: Path) -> None:
+    """Histograms are counts, so subtracting them bucket-wise is what makes this work."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    for _ in range(5):
+        with profiler.phase("step"):
+            time.sleep(0.001)
+    profiler.deltas()
+    for _ in range(5):
+        with profiler.phase("step"):
+            time.sleep(0.020)
+    interval = profiler.deltas()[("step",)]
+    profiler.close()
+
+    assert interval.hist.count == 5
+    assert interval.hist.quantile(0.5) == pytest.approx(0.020e9, rel=0.6), (
+        "the slow interval's median must not be dragged down by the fast one before it"
+    )
+
+
+def test_the_first_delta_read_does_not_alias_the_live_tree(tmp_path: Path) -> None:
+    """The first call has no baseline and returns the tree itself unless it is copied."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    with profiler.phase("step"):
+        pass
+    first = profiler.deltas()
+    with profiler.phase("step"):
+        pass
+    profiler.close()
+
+    assert first[("step",)].calls == 1, "a later phase must not mutate an earlier reading"
+
+
+def test_a_raising_export_callback_does_not_stop_the_flushes(tmp_path: Path) -> None:
+    """An exporter losing its connection must not cost the run its remaining flushes."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=0.05, sample_interval_s=None,
+    )
+    seen: list[int] = []
+
+    def broken(_tree: PhaseTree) -> None:
+        raise RuntimeError("exporter is down")
+
+    def working(tree: PhaseTree) -> None:
+        seen.append(len(tree))
+
+    profiler.on_snapshot(broken)
+    profiler.on_snapshot(working)
+    with profiler.phase("train"):
+        pass
+    deadline = time.monotonic() + 5.0
+    while len(seen) < 3 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    profiler.close()
+
+    assert len(seen) >= 3, "a raising callback stopped the ones after it, or the timer"
+    assert profiler._callback_failures >= 3  # noqa: SLF001
+
+
+def test_deltas_inside_a_snapshot_callback_see_the_interval(tmp_path: Path) -> None:
+    """The documented combination for live export."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=0.05, sample_interval_s=None,
+    )
+    intervals: list[int] = []
+
+    def export(_tree: PhaseTree) -> None:
+        step = profiler.deltas().get(("train",))
+        intervals.append(step.calls if step else 0)
+
+    profiler.on_snapshot(export)
+    for _ in range(3):
+        with profiler.phase("train"):
+            pass
+        time.sleep(0.06)
+    profiler.close()
+
+    assert sum(intervals) <= 3, "deltas must not re-report work already exported"
+    assert any(intervals), "and must report the work that happened"
+
+
+def test_on_snapshot_is_usable_as_a_decorator(tmp_path: Path) -> None:
+    """The README documents the decorator form; returning None would bind the name to None."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    seen: list[int] = []
+
+    @profiler.on_snapshot
+    def export(tree: PhaseTree) -> None:
+        seen.append(len(tree))
+
+    profiler.close()
+
+    assert callable(export), "the decorated function must survive as a function"
+    export({})
+    assert seen == [0]
+
+
+# ── per-thread attribution ──────────────────────────────────────────────────
+
+
+def _two_threads(profiler: Profiler) -> None:
+    """A learner thread and a collector thread doing unrelated work in one process."""
+    def learner() -> None:
+        threading.current_thread().name = "learner"
+        for _ in range(3):
+            with profiler.phase("train_step"):
+                time.sleep(0.005)
+
+    def collector() -> None:
+        threading.current_thread().name = "collector"
+        for _ in range(3):
+            with profiler.phase("drain_queue"):
+                time.sleep(0.005)
+
+    threads = [threading.Thread(target=learner), threading.Thread(target=collector)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+
+def test_threads_are_merged_together_by_default(tmp_path: Path) -> None:
+    """The existing shape: one process, one tree, whatever thread recorded it."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    _two_threads(profiler)
+    tree = profiler.merged_tree()
+    profiler.close()
+
+    assert ("train_step",) in tree
+    assert ("drain_queue",) in tree
+
+
+def test_thread_names_separate_two_threads_of_one_process(tmp_path: Path) -> None:
+    """``role`` is per process, so a learner and a collector in one process were both
+    reported as "learner" and their very different waits averaged together."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, thread_names=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    _two_threads(profiler)
+    tree = profiler.merged_tree()
+    profiler.close()
+
+    assert ("learner", "train_step") in tree
+    assert ("collector", "drain_queue") in tree
+    assert ("learner", "drain_queue") not in tree
+
+
+def test_a_thread_node_carries_the_time_of_the_phases_beneath_it(tmp_path: Path) -> None:
+    """A thread's root is never entered, so without this it is a row of zeros and the report
+    suppresses the whole block."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, thread_names=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    _two_threads(profiler)
+    tree = profiler.merged_tree()
+    profiler.close()
+
+    assert tree[("learner",)].wall_ns == tree[("learner", "train_step")].wall_ns
+    assert tree[("learner",)].self_ns == 0, "the synthesised node claims no time of its own"
+
+
+def test_thread_names_survive_the_snapshot_and_render(tmp_path: Path) -> None:
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, thread_names=True, role="learner",
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    _two_threads(profiler)
+    profiler.close()
+
+    run = merge_run(tmp_path)
+    text = render(run)
+
+    assert ("learner", "train_step") in run.tree
+    assert "collector" in text

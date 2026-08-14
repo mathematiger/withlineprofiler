@@ -119,9 +119,9 @@ class SampleAnalysis:
         loose = self.io_by_phase.get(NO_PHASE)
         if loose is None:
             return 0.0
-        return _share(
-            loose.read_bytes or loose.read_chars,
-            self.totals.read_bytes or self.totals.read_chars,
+        return _same_layer_share(
+            loose.read_chars, loose.read_bytes,
+            self.totals.read_chars, self.totals.read_bytes,
         )
 
     @property
@@ -130,9 +130,9 @@ class SampleAnalysis:
         loose = self.io_by_phase.get(NO_PHASE)
         if loose is None:
             return 0.0
-        return _share(
-            loose.write_bytes or loose.write_chars,
-            self.totals.write_bytes or self.totals.write_chars,
+        return _same_layer_share(
+            loose.write_chars, loose.write_bytes,
+            self.totals.write_chars, self.totals.write_bytes,
         )
 
 
@@ -292,6 +292,29 @@ def _fill_io_from_intervals(analysis: SampleAnalysis, intervals: list[_Interval]
 def _share(part: int, whole: int) -> float:
     """``part / whole``, or zero when there was nothing to divide."""
     return part / whole if whole > 0 else 0.0
+
+
+def _same_layer_share(
+    part_chars: int,
+    part_bytes: int,
+    whole_chars: int,
+    whole_bytes: int,
+) -> float:
+    """Share of one counter layer, never one layer's numerator over the other's denominator.
+
+    Both operands come from the syscall layer when it was recorded at all, and from the block
+    layer otherwise. Choosing per operand mixes them: unattributed traffic that is entirely
+    page-cache has no block bytes, so a numerator falling back to chars over a denominator
+    that stayed in bytes reported 110.3 MB over 816.0 KB as ``13845%``. Over 100% is at least
+    visibly broken; the same expression yields a plausible wrong number whenever both layers
+    are non-zero, which is the common case.
+
+    The syscall layer is the honest default: it is what the process actually asked for, it is
+    always at least the block-layer figure, and a warm dataset moves no block bytes at all.
+    """
+    if whole_chars > 0:
+        return _share(part_chars, whole_chars)
+    return _share(part_bytes, whole_bytes)
 
 
 def _wall_span(intervals: list[_Interval]) -> float:

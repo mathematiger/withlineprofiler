@@ -6,7 +6,7 @@ phase                           A /entry    B /entry    change       n
 iteration/compile                      —      50.0ms only in B       1
 iteration/train_step              40.0ms      60.0ms   +50.0%?     10
 iteration                         28.0ms      38.3ms   +36.9%~     50
-iteration/checkpoint              47.5ms      47.5ms    +0.0%?      2
+…checkpoint_to_object_store       47.5ms      47.5ms    +0.0%?      2
 iteration/env_step                 5.4ms       5.4ms    +0.0%      40
 iteration/mcts                    16.9ms      16.9ms    +0.0%      40
 

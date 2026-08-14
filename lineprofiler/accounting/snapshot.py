@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from lineprofiler.accounting.identity import describe as describe_placement
-from lineprofiler.accounting.phase import PhaseTree, merge_trees, tree_from_dict, tree_to_dict
+from lineprofiler.accounting.phasetree import PhaseTree, merge_trees, tree_from_dict, tree_to_dict
 from lineprofiler.accounting.sampler import (
     Sample,
     open_process,

@@ -20,9 +20,11 @@ from __future__ import annotations
 import atexit
 import contextlib
 import os
+import re
 import signal
 import threading
 import warnings
+import weakref
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from functools import wraps
@@ -38,7 +40,7 @@ from lineprofiler.accounting.capabilities import (
     record_function_factory,
 )
 from lineprofiler.accounting.histogram import bucket_index
-from lineprofiler.accounting.phase import PhasePath, PhaseStats, PhaseTree
+from lineprofiler.accounting.phasetree import PhasePath, PhaseStats, PhaseTree
 from lineprofiler.accounting.sampler import (
     IoSnapshot,
     ProcessHandle,
@@ -79,9 +81,105 @@ _EXIT_SIGNALS = (signal.SIGTERM, signal.SIGUSR1, signal.SIGHUP)
 installed. Slurm sends SIGUSR1 ahead of preemption and SIGHUP on a lost allocation; both
 terminate by default without running atexit."""
 
+_NAME_SHAPE_WARN = 128
+"""Distinct phase names sharing one shape before the profiler says the names look generated.
+
+Far above any hand-written vocabulary — a 96-layer transformer named per layer stays quiet —
+and far below ``MAX_PHASES``, so the warning arrives while the report is still readable."""
+
+_NUMERIC_RUN = re.compile(r"\d+")
+"""Collapses the varying part of a generated name, so ``episode_1`` and ``episode_2`` share a
+shape. Only ever applied when a path is first admitted, never on the hot path."""
+
+_Handler = Callable[[int, "FrameType | None"], object] | int | None
+"""What ``signal.getsignal`` returns: a callable, ``SIG_DFL``/``SIG_IGN``, or ``None`` for a
+handler that was not installed from Python."""
+
 _ROOT: PhasePath = ()
 
 _live_profilers: list[str] = []
+
+_fork_hooks_installed = False
+"""Whether this interpreter has had the fork callbacks registered. Once only, ever."""
+
+_fork_registry: list[weakref.ref[Profiler]] = []
+"""The profilers the fork callbacks dispatch to, weakly.
+
+``os.register_at_fork`` has no counterpart that unregisters, so anything handed to it lives for
+the interpreter's lifetime. Registering three *bound methods* per profiler therefore made every
+enabled profiler immortal — it and its phase trees, thread states and writer — which a test
+suite constructing one per test pays for in full. One registration for the process, dispatching
+over weak references, lets a closed or dropped profiler actually go away.
+"""
+
+
+def _register_fork_hooks(profiler: Profiler) -> None:
+    """Add ``profiler`` to the fork registry, arming the process-wide callbacks on first use."""
+    global _fork_hooks_installed  # noqa: PLW0603 - one registration per interpreter
+    _fork_registry.append(weakref.ref(profiler))
+    if _fork_hooks_installed:
+        return
+    os.register_at_fork(
+        before=_before_fork,
+        after_in_parent=_after_fork_in_parent,
+        after_in_child=_after_fork_in_child,
+    )
+    _fork_hooks_installed = True
+
+
+def _forkable_profilers() -> list[Profiler]:
+    """Return the live, open profilers, dropping any that closed or were collected."""
+    live: list[Profiler] = []
+    survivors: list[weakref.ref[Profiler]] = []
+    for ref in _fork_registry:
+        profiler = ref()
+        if profiler is None or profiler._closed:  # noqa: SLF001 - same module
+            continue
+        survivors.append(ref)
+        live.append(profiler)
+    _fork_registry[:] = survivors
+    return live
+
+
+def _relink_signal_chain(
+    signum: signal.Signals,
+    ours: _Handler,
+    previous: _Handler,
+    skip: Profiler,
+) -> None:
+    """Point whoever chained on top of ``ours`` at ``previous`` instead.
+
+    Only rewrites the *restore target*. The successor's live handler closure still calls
+    ``ours``, which is harmless — a closed profiler's ``close()`` returns immediately and the
+    call passes straight through — but its eventual restore now skips the profiler that is
+    going away.
+    """
+    for reference in _fork_registry:
+        profiler = reference()
+        if profiler is None or profiler is skip:
+            continue
+        chained = profiler._chained_signals.get(signum)  # noqa: SLF001 - same module
+        if chained is not None and chained[1] is ours:
+            profiler._chained_signals[signum] = (chained[0], previous)  # noqa: SLF001
+            return
+
+
+def _before_fork() -> None:
+    """Stop every live profiler's threads before the process is copied."""
+    for profiler in _forkable_profilers():
+        profiler._pause_threads_before_fork()  # noqa: SLF001 - same module
+
+
+def _after_fork_in_parent() -> None:
+    """Restart the threads the fork paused."""
+    for profiler in _forkable_profilers():
+        profiler._resume_threads_after_fork()  # noqa: SLF001 - same module
+
+
+def _after_fork_in_child() -> None:
+    """Give each inherited profiler its own identity, files and threads."""
+    for profiler in _forkable_profilers():
+        profiler._reinitialise_after_fork()  # noqa: SLF001 - same module
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -119,6 +217,21 @@ class Profiler:
             phase names instead of anonymous frames. Costs a few hundred nanoseconds per
             phase and degrades to nothing when neither torch nor ``nvtx`` is installed.
             Off by default: it only pays for itself while such a capture is running.
+        install: Register this as the process-global profiler, so the module-level
+            :func:`phase`, :func:`count` and :func:`current` resolve to it. Without this,
+            instrumenting a deep function means threading a ``profiler`` argument through
+            every caller between it and wherever the object was constructed. ``close()``
+            uninstalls, and a forked child resolves its own profiler rather than the
+            parent's.
+        strict_names: Raise when two phase names differ only in their digits, rather than
+            warning once the tree is filling up. Turns "my phase vocabulary is fixed" into a
+            guarantee the profiler checks, instead of something to pin in a test by hand.
+        thread_names: Nest each thread's phases under its thread name, so two threads of one
+            process doing unrelated work are reported separately. ``role`` is per process, and
+            a learner taking gradient steps alongside a collector draining a queue is one
+            process with two very different answers to "where did the time go?". Off by
+            default: it changes the shape of the reported tree, and most processes have only
+            one interesting thread.
 
     Statistics are accumulated per thread and merged only when a snapshot is written, so the
     hot path takes no locks and needs none. A snapshot taken while another thread is inside
@@ -145,14 +258,21 @@ class Profiler:
         backend_window: tuple[int, int] | None = None,
         window_phase: str = "iteration",
         annotate: bool = False,
+        install: bool = False,
+        strict_names: bool = False,
+        thread_names: bool = False,
     ) -> None:
         self.enabled: bool = _resolve_enabled(enabled)
         self.measure_cpu: bool = measure_cpu
+        self.strict_names: bool = strict_names
+        self.thread_names: bool = thread_names
         self.run_dir: Path = _resolve_run_dir(run_dir)
         self.run_id: str = os.environ.get(ENV_RUN_ID, "") or new_run_id()
         self.role: str = role or os.environ.get(ENV_ROLE, "") or "main"
         self.backend: Backend = Backend.parse(backend)
 
+        if install:
+            install_profiler(self)
         self._local = threading.local()
         self._trees: list[PhaseTree] = []
         self._states: list[_ThreadState] = []
@@ -162,31 +282,41 @@ class Profiler:
         self._snapshot_interval_s = snapshot_interval_s
         self._closed = False
         self._snapshot_failures = 0
+        self._delta_baseline: PhaseTree = {}
+        self._name_shapes: dict[str, int] = {}
+        self._chained_signals: dict[signal.Signals, tuple[_Handler, _Handler]] = {}
+        self._snapshot_callbacks: list[Callable[[PhaseTree], None]] = []
+        self._callback_failures = 0
         self._phase_overflow = 0
         self._window: BackendWindow | None = None
-        self._process: ProcessHandle | None = open_process()
+        self._process: ProcessHandle | None = None
         self._sample_interval_s = sample_interval_s
-        self._nvtx = nvtx_range_functions() if annotate and self.enabled else None
-        self._record_function = record_function_factory() if annotate and self.enabled else None
-        # Resolved once: torch.cuda.is_available() initialises the driver on first call, so
-        # asking per phase would put a lock on the hot path.
-        self._cuda_sync = cuda_synchronize() if self.enabled else None
+        self._nvtx: tuple[Callable[[str], object], Callable[[], object]] | None = None
+        self._record_function: Callable[[str], AbstractContextManager[object]] | None = None
+        self._cuda_sync: Callable[[], None] | None = None
+        self._env_keys_propagated: list[str] = []
 
         if not self.enabled:
             return
 
+        # Everything below costs something, so none of it runs for a disabled profiler:
+        # open_process() constructs a psutil.Process and reads /proc, and used to run
+        # unconditionally above this check.
+        self._process = open_process()
+        self._nvtx = nvtx_range_functions() if annotate else None
+        self._record_function = record_function_factory() if annotate else None
+        # Resolved once: torch.cuda.is_available() initialises the driver on first call, so
+        # asking per phase would put a lock on the hot path.
+        self._cuda_sync = cuda_synchronize()
+
         _warn_if_already_live(self.run_dir)
-        _propagate_to_children(self.run_dir, self.run_id)
+        self._env_keys_propagated = _propagate_to_children(self.run_dir, self.run_id)
         self._writer = SnapshotWriter(self.run_dir, role=self.role, run_id=self.run_id)
         self._start_backend_window(backend_window, window_phase)
         self._start_sampler(sample_interval_s)
         self._install_exit_hooks()
         self._start_flush_timer()
-        os.register_at_fork(
-            before=self._pause_threads_before_fork,
-            after_in_parent=self._resume_threads_after_fork,
-            after_in_child=self._reinitialise_after_fork,
-        )
+        _register_fork_hooks(self)
 
     # ── public API ──────────────────────────────────────────────────────────
 
@@ -196,7 +326,13 @@ class Profiler:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def phase(self, name: str, io: bool = False, sync: bool = False) -> _PhaseScope | _NullScope:
+    def phase(
+        self,
+        name: str,
+        io: bool = False,
+        sync: bool = False,
+        sample: float = 1.0,
+    ) -> _PhaseScope | _NullScope | _SuppressedScope:
         """Open a named region, nested under the phase currently open on this thread.
 
         Args:
@@ -214,6 +350,25 @@ class Profiler:
                 actively measuring, not on every phase in the loop, and take timings from a
                 run where it is off once you know where the work is. A no-op when torch is
                 absent or no CUDA device is visible.
+            sample: Measure one entry in ``round(1/sample)`` and scale the result, for a
+                region worth splitting but too hot to afford at full rate. ``1.0`` (the
+                default) measures every entry.
+
+                **Everything derived from a sampled phase is an estimate**, and is reported
+                as one: the node carries its stride, the report marks the row, and merging a
+                sampled node into a measured one marks the result too. That labelling is the
+                condition on which this option exists — every other number in this layer is
+                measured, and an estimate that cannot be told apart from a measurement is the
+                failure mode the layer is built to avoid.
+
+                Sampling a phase samples its **whole subtree**. A skipped entry records
+                nothing for itself or anything beneath it, because counting children at full
+                rate under a parent counted at one in ``n`` would mix two rates in one tree
+                and produce a plausible wrong number rather than an obvious one.
+
+                Selection is a deterministic stride, not a random draw — a draw costs about
+                as much as the phase it is avoiding. The cost is aliasing: a workload whose
+                period matches the stride keeps measuring the same point in it.
             io: Read the process byte counters on entry and exit, so this phase's I/O is
                 measured *exactly* rather than inferred from the 1 Hz sampler. Costs a
                 ``/proc`` read at each end — tens of microseconds — so it belongs on coarse
@@ -242,7 +397,39 @@ class Profiler:
         """
         if not self.enabled:
             return _NULL_SCOPE
+        if sample != 1.0:
+            return self._sampled_phase(name, io, sync, sample)
         return _PhaseScope(self, name, io, sync)
+
+    def _sampled_phase(
+        self,
+        name: str,
+        io: bool,
+        sync: bool,
+        sample: float,
+    ) -> _PhaseScope | _NullScope | _SuppressedScope:
+        """Decide a sampled entry *before* allocating a scope for it.
+
+        This is where the saving actually comes from. Constructing a ``_PhaseScope`` costs
+        about a microsecond of the ~2.7 µs a phase takes — allocation plus thirteen slot
+        stores — so deciding inside ``__enter__`` would have meant paying most of a phase's
+        cost to skip it, and ``sample=0.01`` would have bought about 30%. Deciding here means
+        a skipped entry never builds one.
+
+        Kept off the default path: an unsampled ``phase()`` reaches this through one float
+        comparison and never calls it.
+        """
+        stride = _stride_of(sample)
+        state = self._thread_state()
+        if state.suppressed:
+            return _NULL_SCOPE  # already inside a skipped subtree: nothing to record or undo
+        path = state.paths[-1] + (name,)
+        seen = state.sampled.get(path, 0)
+        state.sampled[path] = seen + 1
+        if seen % stride:
+            state.suppressed = True
+            return state.suppressor
+        return _PhaseScope(self, name, io, sync, stride)
 
     def io_counters(self) -> IoSnapshot:
         """Return this process's cumulative byte counters at the disk and syscall layers.
@@ -267,7 +454,11 @@ class Profiler:
             return
         if not isinstance(n, int):
             raise TypeError(f"count() takes an int, got {type(n).__name__}")
-        self._thread_state().nodes[-1].add_count(name, n)
+        state = self._thread_state()
+        if state.suppressed:
+            return
+        # scale is 1 unless a sampled phase is open, so the multiply is the whole cost.
+        state.nodes[-1].add_count(name, n * state.scale)
 
     def snapshot(self) -> None:
         """Merge every thread's statistics and write the current aggregate to disk.
@@ -284,19 +475,114 @@ class Profiler:
         self._writer.write(self.merged_tree())
 
     def merged_tree(self) -> PhaseTree:
-        """Return the union of every thread's phase tree for this process."""
+        """Return the union of every thread's phase tree for this process.
+
+        With ``thread_names=True`` each thread's phases are nested under its thread name, so
+        two threads of one process doing unrelated work — a learner taking gradient steps and
+        a collector draining a queue — stop being averaged into one set of numbers. The
+        prefixing happens here rather than at phase entry, so it costs nothing on the hot path
+        and does not change what a phase name means.
+        """
         merged: PhaseTree = {}
-        for tree in list(self._trees):
-            for path, stats in list(tree.items()):
-                node = merged.get(path)
+        for state in list(self._states):
+            prefix: PhasePath = (state.thread,) if self.thread_names else _ROOT
+            for path, stats in list(state.tree.items()):
+                key = prefix + path
+                node = merged.get(key)
                 if node is None:
-                    merged[path] = stats.copy()
+                    merged[key] = stats.copy()
                 else:
                     node.merge(stats)
+        if self.thread_names:
+            _fill_thread_totals(merged)
         return merged
 
+    def deltas(self) -> PhaseTree:
+        """Return the work recorded since the previous call, and advance the cursor.
+
+        ``merged_tree()`` is cumulative, so exporting a per-interval figure to W&B or
+        TensorBoard means keeping a copy of the last reading and subtracting — which every
+        user of a long training run otherwise writes for themselves. The first call returns
+        everything so far.
+
+        Quantiles survive the subtraction: histograms are bucket counts, so the difference of
+        two cumulative histograms is the histogram of the interval between them.
+
+        Note that ``wait_ns`` pairs with ``wall_ns`` and never with ``self_ns`` — waiting
+        inside a child counts towards the parent, so ``wait / self`` exceeds 100% for any
+        phase wrapping a blocking call.
+
+        Has its own cursor, independent of :meth:`on_snapshot`. Calling this *inside* an
+        ``on_snapshot`` callback is the intended way to get per-interval numbers.
+
+        Test specifically:
+            - two successive calls sum to ``merged_tree()``
+            - a phase that did no work in the interval is absent rather than present at zero
+            - counters and histogram quantiles are per-interval, not cumulative
+        """
+        current = self.merged_tree()
+        deltas: PhaseTree = {}
+        for path, stats in current.items():
+            baseline = self._delta_baseline.get(path)
+            delta = stats if baseline is None else stats.difference(baseline)
+            if delta.calls or delta.wall_ns or delta.counters:
+                deltas[path] = delta.copy() if baseline is None else delta
+        self._delta_baseline = current
+        return deltas
+
+    def on_snapshot(
+        self,
+        callback: Callable[[PhaseTree], None],
+    ) -> Callable[[PhaseTree], None]:
+        """Call ``callback`` with the cumulative tree after each *periodic* flush.
+
+        Returns the callback, so it is usable as a decorator.
+
+        For live export: a training run that already has W&B or TensorBoard usually wants the
+        breakdown during the run, not only after it. Call :meth:`deltas` inside the callback
+        for per-interval figures.
+
+        Fires only from the background flush timer — deliberately not from ``close()`` or from
+        a snapshot taken in a signal handler, where running arbitrary user code risks
+        deadlocking the process on its own final flush. That keeps :meth:`snapshot`
+        signal-safe, at the cost of the last partial interval.
+
+        A callback that raises is counted and skipped, never propagated: an exporter losing
+        its connection must not stop the flush timer, which is the defect that used to freeze
+        a worker file for the rest of a run.
+
+        Test specifically:
+            - a raising callback does not stop later flushes or later callbacks
+            - the callback sees a tree, and ``deltas()`` inside it sees the interval
+            - it works as a decorator, leaving the decorated function callable
+        """
+        self._snapshot_callbacks.append(callback)
+        return callback
+
     def close(self) -> None:
-        """Write a final snapshot and stop the sampler, backend and flush threads."""
+        """Write a final snapshot and stop the sampler, backend and flush threads.
+
+        Note that ``os._exit()`` reaches neither this nor the signal handlers, and it is the
+        ordinary way a multiprocessing entrypoint tears a worker down. Call this yourself on
+        any path that ends the process that way, or everything since the last periodic flush
+        is lost — leaving a file that parses and looks complete but stops early.
+
+        Also undoes what an enabled profiler did to the process: the ``atexit`` registration
+        and the signal handlers are removed, the fork callbacks — which CPython offers no way
+        to unregister — go inert, and any of ``LINEPROFILER_PROFILE`` / ``_RUN_DIR`` /
+        ``_RUN_ID`` this instance exported (not ones already set by the user or launcher) are
+        unset, so a later ``Profiler()`` in the same process mints its own run id instead of
+        silently joining this one's attempt. Closed is terminal; a closed profiler never
+        writes again, not even in a child forked afterwards.
+
+        Test specifically:
+            - every chained signal is back to its previous disposition afterwards
+            - a handler the host installed after the profiler is not clobbered
+            - a fork after this writes nothing and starts no thread
+            - environment variables this instance propagated are unset; ones it found already
+              set are left alone
+        """
+        uninstall_profiler(self)
         if self._closed or not self.enabled:
             return
         self._closed = True
@@ -311,6 +597,12 @@ class Profiler:
         self.snapshot()
         if str(self.run_dir) in _live_profilers:
             _live_profilers.remove(str(self.run_dir))
+        # After the final snapshot: teardown must never cost the flush it exists to protect.
+        self._restore_signals()
+        atexit.unregister(self.close)
+        _fork_registry[:] = [ref for ref in _fork_registry if ref() is not self]
+        for key in self._env_keys_propagated:
+            os.environ.pop(key, None)
 
     def current_phase(self) -> str:
         """Return the deepest phase open in any thread, as a ``/``-joined path.
@@ -359,6 +651,44 @@ class Profiler:
 
     # ── internals ───────────────────────────────────────────────────────────
 
+    def _check_name_shape(self, path: PhasePath) -> None:
+        """Notice phase names that vary per call, before the tree fills up because of them.
+
+        ``count()`` raises on a float rather than truncating it. A name built from data is the
+        more damaging mistake of the two and had no such protection: it degrades the report
+        instead of raising, and only announces itself at ``MAX_PHASES``, by which point the
+        run is already unreadable.
+
+        One name in isolation says nothing — ``conv2d`` and ``resnet50`` are perfectly good
+        names. What gives it away is *repetition of a shape*: ``episode_1`` and ``episode_2``
+        share the shape ``episode_#``, and a hand-written vocabulary does not accumulate
+        hundreds of those. So the check counts distinct names per shape rather than judging
+        any name on its own.
+
+        The counter is shared across threads and incremented without a lock: this is a
+        heuristic whose worst failure under a race is warning slightly late.
+        """
+        shape = _NUMERIC_RUN.sub("#", path[-1])
+        if shape == path[-1]:
+            return
+        seen = self._name_shapes.get(shape, 0) + 1
+        self._name_shapes[shape] = seen
+        if self.strict_names and seen > 1:
+            raise ValueError(
+                f"phase name {path[-1]!r} looks built from data: {seen} distinct names now "
+                f"share the shape {shape!r}. Use a fixed name and count() for the varying "
+                f"part, or pass strict_names=False.",
+            )
+        if seen == _NAME_SHAPE_WARN:
+            warnings.warn(
+                f"{seen} distinct phase names share the shape {shape!r} (most recently "
+                f"{path[-1]!r}). Names built from data grow the phase tree until it folds at "
+                f"{MAX_PHASES} paths and the report stops being readable — use a fixed name "
+                f"and count() for the varying part.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
     def _note_phase_overflow(self, path: PhasePath) -> None:
         """Warn once that the phase tree is full, naming a path that did not fit."""
         if self._phase_overflow:
@@ -402,7 +732,7 @@ class Profiler:
             - no ``lineprofiler`` thread is alive at the moment of the fork
             - the parent's sampler resumes and keeps producing rows afterwards
         """
-        if not self.enabled:
+        if not self.enabled or self._closed:
             return
         if self._flush_timer is not None:
             self._flush_timer.cancel()
@@ -432,13 +762,19 @@ class Profiler:
             - the sampler and flush timer run again in the child
             - nesting a fork inside a phase leaves the child with a clean phase stack
             - the child's profiler-overhead total starts at zero, since its byte counters do
+            - a child forked after ``close()`` inherits nothing: no file, no thread
+
+        ``os.register_at_fork`` callbacks cannot be unregistered — CPython offers no API — so
+        a closed profiler cannot stop being called here and must instead refuse to act. This
+        used to set ``_closed`` back to ``False`` unconditionally, which meant any fork after
+        ``close()`` handed the child a live profiler: a new writer that re-created the run
+        directory, a sampler and a flush timer, for a profiler the process had finished with.
         """
-        if not self.enabled:
+        if not self.enabled or self._closed:
             return
         self._local = threading.local()
         self._trees = []
         self._states = []
-        self._closed = False
         self._process = open_process()
         # The child's OS byte counters start at zero, so the parent's overhead total would
         # over-deduct against them for the rest of the child's life.
@@ -503,6 +839,35 @@ class Profiler:
 
         with contextlib.suppress(ValueError, OSError):
             signal.signal(signum, handler)
+            # Kept so close() can put back what was here. Recorded only once the install
+            # succeeded, so a signal we failed to take is never one we try to restore.
+            self._chained_signals[signum] = (handler, previous)
+
+    def _restore_signals(self) -> None:
+        """Take this profiler out of the signal chain it joined.
+
+        Handlers chain, so which profiler is currently installed depends on construction order
+        and closing order, and the two need not match: closing a parent before the child it
+        constructed is ordinary code. Two cases therefore:
+
+        - **We are on top.** Put back what we replaced.
+        - **Something chained above us.** Restoring would delete whatever is on top, so we
+          leave the handler installed and instead hand our predecessor to whoever holds us as
+          theirs. Our closure still calls through correctly in the meantime; when the profiler
+          above us closes, it now restores past us to the right target. Without this splice a
+          parent closed before its child stranded its handler in the process for good.
+
+        A handler the *host* installed above us cannot be spliced, because we do not know what
+        it will restore to. There we simply stay installed — the safe side of the trade, since
+        our handler still chains correctly and closing has made it inert.
+        """
+        for signum, (ours, previous) in self._chained_signals.items():
+            with contextlib.suppress(ValueError, OSError):
+                if signal.getsignal(signum) is ours:
+                    signal.signal(signum, previous)
+                else:
+                    _relink_signal_chain(signum, ours, previous, skip=self)
+        self._chained_signals.clear()
 
     def _start_flush_timer(self) -> None:
         """Schedule the next background snapshot, if a cadence was configured."""
@@ -526,13 +891,50 @@ class Profiler:
         except Exception:  # noqa: BLE001 - a failed flush must not stop the ones after it
             self._snapshot_failures += 1
         finally:
+            self._notify_snapshot_callbacks()
             self._start_flush_timer()
+
+    def _notify_snapshot_callbacks(self) -> None:
+        """Hand the current tree to each live-export callback, surviving any that raises.
+
+        One exporter losing its connection must not cost the run its remaining flushes, nor
+        stop the callbacks registered after it.
+        """
+        if not self._snapshot_callbacks:
+            return
+        tree = self.merged_tree()
+        for callback in list(self._snapshot_callbacks):
+            try:
+                callback(tree)
+            except Exception:  # noqa: BLE001 - an exporter must not stop the flush timer
+                self._callback_failures += 1
+
+
+def _fill_thread_totals(merged: PhaseTree) -> None:
+    """Give each per-thread root the wall time of the phases beneath it.
+
+    A thread's root node is never entered, so it carries no time of its own — and the report
+    derives every share from the wall time of top-level nodes. Without this the thread level
+    would render as a row of zeros and suppress the block entirely. ``child_wall_ns`` matches,
+    so the synthesised node claims no self time it did not spend.
+    """
+    totals: dict[str, int] = {}
+    for path, stats in merged.items():
+        if len(path) == 2:
+            totals[path[0]] = totals.get(path[0], 0) + stats.wall_ns
+    for path, stats in merged.items():
+        if len(path) == 1:
+            stats.wall_ns = totals.get(path[0], 0)
+            stats.child_wall_ns = stats.wall_ns
 
 
 class _ThreadState:
     """One thread's open phase stack and its private slice of the phase tree."""
 
-    __slots__ = ("names", "nodes", "paths", "tree")
+    __slots__ = (
+        "names", "nodes", "paths", "sampled", "scale", "suppressed", "suppressor", "thread",
+        "tree",
+    )
 
     def __init__(self) -> None:
         root = PhaseStats()
@@ -540,14 +942,33 @@ class _ThreadState:
         self.names: list[str] = []
         self.paths: list[PhasePath] = [_ROOT]
         self.nodes: list[PhaseStats] = [root]
+        # Read once, on this thread's first phase, never on the hot path.
+        self.thread: str = threading.current_thread().name
+        self.suppressed: bool = False
+        """Set while inside a sampled phase whose entry was not selected. Everything beneath
+        records nothing: sampling a phase samples its whole subtree, or children would be
+        counted at full rate under a parent counted at one in ``n`` and the tree would mix two
+        rates in one place.
+
+        A flag rather than a depth, because only the *outermost* skipped phase owns it —
+        everything nested inside gets the shared null scope and has nothing to unwind."""
+        self.suppressor: _SuppressedScope = _SuppressedScope(self)
+        """Reused for every skipped entry on this thread. Only one can be open at a time (the
+        outermost), so one instance suffices, and skipping then allocates nothing at all."""
+        self.scale: int = 1
+        """Product of the strides of the sampled phases currently open, so ``count()`` scales
+        the work it attributes by the same factor as the time around it."""
+        self.sampled: dict[PhasePath, int] = {}
+        """Entries seen per sampled path. A deterministic stride rather than a random draw:
+        one increment and a compare, against ~50 ns for ``random()`` on the hot path."""
 
 
 class _PhaseScope:
     """Context manager for one phase entry. Allocated per call, so it nests safely."""
 
     __slots__ = (
-        "_cpu0", "_function", "_io", "_io0", "_name", "_profiler", "_self_io0", "_state",
-        "_stats", "_sync", "_wall0",
+        "_cpu0", "_function", "_io", "_io0", "_name", "_profiler", "_self_io0", "_skipped",
+        "_state", "_stats", "_stride", "_sync", "_wall0",
     )
 
     def __init__(
@@ -556,10 +977,13 @@ class _PhaseScope:
         name: str,
         io: bool = False,
         sync: bool = False,
+        stride: int = 1,
     ) -> None:
         self._profiler = profiler
         self._name = name
         self._io = io
+        self._stride = stride
+        self._skipped = False
         # Resolved here rather than read at both ends: a phase that does not synchronise
         # then costs one `is not None` test instead of two attribute loads and a branch.
         self._sync = profiler._cuda_sync if sync else None
@@ -573,6 +997,12 @@ class _PhaseScope:
 
     def __enter__(self) -> None:
         state = self._profiler._thread_state()
+        self._state = state
+        # Inside a sampled phase that was not selected: record nothing, but keep the depth so
+        # __exit__ unwinds symmetrically.
+        if state.suppressed:
+            self._skipped = True
+            return
         if len(state.names) >= MAX_DEPTH:
             self._stats = state.nodes[-1]  # fold into the ancestor rather than grow the tree
             path = state.paths[-1]
@@ -589,7 +1019,8 @@ class _PhaseScope:
         state.names.append(self._name)
         state.paths.append(path)
         state.nodes.append(self._stats)
-        self._state = state
+        if self._stride != 1:
+            state.scale *= self._stride
         window = self._profiler._window
         if window is not None:
             window.on_phase_enter(self._name)
@@ -626,11 +1057,15 @@ class _PhaseScope:
         if len(state.tree) >= MAX_PHASES:
             self._profiler._note_phase_overflow(path)
             return None
+        # Only reached once per distinct path, never on the hot path, so a regex here is free.
+        self._profiler._check_name_shape(path)
         stats = PhaseStats()
         state.tree[path] = stats
         return stats
 
     def __exit__(self, *exc: object) -> None:
+        if self._skipped:
+            return  # the outermost skipped phase owns the flag and clears it
         if self._sync is not None:
             self._sync()  # first: the kernels this phase launched are part of its cost
         wall = perf_counter_ns() - self._wall0
@@ -648,6 +1083,13 @@ class _PhaseScope:
         state.names.pop()
         state.paths.pop()
         state.nodes.pop()
+        # The product of every sampled phase currently open, this one included — not just
+        # this phase's own stride. A child of a phase sampled at one in ten is itself only
+        # entered on those ten, so scaling it by its own stride alone (1) under-reports it
+        # tenfold and leaves two rates mixed in one tree.
+        scale = state.scale
+        if self._stride != 1:
+            state.scale //= self._stride
         stats = self._stats
         parent = state.nodes[-1]
         if stats is None or stats is parent:
@@ -655,22 +1097,26 @@ class _PhaseScope:
 
         # PhaseStats.record and DurationHistogram.observe are inlined: at roughly a
         # microsecond per phase, two extra Python-level calls are a measurable share.
-        stats.calls += 1
-        stats.wall_ns += wall
-        stats.cpu_ns += cpu
+        stats.calls += scale
+        stats.wall_ns += wall * scale
+        stats.cpu_ns += cpu * scale
         histogram = stats.hist
-        histogram.buckets[bucket_index(wall)] += 1
-        histogram.count += 1
-        parent.child_wall_ns += wall
+        histogram.buckets[bucket_index(wall)] += scale
+        histogram.count += scale
+        parent.child_wall_ns += wall * scale
+        if scale != 1:
+            # Marks every derived figure on this node as an estimate. Set on exit rather than
+            # at admission so a node only claims to be sampled once it actually is.
+            stats.sample_stride = scale
 
         if self._io:
-            self._record_io(stats)
+            self._record_io(stats, scale)
 
         window = self._profiler._window
         if window is not None:
             window.on_phase_exit(self._name)
 
-    def _record_io(self, stats: PhaseStats) -> None:
+    def _record_io(self, stats: PhaseStats, scale: int = 1) -> None:
         """Attribute the bytes this phase moved, measured at its own boundaries.
 
         Records nothing at all when either boundary reading failed — a phase with no I/O
@@ -691,23 +1137,45 @@ class _PhaseScope:
             return
         chars_before, blocks_before = self._self_io0
         chars_after, blocks_after = selfio_bytes_written()
-        self._add_delta(stats, "io_read_bytes", now.read_bytes - self._io0.read_bytes)
-        self._add_delta(stats, "io_read_chars", now.read_chars - self._io0.read_chars)
+        # Scaled by the same factor as the time around it. Bytes measured on one entry in n,
+        # sitting beside a duration scaled to all n, would be two rates in one row.
+        self._add_delta(stats, "io_read_bytes", (now.read_bytes - self._io0.read_bytes) * scale)
+        self._add_delta(stats, "io_read_chars", (now.read_chars - self._io0.read_chars) * scale)
         self._add_delta(
             stats,
             "io_write_bytes",
-            now.write_bytes - self._io0.write_bytes - (blocks_after - blocks_before),
+            (now.write_bytes - self._io0.write_bytes - (blocks_after - blocks_before)) * scale,
         )
         self._add_delta(
             stats,
             "io_write_chars",
-            now.write_chars - self._io0.write_chars - (chars_after - chars_before),
+            (now.write_chars - self._io0.write_chars - (chars_after - chars_before)) * scale,
         )
 
     @staticmethod
     def _add_delta(stats: PhaseStats, name: str, delta: int) -> None:
         if delta > 0:
             stats.add_count(name, delta)
+
+
+class _SuppressedScope:
+    """Handed out for an entry inside a sampled phase that was not selected.
+
+    Holds only the thread state, so that ``__exit__`` unwinds the suppression depth
+    symmetrically. Sampling a phase samples its whole subtree: recording children at full rate
+    beneath a parent recorded at one in ``n`` would leave two rates mixed in one tree.
+    """
+
+    __slots__ = ("_state",)
+
+    def __init__(self, state: _ThreadState) -> None:
+        self._state = state
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *exc: object) -> None:
+        self._state.suppressed = False
 
 
 class _NullScope:
@@ -725,6 +1193,101 @@ class _NullScope:
 _NULL_SCOPE = _NullScope()
 
 
+# ── the ambient profiler ────────────────────────────────────────────────────
+#
+# `phase()` being an instance method means instrumenting a deep function requires threading a
+# profiler argument through every caller between it and wherever the object was constructed.
+# In a real integration that is the search, the episode loop, the actor session and the
+# inference server — for one phase. The alternative every integration writes for itself is a
+# process-global shim, so it ships here instead, once and tested.
+
+_installed: Profiler | None = None
+"""The profiler ``phase()``/``count()`` below resolve to. Process-global on purpose: phase
+*statistics* are per thread (see ``_ThreadState``), but which profiler is in use is a property
+of the process, and a thread-local one would leave every thread a worker spawned uninstrumented.
+"""
+
+
+def install_profiler(profiler: Profiler) -> None:
+    """Make ``profiler`` the one the module-level functions resolve to.
+
+    Usually done at construction with ``Profiler(..., install=True)`` rather than called
+    directly. ``close()`` uninstalls, so a closed profiler is never resolvable.
+    """
+    global _installed  # noqa: PLW0603 - the point of the function
+    if _installed is not None and _installed is not profiler and not _installed._closed:  # noqa: SLF001
+        warnings.warn(
+            "an accounting Profiler is already installed; module-level phase() and count() "
+            "will now resolve to the new one",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    _installed = profiler
+
+
+def uninstall_profiler(profiler: Profiler | None = None) -> None:
+    """Clear the installed profiler, if it is ``profiler`` (or unconditionally when ``None``)."""
+    global _installed  # noqa: PLW0603 - the point of the function
+    if profiler is None or _installed is profiler:
+        _installed = None
+
+
+def installed_profiler() -> Profiler | None:
+    """Return the installed profiler, or ``None``. Useful for asserting in tests."""
+    return _installed
+
+
+def phase(
+    name: str,
+    io: bool = False,
+    sync: bool = False,
+    sample: float = 1.0,
+) -> _PhaseScope | _NullScope | _SuppressedScope:
+    """Open a phase on the installed profiler, or do nothing when there is none.
+
+    The no-op path is one module-global load and one identity test, so leaving these calls in
+    library code that is sometimes profiled and sometimes not costs nothing measurable — which
+    is what makes it safe to instrument a function that does not know whether it is being
+    profiled.
+
+    Test specifically:
+        - with nothing installed, this records nothing and allocates no state
+        - a forked child resolves the child's profiler, never the parent's dead one
+        - after ``close()`` this is a no-op again
+    """
+    profiler = _installed
+    if profiler is None:
+        return _NULL_SCOPE
+    return profiler.phase(name, io, sync, sample)
+
+
+def count(name: str, n: int = 1) -> None:
+    """Attribute ``n`` work units on the installed profiler, or do nothing when there is none."""
+    profiler = _installed
+    if profiler is not None:
+        profiler.count(name, n)
+
+
+def current() -> str:
+    """Return the deepest phase open on the installed profiler, or ``""`` when there is none.
+
+    Handy for tagging a log line or an exception with whatever the process was doing.
+    """
+    profiler = _installed
+    return profiler.current_phase() if profiler is not None else ""
+
+
+def _stride_of(sample: float) -> int:
+    """Turn a sampling fraction into the "one entry in n" stride, validating it here.
+
+    Raised rather than clamped: ``sample=0`` means "measure nothing", which is a mistake a
+    caller wants to hear about immediately, not a phase that silently never appears.
+    """
+    if not 0.0 < sample <= 1.0:
+        raise ValueError(f"sample must be in (0.0, 1.0], got {sample!r}")
+    return max(1, round(1.0 / sample))
+
+
 def _resolve_enabled(enabled: bool | None) -> bool:
     """Resolve the master switch, reading the environment only when not given explicitly."""
     if enabled is not None:
@@ -733,17 +1296,32 @@ def _resolve_enabled(enabled: bool | None) -> bool:
 
 
 def _resolve_run_dir(run_dir: str | Path | None) -> Path:
-    """Use the caller's directory, else the one a parent process propagated, else the default."""
-    if run_dir is not None:
-        return Path(run_dir)
-    return Path(os.environ.get(ENV_RUN_DIR, "") or "profile")
+    """Use the caller's directory, else the one a parent process propagated, else the default.
+
+    Always returned absolute, because the result is exported to children through
+    ``LINEPROFILER_RUN_DIR`` and a relative path means a different directory in every process
+    that has its own working directory. A batch system gives workers exactly that, so one run
+    used to scatter its worker files across the filesystem and merge as several short runs —
+    or land in whatever tree the job happened to start in.
+
+    A relative path is resolved against the working directory of the process that constructed
+    the profiler, which is what the caller meant by it. Deliberately *not* against
+    ``$SLURM_SUBMIT_DIR``: schedulers and portals set that to whatever directory the job was
+    launched from, which under Open OnDemand is the dashboard's own installation directory and
+    typically not writable. Relocating the user's path there would trade one surprising
+    location for a less predictable one.
+    """
+    given = Path(run_dir) if run_dir is not None else Path(
+        os.environ.get(ENV_RUN_DIR, "") or "profile",
+    )
+    return given if given.is_absolute() else Path.cwd() / given
 
 
 def _truthy(value: str) -> bool:
     return bool(value.strip()) and value not in {"0", "false", "False"}
 
 
-def _propagate_to_children(run_dir: Path, run_id: str) -> None:
+def _propagate_to_children(run_dir: Path, run_id: str) -> list[str]:
     """Export the switch and run directory so child processes enable themselves.
 
     A worker started with ``spawn`` inherits the environment but not the parent's objects,
@@ -755,10 +1333,18 @@ def _propagate_to_children(run_dir: Path, run_id: str) -> None:
     daemon's environment, a snapshot taken when the daemon started. Variables exported after
     that never reach them. Under ``forkserver``, export ``LINEPROFILER_PROFILE`` in the shell
     before training starts, or pass ``enabled`` and ``run_dir`` to each worker explicitly.
+
+    Returns the keys this call actually set (i.e. were previously unset), so ``close()`` can
+    undo exactly those and leave anything the user or launcher had already exported alone —
+    otherwise a long-lived process that opens and closes several profilers in turn (this test
+    suite included) hands every later one the first one's ``run_id``, which defeats the
+    "separate attempts" protection in :func:`_split_by_attempt` instead of providing it.
     """
-    os.environ.setdefault(ENV_ENABLE, "1")
-    os.environ.setdefault(ENV_RUN_DIR, str(run_dir))
-    os.environ.setdefault(ENV_RUN_ID, run_id)
+    to_set = {ENV_ENABLE: "1", ENV_RUN_DIR: str(run_dir), ENV_RUN_ID: run_id}
+    newly_set = [key for key in to_set if key not in os.environ]
+    for key in newly_set:
+        os.environ[key] = to_set[key]
+    return newly_set
 
 
 def _warn_if_already_live(run_dir: Path) -> None:
