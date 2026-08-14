@@ -286,7 +286,7 @@ heavy profilers cannot be active at once — they contend for the same interpret
 `torch.profiler.record_function`, so an externally started `nsys profile` or Kineto capture
 shows your phase names. This package never launches nsys itself.
 
-### What it deliberately does not do
+### What it does not do
 
 Function-level tracing, CUDA kernel timing, GPU compute-versus-wait attribution and
 per-line memory are left to `torch.profiler`, VizTracer, memray and nsys. The GPU block
@@ -296,9 +296,75 @@ you that breakdown for a window.
 
 ### Optional dependencies
 
-`psutil` (memory and I/O), `torch` (CUDA memory), `nvidia-ml-py` (GPU utilisation),
-`viztracer`. Each is imported lazily behind a capability check; a missing one disables one
-block of the report and never raises.
+None of `psutil`, `torch`, `nvidia-ml-py` or `viztracer` are required. Each is imported
+lazily behind a capability check (`capabilities.py`); whichever are missing just disables the
+block of the report they feed, and construction never raises.
+
+| Package | Extra | Powers |
+|---|---|---|
+| `psutil` | `resources` | RSS (memory block) and per-process I/O counters (`I/O` block, both `bytes` and `chars` layers) |
+| `nvidia-ml-py` | `gpu` | GPU block: whole-device (`busy`) and per-pid (`this run`) utilisation, read by the 1 Hz sampler |
+| `torch` | none — install separately | CUDA allocator stats (VRAM allocated/reserved), `phase(sync=True)`, NVTX ranges (`annotate=True`), the `backend="torch"` window |
+| `viztracer` | `viztracer` | the `backend="viztracer"` window |
+
+```
+pip install with-line-profiler[resources]   # psutil  -> memory + I/O blocks
+pip install with-line-profiler[gpu]         # nvidia-ml-py -> GPU utilisation block
+pip install with-line-profiler[viztracer]   # viztracer backend
+pip install with-line-profiler[all]         # psutil + nvidia-ml-py + viztracer
+pip install torch                           # separately; CUDA memory, sync=True, annotate=True, backend="torch"
+```
+
+None of this is threaded through your code — construct `Profiler` the same way regardless,
+and each block just appears once its package is importable and, for NVML, once a device is
+visible:
+
+```python
+profiler = Profiler(run_dir="profile", role="learner")
+```
+
+**`psutil`** drives the sampler's memory and I/O rows: `Process.memory_info().rss` for the
+memory block, and `Process.io_counters()` for both layers reported under `I/O` —
+`read_bytes`/`write_bytes` (block device) and `read_chars`/`write_chars` (syscalls, cache hits
+included). Without it the sampler still starts; those two blocks are absent, nothing else is.
+
+**`torch`** is read for CUDA rather than declared as a dependency, so install it yourself if you want GPU features. It backs:
+- `cuda_alloc`/`cuda_reserved` sampler rows → `VRAM allocated (peak)` / `VRAM reserved (peak)`
+  in the GPU block, via `torch.cuda.memory_allocated()`/`memory_reserved()`
+- `phase(name, sync=True)`, which calls `torch.cuda.synchronize()` at both ends of the phase
+  so its wall time reflects GPU completion rather than kernel enqueue; a no-op when torch is
+  absent or no CUDA device is visible
+- `Profiler(..., annotate=True)`, which wraps every phase in `torch.cuda.nvtx.range_push/pop`
+  (falling back to the standalone `nvtx` package) and `torch.profiler.record_function`, so an externally started `nsys profile` or Kineto capture shows your phase names
+- `Backend.TORCH`, the `backend="torch"` window below
+
+**`nvidia-ml-py`** (imported as `pynvml`) is initialised once on first use; if `nvmlInit()`
+fails — no driver, no GPU — the capability degrades to `None` and the sampler skips GPU rows.
+It supplies the two numbers the GPU block reports per device: `nvmlDeviceGetUtilizationRates`
+(whole-device `busy`) and `nvmlDeviceGetProcessUtilization` (`this run`, this pid's share).
+
+**`viztracer`** backs only `Backend.VIZTRACER`, the other heavy-profiler option below; it is
+never imported for anything else.
+
+#### Running a heavy backend for a window
+
+```python
+profiler = Profiler(
+    run_dir="profile",
+    backend="torch",              # or "viztracer"
+    backend_window=(100, 110),    # start on the 100th entry into "iteration", stop on the 110th
+    window_phase="iteration",
+)
+```
+
+Starts the chosen backend on the 100th entry into `iteration` and stops it on the 110th,
+writing its artifact under `profile/backend/` — a Chrome trace (`torch_trace.json`, open at
+`chrome://tracing` or with Perfetto) for `backend="torch"`, a VizTracer capture
+(`viztracer.json`, open with `vizviewer`) for `backend="viztracer"`. `backend` is a single
+enum value: `line_profiler`, `cProfile`, VizTracer and `torch.profiler` all contend for the
+interpreter's trace hook, so only one heavy profiler can run at a time. If the chosen
+package isn't installed, the window degrades to a no-op and records `unavailable_reason` in
+`metadata.json` instead of raising.
 
 ## Licence
 MIT
