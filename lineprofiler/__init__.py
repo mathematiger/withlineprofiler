@@ -8,12 +8,16 @@ from lineprofiler.profiler import (
     FunctionStats,
     LineProfiler,
     LineStats,
+    start_profiling,
+    stop_profiling,
 )
 
 __all__ = [
     "FunctionStats",
     "LineProfiler",
     "LineStats",
+    "start_profiling",
+    "stop_profiling",
 ]
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"

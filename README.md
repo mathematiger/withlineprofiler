@@ -1,7 +1,56 @@
 # with-line-profiler
 
-Two independent profiling tools in one distribution. Install as `with-line-profiler`,
-import as `lineprofiler`:
+[![PyPI](https://img.shields.io/pypi/v/with-line-profiler.svg)](https://pypi.org/project/with-line-profiler/)
+[![CI](https://github.com/mathematiger/withlineprofiler/actions/workflows/ci.yml/badge.svg)](https://github.com/mathematiger/withlineprofiler/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-informational.svg)](LICENSE)
+[![Python](https://img.shields.io/pypi/pyversions/with-line-profiler.svg)](https://pypi.org/project/with-line-profiler/)
+
+Two independent profiling tools in one distribution: line-by-line tracing for a region you
+suspect, and low-overhead phase accounting for a run too long to trace. Zero required
+dependencies, MIT licensed.
+
+```
+pip install with-line-profiler
+```
+
+```python
+# example.py
+from lineprofiler import LineProfiler
+
+def slow_function():
+    total = 0
+    for i in range(1_000_000):
+        total += i * i
+    return total
+
+profiler = LineProfiler()
+with profiler:
+    slow_function()
+profiler.print_stats()
+```
+
+```
+====================================================================================================
+File: /path/to/example.py
+Function: slow_function at line 3
+Total time: 710676.0 µs
+====================================================================================================
+Line #   Hits       Time (µs)       Per Hit (µs)    % Time     Line Content
+----------------------------------------------------------------------------------------------------
+6        1000000    364848.9        0.4             51.3       total += i * i
+5        1000001    345825.8        0.3             48.7       for i in range(1_000_000):
+7        1          0.7             0.7             0.0        return total
+4        1          0.6             0.6             0.0        total = 0
+```
+
+(numbers vary by machine; `File:` prints the absolute path)
+
+That's the whole API surface for a first try — no decorators to add to the function, no
+separate `kernprof` invocation, no build step. `project_folder` auto-detects your nearest git
+repo root, so only your own code is traced; the standard library and installed packages are
+skipped automatically. See [Adopting either tool in two lines](#adopting-either-tool-in-two-lines)
+for dropping this into a script you don't want to restructure around a `with` block, or
+[vs. `line_profiler`](#vs-line_profiler) if you're comparing against the incumbent.
 
 | Tool | What it does | Use it when |
 |---|---|---|
@@ -20,6 +69,77 @@ pip install with-line-profiler
 
 See [Optional dependencies](#optional-dependencies) for the extras that enable the memory,
 I/O and GPU blocks.
+
+## vs. `line_profiler`
+
+The most likely thing you've already tried is [`line_profiler`](https://github.com/pyutils/line_profiler)
+(`kernprof`). Both give you per-line hit counts and timings; the difference is in what you have
+to do to your code first:
+
+| | `line_profiler` | `lineprofiler.LineProfiler` |
+|---|---|---|
+| Mark functions to profile | `@profile` decorator on each one (or `kernprof -l`, which injects it) | Nothing — every function under your project folder while the `with` block/`start_profiling()` is active |
+| Run it | `kernprof -lv script.py`, a separate invocation | Two lines inside your existing script, run it normally |
+| Mechanism | C-accelerated line tracer | Pure-Python `sys.settrace` |
+| Overhead | Lower — built for leaving `@profile` on hot code | Higher — meant for a bounded region, not a whole run |
+| Notebook/REPL use | Needs the `%lprun` IPython extension | `with profiler:` works as-is, no extension |
+
+If you already know exactly which function is slow and want the lowest possible overhead,
+`line_profiler` is the better tool. If you want to point at a *region* of code — including code
+you didn't write and can't add a decorator to — without a separate build/run step, that's what
+this package is for.
+
+## Adopting either tool in two lines
+
+Both tools also come as a module-level entry/exit pair — the alternative to a `with` block for
+dropping either one into a function you do not want to restructure:
+
+```python
+from lineprofiler.accounting import start, stop
+
+start(role="actor")        # line 1: top of the region
+...                         # existing code, unmodified
+stop()                      # line 2: bottom of the region
+```
+
+```python
+from lineprofiler import start_profiling, stop_profiling
+
+start_profiling()          # line 1
+...                         # existing code, unmodified
+stop_profiling()           # line 2
+```
+
+Both are **opt-in and off by default**: with nothing configured, `start_profiling()` /
+`accounting.start()` cost a no-op check and nothing else, so the two lines are safe to leave
+committed permanently rather than added and removed per debugging session. Turn profiling on
+with:
+
+```
+LINEPROFILER_ENABLED=1   # master switch for start_profiling()/stop_profiling()
+```
+
+`accounting.start()`/`stop()` use `accounting`'s own existing `LINEPROFILER_PROFILE` switch
+(see below) — the two tools' switches are independent, matching the fact that they share
+nothing but the distribution.
+
+To scope `start_profiling()` to part of the codebase without touching a single call site, add
+an optional table to `pyproject.toml`:
+
+```toml
+[tool.lineprofiler]
+include = ["src/mypkg/**"]        # only these paths are traced (glob, relative to the project root)
+exclude = ["src/mypkg/generated/**"]  # exclude wins over include
+functions = ["*.train_step", "*.forward"]  # only these function/method names (glob over __qualname__)
+```
+
+All three are optional and default to "everything under the project root" — the same behavior
+as constructing `LineProfiler()` directly. This table is read once per process and cached; it
+never runs on the hot per-line path.
+
+`with profiler:` (below) remains the better choice inside a Jupyter notebook or any region
+you're actively iterating on interactively — the two APIs are interchangeable and neither is
+deprecated by the other.
 
 ## Accounting layer (`lineprofiler.accounting`)
 
@@ -653,9 +773,11 @@ This is the expensive one. `sys.settrace` fires on every line of every in-projec
 it is for a region you already suspect, not for a whole training run. For that, use the
 accounting layer above.
 
-- **Zero configuration** – just wrap code in a `with` block
+- **Zero configuration** – just wrap code in a `with` block, or use `start_profiling()`/
+  `stop_profiling()` (see [Adopting either tool in two lines](#adopting-either-tool-in-two-lines))
 - **Line-level timing** – see exactly which lines are slow
-- **Auto-filtering** – only profiles code in your project (auto-detects git repo root)
+- **Auto-filtering** – only profiles code in your project (auto-detects git repo root), further
+  narrowed by an optional `[tool.lineprofiler]` table
 - **Flexible output** – sort by time, hits, or line number; filter by threshold
 
 ```python
@@ -673,6 +795,11 @@ profiler.print_global_top_stats(min_time_us=0.01, top_n=40)
 | `print_global_top_stats(top_n, min_time_us, sort_by)` | Print top N lines across all functions |
 | `get_stats()` | Get raw `FunctionStats` dictionary |
 | `clear()` / `reset()` | Clear all collected data |
+
+| Function | Description |
+|--------|-------------|
+| `start_profiling(project_folder=None)` | Start ambient profiling — the two-line alternative to `with profiler:` |
+| `stop_profiling(print_stats=True)` | Stop it, optionally printing the top-lines report, returning the profiler |
 
 `sys.settrace` is global and single-tracer, so this profiler is not thread-safe and cannot
 run alongside another tracing profiler (including `accounting`'s `backend=` window).

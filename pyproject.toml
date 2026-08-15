@@ -1,6 +1,6 @@
 [project]
 name = "with_line_profiler"
-version = "0.4.0"
+version = "0.4.1"
 description = "Line-by-line profiling, plus a low-overhead accounting layer for long multi-process RL training runs"
 readme = "README.md"
 license = "MIT"
@@ -11,9 +11,12 @@ authors = [
 keywords = [
     "profiler",
     "profiling",
+    "line-profiler",
+    "tracing",
     "performance",
     "timing",
     "debugging",
+    "jupyter",
     "reinforcement-learning",
     "multiprocessing",
     "observability",

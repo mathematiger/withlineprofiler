@@ -25,6 +25,8 @@ from lineprofiler.accounting.profiler import (
     install_profiler,
     installed_profiler,
     phase,
+    start,
+    stop,
     uninstall_profiler,
 )
 from lineprofiler.accounting.report import render, report_as_dict
@@ -55,5 +57,7 @@ __all__ = [
     "render",
     "render_comparison",
     "report_as_dict",
+    "start",
+    "stop",
     "uninstall_profiler",
 ]

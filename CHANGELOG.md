@@ -4,6 +4,34 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1]
+
+### Added — opt-in, two-line adoption for existing projects
+
+- **`lineprofiler.start_profiling()` / `stop_profiling()`** — the entry/exit alternative to
+  `with profiler:`. Wraps ambient line-by-line profiling in two calls instead of a `with`
+  block, so dropping this into an existing function or script costs two lines rather than
+  restructuring it around a context manager. Opt-in: both are near-free no-ops unless
+  `LINEPROFILER_ENABLED` is set (or a `[tool.lineprofiler]` table exists in `pyproject.toml`),
+  so they are safe to leave in place permanently. `with profiler:` is unchanged and remains the
+  better fit for notebooks and scoped regions.
+- **`lineprofiler.accounting.start()` / `stop()`** — the same two-line shape for the accounting
+  layer, collapsing the documented `Profiler(..., install=True)` + `.close()` pattern into one
+  call each.
+- **`lineprofiler.config`** — a shared, opt-in configuration layer read once per process:
+  `LINEPROFILER_ENABLED` is the master switch, and an optional `[tool.lineprofiler]` table in
+  `pyproject.toml` (`include`/`exclude` path globs, `functions` name globs) narrows what
+  `LineProfiler`/`start_profiling()` traces, without touching the profiled code itself. Uses
+  the standard library's `tomllib`; no new dependency.
+
+### Documentation — discoverability
+
+- README now leads with a runnable hello-world example and status badges (PyPI, CI, license,
+  supported Python versions) before the two-tool comparison table, and adds a `vs. line_profiler`
+  section for anyone arriving already familiar with `kernprof`/`@profile`.
+- Added `line-profiler`, `tracing` and `jupyter` to the PyPI keywords so the package surfaces
+  for those searches.
+
 ## [0.4.0]
 
 Driven by a review from integrating 0.3.0 into a MuZero/AlphaZero training pipeline — 16

@@ -12,7 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from lineprofiler import FunctionStats, LineProfiler, LineStats
+from lineprofiler import FunctionStats, LineProfiler, LineStats, start_profiling, stop_profiling
+from lineprofiler.config import ENV_ENABLED, ProfilerConfig, get_config
 
 THIS_DIR = str(Path(__file__).resolve().parent)
 
@@ -423,3 +424,182 @@ def test_repo_root_still_finds_a_git_directory(tmp_path: Path) -> None:
     profiler = LineProfiler(project_folder=THIS_DIR)
 
     assert profiler._find_repo_root(str(module)) == tmp_path.resolve()
+
+
+# --------------------------------------------------------------------------- #
+# Config-driven include/exclude/function filtering
+# --------------------------------------------------------------------------- #
+def test_config_include_excludes_files_outside_the_glob() -> None:
+    config = ProfilerConfig(enabled=True, include=("does_not_match_*.py",))
+    profiler = LineProfiler(project_folder=THIS_DIR, config=config)
+    with profiler:
+        add(1, 2)
+    assert profiler.get_stats() == {}
+
+
+def test_config_include_matches_this_file() -> None:
+    config = ProfilerConfig(enabled=True, include=("test_profiler.py",))
+    profiler = LineProfiler(project_folder=THIS_DIR, config=config)
+    with profiler:
+        add(1, 2)
+    assert stats_for(profiler, "add")
+
+
+def test_config_exclude_wins_over_include() -> None:
+    config = ProfilerConfig(
+        enabled=True,
+        include=("test_profiler.py",),
+        exclude=("test_profiler.py",),
+    )
+    profiler = LineProfiler(project_folder=THIS_DIR, config=config)
+    with profiler:
+        add(1, 2)
+    assert profiler.get_stats() == {}
+
+
+def test_config_functions_filters_by_qualname() -> None:
+    config = ProfilerConfig(enabled=True, functions=("loop_sum",))
+    profiler = LineProfiler(project_folder=THIS_DIR, config=config)
+    with profiler:
+        add(1, 2)
+        loop_sum(3)
+    assert [k for k in profiler.get_stats() if k[1] == "add"] == []
+    assert stats_for(profiler, "loop_sum")
+
+
+def test_config_functions_glob_matches_qualname_prefix() -> None:
+    config = ProfilerConfig(enabled=True, functions=("add*",))
+    profiler = LineProfiler(project_folder=THIS_DIR, config=config)
+    with profiler:
+        add(1, 2)
+    assert stats_for(profiler, "add")
+
+
+# --------------------------------------------------------------------------- #
+# start_profiling() / stop_profiling()
+# --------------------------------------------------------------------------- #
+def test_start_profiling_is_a_no_op_when_not_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(ENV_ENABLED, raising=False)
+    before = sys.gettrace()
+
+    profiler = start_profiling(project_folder=THIS_DIR)
+    add(1, 2)
+    result = stop_profiling(print_stats=False)
+
+    assert sys.gettrace() is before
+    assert profiler.get_stats() == {}
+    assert result is None
+
+
+def test_start_profiling_traces_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(ENV_ENABLED, "1")
+
+    start_profiling(project_folder=THIS_DIR)
+    add(1, 2)
+    profiler = stop_profiling(print_stats=False)
+
+    assert profiler is not None
+    assert stats_for(profiler, "add")
+
+
+def test_stop_profiling_restores_the_tracer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(ENV_ENABLED, "1")
+    before = sys.gettrace()
+
+    start_profiling(project_folder=THIS_DIR)
+    add(1, 2)
+    stop_profiling(print_stats=False)
+
+    assert sys.gettrace() is before
+
+
+def test_stop_profiling_without_start_is_a_no_op() -> None:
+    assert stop_profiling(print_stats=False) is None
+
+
+def test_double_start_profiling_warns_and_returns_the_running_instance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(ENV_ENABLED, "1")
+
+    first = start_profiling(project_folder=THIS_DIR)
+    with pytest.warns(RuntimeWarning, match="already called"):
+        second = start_profiling(project_folder=THIS_DIR)
+    stop_profiling(print_stats=False)
+
+    assert second is first
+
+
+def test_start_profiling_respects_config_include(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(ENV_ENABLED, "1")
+
+    start_profiling(project_folder=THIS_DIR)
+    add(1, 2)
+    profiler = stop_profiling(print_stats=False)
+
+    assert profiler is not None
+    for filename, _, _ in profiler.get_stats():
+        assert filename.startswith(THIS_DIR)
+
+
+def test_get_config_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(ENV_ENABLED, raising=False)
+    config = get_config(THIS_DIR)
+    assert config.enabled is False
+    assert config.include == ()
+    assert config.exclude == ()
+    assert config.functions == ()
+
+
+def test_get_config_enabled_via_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(ENV_ENABLED, "1")
+    assert get_config(THIS_DIR).enabled is True
+
+
+def test_get_config_falsy_values_are_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    for value in ("0", "false", "False"):
+        monkeypatch.setenv(ENV_ENABLED, value)
+        assert get_config(THIS_DIR).enabled is False
+
+
+def test_get_config_reads_pyproject_table(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.lineprofiler]\ninclude = ["src/**"]\nexclude = ["src/generated/**"]\n'
+        'functions = ["*.train_step"]\n',
+        encoding="utf-8",
+    )
+    config = get_config(tmp_path)
+    assert config.include == ("src/**",)
+    assert config.exclude == ("src/generated/**",)
+    assert config.functions == ("*.train_step",)
+
+
+def test_get_config_missing_pyproject_degrades_to_defaults(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    config = get_config(tmp_path)
+    assert config.include == ()
+    assert config.exclude == ()
+
+
+def test_get_config_malformed_pyproject_degrades_to_defaults(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "pyproject.toml").write_text("this is not [ valid toml", encoding="utf-8")
+    config = get_config(tmp_path)
+    assert config.include == ()
+
+
+def test_get_config_is_cached_per_project_root(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.lineprofiler]\ninclude = ["a"]\n', encoding="utf-8",
+    )
+    first = get_config(tmp_path)
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.lineprofiler]\ninclude = ["b"]\n', encoding="utf-8",
+    )
+    second = get_config(tmp_path)
+    assert second is first
+    assert second.include == ("a",)

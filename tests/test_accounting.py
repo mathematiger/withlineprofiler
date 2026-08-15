@@ -548,6 +548,43 @@ def test_an_explicitly_disabled_profiler_still_installs_as_a_no_op(tmp_path: Pat
         accounting.uninstall_profiler()
 
 
+# ── start() / stop() sugar ───────────────────────────────────────────────────
+
+
+def test_start_installs_and_stop_closes(tmp_path: Path) -> None:
+    profiler = accounting.start(
+        run_dir=tmp_path, role="actor", enabled=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    try:
+        assert accounting.installed_profiler() is profiler
+        with accounting.phase("iteration"):
+            accounting.count("simulations", 64)
+    finally:
+        accounting.stop()
+
+    assert accounting.installed_profiler() is None
+    tree = merge_run(tmp_path).tree
+    assert tree[("iteration",)].counters == {"simulations": 64}
+
+
+def test_stop_with_nothing_installed_is_a_no_op() -> None:
+    accounting.uninstall_profiler()
+    accounting.stop()  # must not raise
+    assert accounting.installed_profiler() is None
+
+
+def test_start_defaults_to_disabled_without_the_env_var(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("LINEPROFILER_PROFILE", raising=False)
+    profiler = accounting.start(run_dir=tmp_path, role="actor")
+    try:
+        assert profiler.enabled is False
+    finally:
+        accounting.stop()
+
+
 # ── live export ─────────────────────────────────────────────────────────────
 
 

@@ -1244,6 +1244,30 @@ def installed_profiler() -> Profiler | None:
     return _installed
 
 
+def start(run_dir: str | Path | None = None, role: str | None = None, **kwargs: object) -> Profiler:
+    """Construct, install and return a ``Profiler`` — the two-line alternative to ``with``.
+
+        from lineprofiler.accounting import start, stop
+
+        start(role="actor")     # top of the script
+        ...
+        stop()                  # bottom of the script
+
+    Equivalent to ``Profiler(run_dir=run_dir, role=role, install=True, **kwargs)``. Respects
+    the same ``LINEPROFILER_PROFILE``/``LINEPROFILER_ROLE``/``LINEPROFILER_RUN_DIR`` defaults
+    as the constructor, so a disabled profiler is a near-free no-op and these two calls are
+    safe to leave in place permanently.
+    """
+    return Profiler(run_dir=run_dir, role=role, install=True, **kwargs)  # type: ignore[arg-type]
+
+
+def stop() -> None:
+    """Close the currently installed profiler, if any. The counterpart to ``start()``."""
+    profiler = _installed
+    if profiler is not None:
+        profiler.close()
+
+
 def phase(
     name: str,
     io: bool = False,

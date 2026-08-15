@@ -8,11 +8,14 @@ from __future__ import annotations
 import inspect
 import sys
 import time
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import FrameType, TracebackType
 from typing import Optional, Self
+
+from lineprofiler.config import ProfilerConfig, find_project_root, get_config
 
 # Signature of a CPython trace function as installed via sys.settrace.
 TraceFunction = Callable[[FrameType, str, object], Optional["TraceFunction"]]
@@ -73,13 +76,20 @@ class LineProfiler:
     overhead and the output focused on the user's own code.
     """
 
-    def __init__(self, project_folder: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        project_folder: str | Path | None = None,
+        config: ProfilerConfig | None = None,
+    ) -> None:
         """Initialize the profiler.
 
         Args:
             project_folder: Folder used to scope profiling. If omitted, it is
                 auto-detected by walking up from the caller's file to the nearest
                 git repository root.
+            config: Optional include/exclude/function glob filters, on top of
+                ``project_folder``. Defaults to no extra filtering (everything under
+                ``project_folder`` is traced), which is the pre-existing behavior.
         """
         self._function_stats: dict[FunctionKey, FunctionStats] = {}
         self._enabled: bool = False
@@ -89,6 +99,7 @@ class LineProfiler:
         self._project_cache: dict[str, bool] = {}
         self._source_cache: dict[str, dict[int, str]] = {}
         self._old_trace = sys.gettrace()
+        self._config = config
 
         if project_folder is not None:
             self._project_folder: Path = Path(project_folder).resolve()
@@ -163,6 +174,10 @@ class LineProfiler:
         if event == "call":
             if not self._is_in_project_folder(frame.f_code.co_filename):
                 return None
+            if self._config is not None and not self._config.allows_function(
+                frame.f_code.co_qualname,
+            ):
+                return None
             self._record_gap(now)
             self._ensure_function(frame)
             self._last_key = None
@@ -236,23 +251,21 @@ class LineProfiler:
         profiler silently narrowed to the single file that had constructed it, and reported
         nothing about the rest of the project.
         """
-        p = Path(start_path).resolve()
-
-        for parent in [p, *p.parents]:
-            if (parent / ".git").exists():
-                return parent
-
-        return p.parent if p.is_file() else p
+        return find_project_root(start_path)
 
     def _is_in_project_folder(self, filename: str) -> bool:
-        """Return whether ``filename`` lives inside the project folder (cached)."""
+        """Return whether ``filename`` lives inside the project folder (cached).
+
+        When a ``config`` was passed to the constructor, its ``include``/``exclude`` globs
+        (evaluated against the path relative to the project folder) narrow this further.
+        """
         cached = self._project_cache.get(filename)
         if cached is not None:
             return cached
 
         try:
-            Path(filename).resolve().relative_to(self._project_folder)
-            result = True
+            relative = Path(filename).resolve().relative_to(self._project_folder)
+            result = self._config is None or self._config.allows_path(str(relative))
         except (OSError, ValueError):
             result = False
 
@@ -486,3 +499,78 @@ class _GlobalLine:
     avg_time_us: float
     percent: float
     source_line: str
+
+
+# ── ambient profiling: start_profiling() / stop_profiling() ────────────────
+#
+# A `with` block cannot wrap a whole module or script, and `sys.settrace` only affects frames
+# created after it is installed anyway. The two-line alternative below is opt-in
+# (`LINEPROFILER_ENABLED`, see `lineprofiler.config`) and safe to leave in place permanently:
+# with profiling disabled, `start_profiling()`/`stop_profiling()` cost one dict lookup each.
+
+_installed: LineProfiler | None = None
+
+
+def start_profiling(project_folder: str | Path | None = None) -> LineProfiler:
+    """Start ambient line-by-line profiling — the two-line alternative to ``with profiler:``.
+
+        from lineprofiler import start_profiling, stop_profiling
+
+        start_profiling()      # top of the region/script
+        ...
+        stop_profiling()       # bottom of the region/script
+
+    Opt-in: profiling only actually starts when ``LINEPROFILER_ENABLED`` is truthy or a
+    ``[tool.lineprofiler]`` table exists (see ``lineprofiler.config.get_config``). Otherwise
+    this returns a fresh, never-entered ``LineProfiler`` and installs nothing, so the call is
+    always safe to leave in the code.
+
+    Calling this again before ``stop_profiling()`` warns and returns the profiler already
+    running, rather than raising — ambient usage should never crash the host program.
+    """
+    global _installed  # noqa: PLW0603 - the point of the function
+
+    if _installed is not None:
+        warnings.warn(
+            "start_profiling() was already called; stop_profiling() first to start a new "
+            "profiler. Returning the one already running.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return _installed
+
+    caller_frame = inspect.currentframe()
+    caller = caller_frame.f_back if caller_frame else None
+    start_path = project_folder if project_folder is not None else (
+        caller.f_code.co_filename if caller is not None else Path.cwd()
+    )
+    config = get_config(start_path)
+
+    resolved_folder = Path(project_folder) if project_folder is not None else find_project_root(
+        start_path,
+    )
+    profiler = LineProfiler(project_folder=resolved_folder, config=config)
+    if config.enabled:
+        profiler.__enter__()
+        _installed = profiler
+    return profiler
+
+
+def stop_profiling(print_stats: bool = True) -> LineProfiler | None:
+    """Stop ambient profiling started by ``start_profiling()``.
+
+    Returns the profiler so callers can still read ``get_stats()`` afterward, or ``None`` if
+    ``start_profiling()`` was never called (or profiling was not enabled). Prints the top lines
+    across all functions unless ``print_stats`` is ``False``.
+    """
+    global _installed  # noqa: PLW0603 - the point of the function
+
+    profiler = _installed
+    if profiler is None:
+        return None
+
+    profiler.__exit__(None, None, None)
+    _installed = None
+    if print_stats:
+        profiler.print_global_top_stats()
+    return profiler

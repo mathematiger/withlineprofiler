@@ -15,9 +15,25 @@ from collections.abc import Iterator
 
 import pytest
 
+from lineprofiler import config as _config_module
+from lineprofiler import profiler as _line_profiler_module
 from lineprofiler.accounting import profiler as _profiler_module
 
 _WATCHED_SIGNALS = (signal.SIGTERM, signal.SIGUSR1, signal.SIGHUP)
+
+
+@pytest.fixture(autouse=True)
+def _reset_ambient_line_profiler() -> Iterator[None]:
+    """Undo ``start_profiling()``/config-cache state a test left behind.
+
+    Both are process-global module state, same rationale as the fork registry cleanup below:
+    a test that starts ambient profiling and forgets to stop it would otherwise hand the next
+    test a live ``sys.settrace`` tracer.
+    """
+    yield
+    if _line_profiler_module._installed is not None:  # noqa: SLF001 - hygiene
+        _line_profiler_module.stop_profiling(print_stats=False)
+    _config_module._cache.clear()  # noqa: SLF001 - hygiene
 
 
 @pytest.fixture(autouse=True)
