@@ -9,11 +9,13 @@ from __future__ import annotations
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from lineprofiler import FunctionStats, LineProfiler, LineStats, start_profiling, stop_profiling
 from lineprofiler.config import ENV_ENABLED, ProfilerConfig, get_config
+from lineprofiler.profiler import _qualname_of
 
 THIS_DIR = str(Path(__file__).resolve().parent)
 
@@ -424,6 +426,34 @@ def test_repo_root_still_finds_a_git_directory(tmp_path: Path) -> None:
     profiler = LineProfiler(project_folder=THIS_DIR)
 
     assert profiler._find_repo_root(str(module)) == tmp_path.resolve()
+
+
+# --------------------------------------------------------------------------- #
+# Interpreter-version fallbacks
+# --------------------------------------------------------------------------- #
+def test_qualname_of_uses_co_qualname_where_available() -> None:
+    """On 3.11+ a method is matched by its dotted name, which is what the globs expect."""
+
+    class Holder:
+        def step(self) -> None:
+            pass
+
+    if sys.version_info >= (3, 11):
+        assert _qualname_of(Holder.step.__code__).endswith("Holder.step")
+    else:  # pragma: no cover - the 3.10 branch, covered by the stub test below
+        assert _qualname_of(Holder.step.__code__) == "step"
+
+
+def test_qualname_of_falls_back_to_co_name_without_co_qualname() -> None:
+    """The 3.10 branch, exercised on every version so it cannot rot untested.
+
+    ``co_qualname`` arrived in 3.11. A stub stands in for a 3.10 code object because the
+    dev environment and CI's default interpreter both have the attribute, so the fallback
+    would otherwise only ever run on one matrix entry.
+    """
+    stub = SimpleNamespace(co_name="step")
+
+    assert _qualname_of(stub) == "step"  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------------------- #

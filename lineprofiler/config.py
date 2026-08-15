@@ -8,9 +8,14 @@ from __future__ import annotations
 
 import fnmatch
 import os
-import tomllib
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover - exercised only on 3.10, where tomllib is not in the stdlib
+    import tomli as tomllib
 
 ENV_ENABLED = "LINEPROFILER_ENABLED"
 

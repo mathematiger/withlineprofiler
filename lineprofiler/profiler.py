@@ -12,13 +12,25 @@ import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import FrameType, TracebackType
-from typing import Optional, Self
+from types import CodeType, FrameType, TracebackType
+from typing import Optional
 
 from lineprofiler.config import ProfilerConfig, find_project_root, get_config
 
 # Signature of a CPython trace function as installed via sys.settrace.
 TraceFunction = Callable[[FrameType, str, object], Optional["TraceFunction"]]
+
+
+def _qualname_of(code: CodeType) -> str:
+    """Return ``co_qualname`` where the interpreter has it (3.11+), else ``co_name``.
+
+    On 3.10 a method or nested function is matched by its bare name, so a
+    ``functions = ["MyClass.step"]`` pattern will not match there. That limitation is
+    documented rather than emulated: reconstructing a qualified name from a code object
+    needs the enclosing frame chain, and a *guessed* qualname would silently match the
+    wrong function — a wrong answer where this returns an honestly narrower one.
+    """
+    return getattr(code, "co_qualname", code.co_name)
 
 # A function is identified by the file it lives in, its name and its first line.
 FunctionKey = tuple[str, str, int]
@@ -111,7 +123,7 @@ class LineProfiler:
             else:
                 self._project_folder = Path.cwd()
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> LineProfiler:
         """Enable profiling, registering the trace callback.
 
         Re-entering an instance that is already active is refused rather than allowed to
@@ -172,11 +184,7 @@ class LineProfiler:
             return self._trace_callback
 
         if event == "call":
-            if not self._is_in_project_folder(frame.f_code.co_filename):
-                return None
-            if self._config is not None and not self._config.allows_function(
-                frame.f_code.co_qualname,
-            ):
+            if not self._admits(frame.f_code):
                 return None
             self._record_gap(now)
             self._ensure_function(frame)
@@ -209,9 +217,22 @@ class LineProfiler:
         line_stats.total_time += delta
         func_stats.total_time += delta
 
+    def _admits(self, code: CodeType) -> bool:
+        """Whether ``code`` is inside the project folder and passes the configured filters.
+
+        The single admission decision, so the project-folder check and the function-name
+        glob cannot drift apart between the places that ask.
+        """
+        if not self._is_in_project_folder(code.co_filename):
+            return False
+        return self._config is None or self._config.allows_function(_qualname_of(code))
+
     def _ensure_function(self, frame: FrameType) -> FunctionKey:
         """Return the key for ``frame``'s function, creating its stats on demand."""
-        code = frame.f_code
+        return self._ensure_function_of(frame.f_code)
+
+    def _ensure_function_of(self, code: CodeType) -> FunctionKey:
+        """Return the key for ``code``'s function, creating its stats on demand."""
         key: FunctionKey = (code.co_filename, code.co_name, code.co_firstlineno)
         if key not in self._function_stats:
             self._function_stats[key] = FunctionStats(

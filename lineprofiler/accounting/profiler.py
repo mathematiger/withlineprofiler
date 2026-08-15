@@ -31,7 +31,7 @@ from functools import wraps
 from pathlib import Path
 from time import perf_counter_ns, thread_time_ns
 from types import FrameType
-from typing import ParamSpec, Self, TypeVar, overload
+from typing import ParamSpec, TypeVar, overload
 
 from lineprofiler.accounting.backend import Backend, BackendWindow
 from lineprofiler.accounting.capabilities import (
@@ -327,7 +327,7 @@ class Profiler:
 
     # ── public API ──────────────────────────────────────────────────────────
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> Profiler:
         return self
 
     def __exit__(self, *exc: object) -> None:

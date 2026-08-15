@@ -4,7 +4,7 @@ version = "0.4.1"
 description = "Line-by-line profiling, plus a low-overhead accounting layer for long multi-process RL training runs"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 authors = [
     { name = "mathematiger", email = "mcop.dkoehler@gmail.com" },
 ]
@@ -26,6 +26,8 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Debuggers",
@@ -33,7 +35,12 @@ classifiers = [
     "Topic :: System :: Monitoring",
     "Typing :: Typed",
 ]
-dependencies = []
+# tomllib entered the stdlib in 3.11; on 3.10 the config reader needs its backport. This is
+# the only required dependency and it disappears on every version above 3.10, so the
+# zero-dependency property holds everywhere it can.
+dependencies = [
+    "tomli>=2.0; python_version < '3.11'",
+]
 
 # Every extra is optional at runtime: the code imports each lazily behind a capability
 # check, and a missing one disables one block of the report instead of raising.
@@ -77,7 +84,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "ANN", "B", "C4", "SIM"]
@@ -101,13 +108,17 @@ exclude_also = [
 ]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.10"
 strict = true
 warn_return_any = true
 warn_unused_ignores = true
 
 # Optional integrations. These are imported lazily behind capability checks and are not
 # installed in the dev environment, so their absence must not fail the type check.
+#
+# `tomli` is here for a different reason: it is a real dependency, but only on 3.10, where
+# `tomllib` is not yet in the stdlib. The dev environment is 3.12, so the backport is
+# correctly absent and mypy would otherwise fail on a branch that never runs here.
 [[tool.mypy.overrides]]
-module = ["torch.*", "pynvml.*", "viztracer.*", "psutil.*", "nvtx.*"]
+module = ["torch.*", "pynvml.*", "viztracer.*", "psutil.*", "nvtx.*", "tomli"]
 ignore_missing_imports = true
