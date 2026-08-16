@@ -35,6 +35,11 @@ def worked(n: int) -> int:
     return total
 
 
+def holds_markup() -> str:
+    markup = "<b>not bold</b>"  # must be escaped when this line is rendered
+    return markup
+
+
 def _embedded_data(html: str) -> dict[str, Any]:
     """Pull the JSON payload back out of the page, the way a reader or script would."""
     match = re.search(
@@ -99,10 +104,14 @@ def test_a_phase_named_like_a_script_tag_cannot_escape_its_block(tmp_path: Path)
 
 
 def test_source_html_escapes_the_code_it_shows(tmp_path: Path) -> None:
+    """The markup lives in a *function*, not in the ``with`` body.
+
+    Only the monitoring backend traces the block's own frame, so a source line placed there
+    would make this pass on 3.12 and fail on 3.11 for a reason unrelated to escaping.
+    """
     profiler = LineProfiler(project_folder=THIS_DIR)
     with profiler:
-        markup = "<b>not bold</b>"  # noqa: F841
-        worked(5)
+        holds_markup()
     destination = tmp_path / "source.html"
     profiler.to_html(destination)
 
