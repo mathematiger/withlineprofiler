@@ -4,6 +4,74 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0]
+
+Four changes aimed at the same problem: the package was hard to adopt, hard to discover, and
+excluded a large part of the audience it was written for.
+
+### Added — a `sys.monitoring` backend, so the line profiler stops fighting other tools
+
+`sys.settrace` is a single global hook, so `LineProfiler` could not run alongside coverage.py,
+pdb, or any other tracing profiler. Anyone who tried it under `pytest-cov` got confusing
+numbers and no explanation. On 3.12+ the profiler now uses `sys.monitoring`, which gives each
+tool its own slot; below 3.12 it falls back to `sys.settrace`. The backend is chosen
+automatically and can be overridden with `LineProfiler(backend=...)`, which is what keeps the
+fallback path exercised on a runner that defaults to the newer one.
+
+Two differences between the backends are deliberate and pinned by tests:
+
+- **`monitoring` profiles the body of the `with` block itself.** `sys.settrace` only affects
+  frames created after it is installed, so the block's own lines were never traced — a
+  limitation documented since the first release. The new backend has no such restriction.
+- **Two `monitoring` profilers cannot nest.** They would contend for one tool slot, so the
+  inner one is refused. `settrace` tracers chain instead. Nesting double-counts either way;
+  the refusal says so rather than returning inflated numbers.
+
+The subtle part is that `sys.monitoring`'s `DISABLE` — the per-code-object opt-out that makes
+the `[tool.lineprofiler]` filter free rather than merely cached — **outlives the session that
+returned it**. A function filtered out in one session stayed filtered for every later session
+in the process, reporting a confident zero for code that ran. `_enable_monitoring` calls
+`restart_events()` to clear that, and there is a regression test which was confirmed to fail
+when the call is removed.
+
+### Added — self-contained HTML reports for both tools
+
+`lineprofiler report <dir> --format html` draws the phase tree as an icicle chart — width is
+wall time, colour is the share spent waiting rather than running — alongside the I/O, GPU and
+memory blocks. `LineProfiler.to_html()` writes annotated source with per-line heat.
+
+Both are a single file with inline styles and hand-built SVG: no CDN, no webfont, no script,
+and no new dependency. Each page also embeds the `--format json` document verbatim, so the
+exact numbers behind any figure can be extracted from the page itself; a test asserts the two
+agree.
+
+The CLI gains `--format {text,json,html}` and `--output`/`-o`. `--json` still works as a
+hidden alias, since it appears in released documentation.
+
+### Added — Python 3.10 and 3.11 support
+
+`requires-python` drops from `>=3.12` to `>=3.10`, which was excluding much of the ML and RL
+audience this package was written for. `tomli` is required only on 3.10; the package remains
+dependency-free on 3.11 and above. On 3.10, `co_qualname` does not exist, so a dotted
+`functions = ["MyClass.step"]` pattern matches on the bare name there — documented rather
+than emulated, since guessing a qualified name from a code object would silently match the
+wrong function.
+
+### Changed — documentation split out of the README
+
+The README was ~800 lines, which put design philosophy and caveats between a newcomer and
+their first result. It is now a short page — install, a runnable example, which-tool — with
+the depth moved to `docs/`, including a new comparison against `line_profiler`, py-spy,
+Scalene and VizTracer that says plainly when those are the better choice.
+
+### Internal
+
+`sibling_shares()` and `wait_share()` are extracted from the text report's formatters so the
+HTML renderer consumes the same derivation rather than reimplementing it. The text report's
+golden files are unchanged. `tests/test_overhead.py`'s guard, which checked only
+`sys.gettrace()`, now also checks the `sys.monitoring` slots — otherwise the hot-path
+assertions would run against a monitoring-instrumented interpreter.
+
 ## [0.4.1]
 
 ### Added — opt-in, two-line adoption for existing projects

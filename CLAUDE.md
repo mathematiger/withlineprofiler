@@ -17,41 +17,42 @@ The repo root is `withlineprofiler/` (the parent folder is not a git repo). Run 
 
 - Install (dev): `poetry install --extras resources` (creates `.venv` with the `dev` + `test` groups; **install psutil or the I/O and memory paths silently degrade to their absent-capability branches and stop being tested**)
 - Install for GPU validation: `poetry install --extras all` plus `torch`. The torch wheels need their CUDA libs on `LD_LIBRARY_PATH`; see the `nvidia/*/lib` trick in CI.
-- Lint: `poetry run ruff check lineprofiler tests` (config in `pyproject.toml`: line-length 100, target py312, rules `E,F,W,I,N,UP,ANN,B,C4,SIM`, ignoring `ANN101/ANN102` for ruff `^0.5`)
-- Type-check: `poetry run mypy lineprofiler tests` (configured `strict = true`, `python_version = 3.12`)
-- Test: `poetry run pytest tests/`
+- Lint: `poetry run ruff check lineprofiler tests` (config in `pyproject.toml`: line-length 100, target py310, rules `E,F,W,I,N,UP,ANN,B,C4,SIM`, ignoring `ANN101/ANN102` for ruff `^0.5`)
+- Type-check: `poetry run mypy lineprofiler tests` (configured `strict = true`, `python_version = 3.10`)
+- Test: `poetry run pytest tests/` (the line-profiler tests are parametrised over both event backends on 3.12+, so they run twice there)
 - Note: `test_the_profilers_own_writes_are_not_attributed_to_a_phase` is timing-sensitive (0.3 s window, background flush threads racing the `selfio` deduction) and has been seen to fail once under heavy machine load. Re-run before investigating.
 - Single test: `poetry run pytest tests/test_profiler.py::test_sleep_line_dominates_timing -q`
 - Build: `poetry build` (build backend is `poetry-core`; metadata is PEP 621 `[project]`, the wheel packages only the `lineprofiler` dir)
 
-- Benchmark: `poetry run python benchmarks/bench_accounting.py` (the numbers quoted in the README come from here; re-run and update them if the hot path changes)
+- Benchmark: `poetry run python benchmarks/bench_accounting.py` (the numbers quoted in docs/accounting-recipes.md come from here; re-run and update them if the hot path changes)
 - Regenerate report golden files: `LINEPROFILER_UPDATE_GOLDEN=1 poetry run pytest tests/test_accounting_report_golden.py`
 - Coverage: `poetry run pytest tests/ --cov=lineprofiler --cov-report=term-missing`
-- CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs ruff, mypy, pytest on 3.12/3.13, coverage, the overhead job, and a build job that runs the suite from the unpacked sdist.
+- CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs ruff, mypy, pytest on 3.10/3.11/3.12/3.13, coverage, the overhead job, and a build job that runs the suite from the unpacked sdist.
 
-Tests (269 total, ~17 s; plus 8 GPU-only in `test_gpu_hardware.py`):
+Tests (364 total on 3.12, ~18 s; plus 8 GPU-only in `test_gpu_hardware.py`). The count differs by interpreter: `test_profiler.py` is parametrised over both event backends, so 3.10/3.11 collect fewer.
 
-- [tests/test_profiler.py](tests/test_profiler.py) — the line profiler (27). Several tests reach into private state (`_is_in_project_folder`, `_project_cache`, `_source_cache`, `_function_stats`), so renaming those attributes breaks tests.
+- [tests/test_profiler.py](tests/test_profiler.py) — the line profiler, parametrised over the `monitoring` and `settrace` backends by an autouse fixture that patches `_default_backend`. Several tests reach into private state (`_is_in_project_folder`, `_project_cache`, `_source_cache`, `_function_stats`), so renaming those attributes breaks tests.
 - [tests/test_accounting.py](tests/test_accounting.py) — histogram, phase tree, counters, snapshots, merge.
 - [tests/test_accounting_resources.py](tests/test_accounting_resources.py) — roles, sampler, analysis, compare, backends, annotation, per-device GPU utilisation, synchronised phases, and a parametrised settings matrix. The GPU tests drive a `SimpleNamespace` stub of pynvml, so they run without a device.
 - [tests/test_accounting_multiprocess.py](tests/test_accounting_multiprocess.py) — `{spawn, fork, forkserver}` × `{1, 4, 16}` workers, fork safety, failure modes.
 - [tests/test_accounting_report_golden.py](tests/test_accounting_report_golden.py) — byte-for-byte report/compare output, built from fixed numbers so it is deterministic.
 - [tests/test_accounting_resilience.py](tests/test_accounting_resilience.py) — the failures that used to produce *wrong* numbers rather than missing ones: I/O counter gaps, flush-thread death, attempt merging, invalid worker files, multi-node identity, scheduler signals, phase cardinality.
 - [tests/conftest.py](tests/conftest.py) — two suite-wide hygiene fixtures: one closes any enabled profiler a test left open (sixteen do), the other fails the *session* if `SIGTERM`/`SIGUSR1`/`SIGHUP` are not back where they started. The leak they guard against is cumulative and surfaces far from its cause, so a per-test check would not catch it.
-- [tests/test_overhead.py](tests/test_overhead.py) — loose upper bounds on the hot path so the README's ns/call table cannot rot. Bounds are ~4x measured; they catch order-of-magnitude regressions, not drift.
+- [tests/test_overhead.py](tests/test_overhead.py) — loose upper bounds on the hot path so the ns/call table in docs/accounting-recipes.md cannot rot. Bounds are ~4x measured; they catch order-of-magnitude regressions, not drift.
 - [tests/test_gpu_hardware.py](tests/test_gpu_hardware.py) — needs a real GPU, driver and torch. Skips cleanly without them. This is what validates the pynvml stub's assumptions.
 
-The version number lives in **two** places that must be bumped together: `[project].version` in `pyproject.toml` and `__version__` in [lineprofiler/__init__.py](lineprofiler/__init__.py). Both are currently 0.4.0. [CHANGELOG.md](CHANGELOG.md) records what changed and why.
+The version number lives in **two** places that must be bumped together: `[project].version` in `pyproject.toml` and `__version__` in [lineprofiler/__init__.py](lineprofiler/__init__.py). Both are currently 0.5.0. [CHANGELOG.md](CHANGELOG.md) records what changed and why.
 
-Everything targets Python 3.12 — `requires-python`, mypy, ruff and the checked-in `.venv`.
+Everything targets Python 3.10+ — `requires-python`, mypy and ruff. The checked-in `.venv` is 3.12, so the 3.10-only branches (the `tomli` import in `config.py`, the `co_qualname` fallback in `_qualname_of`) only ever run in CI; both have unit tests that exercise them on any version.
 
 ## Architecture
 
-Everything lives in [lineprofiler/profiler.py](lineprofiler/profiler.py) (~465 lines); [lineprofiler/__init__.py](lineprofiler/__init__.py) only re-exports the public API (`LineProfiler`, `FunctionStats`, `LineStats`). Pieces:
+The line profiler lives in [lineprofiler/profiler.py](lineprofiler/profiler.py) (~700 lines), with opt-in config in [lineprofiler/config.py](lineprofiler/config.py) and HTML rendering in [lineprofiler/html_source.py](lineprofiler/html_source.py) + the shared [lineprofiler/htmldoc.py](lineprofiler/htmldoc.py). [lineprofiler/__init__.py](lineprofiler/__init__.py) re-exports the public API (`LineProfiler`, `FunctionStats`, `LineStats`, `start_profiling`, `stop_profiling`). Pieces:
 
 - `LineStats` / `FunctionStats` — dataclasses holding per-line and per-function accumulated `hits` and `total_time`. Functions are keyed by the tuple `(filename, function_name, first_line)`.
 - `LineProfiler` — the context manager. Core mechanism:
-  - `__enter__` registers `self._trace_callback` via `sys.settrace` (saving the previous tracer); `__exit__` restores it.
+  - **Two backends.** `__enter__` branches on `self._backend`: `monitoring` claims `sys.monitoring`'s `PROFILER_ID` slot and registers `_on_line`/`_on_start`/`_on_return` (the last bound to both `PY_RETURN` and `PY_UNWIND`, since settrace's `return` covers exceptional exits too); `settrace` registers `self._trace_callback` via `sys.settrace`, saving the previous tracer. `__exit__` undoes whichever ran. Both share the timing model, `_admits` and `_ensure_function_of`.
+  - **`_enable_monitoring` must call `restart_events()`.** `sys.monitoring`'s `DISABLE` is permanent per code object *for the life of the interpreter*, so a function filtered out in one session stays filtered in the next one — reporting a confident zero for code that ran. See the wrong-numbers note below.
   - `_trace_callback` handles `call` / `line` / `return` events. **Timing model:** the delta between two events is attributed to the *previous* line (`self._last_key`, `self._last_line`). The reference timestamp for the next line is taken at the *end* of the callback (a second `perf_counter()` call), so the profiler's own bookkeeping is excluded from the reported per-line times. The line being attributed to is identified from the current `frame` (`_ensure_function`), so the caller's lines are still timed correctly after a nested in-project call returns.
   - **Project filtering is central.** Only frames whose filename is under `self._project_folder` are traced (`_is_in_project_folder`). If `project_folder` is not passed to the constructor, it auto-detects by walking up from the *caller's* file to the nearest `.git` directory (`_find_repo_root`). This is why profiling stays scoped to the user's own code instead of stdlib/site-packages.
   - **Caching keeps overhead/memory down.** `_is_in_project_folder` caches its verdict per filename in `_project_cache` (so `Path.resolve()` runs once per file, not per `call` event). Source lines are read once per file into `_source_cache`, and every `FunctionStats.source_lines` for a given file is the *same* dict object — so a file's source is held in memory only once regardless of how many of its functions are profiled.
@@ -119,10 +120,12 @@ regression test; the *pattern* is what to watch for when changing this code:
 
 ## Gotchas
 
-- `sys.settrace` is global and single-tracer; this profiler is not thread-safe. Recursive/nested calls share one `FunctionStats` per function key (no per-call-depth breakdown), but their per-line timing is correct because the line is identified from the live `frame` on every event rather than from a single remembered key.
+- The `settrace` backend is global and single-tracer, so it is not thread-safe and cannot coexist with coverage.py or pdb; the `monitoring` backend (3.12+, the default there) has its own tool slot and can. Neither is thread-safe. Recursive/nested calls share one `FunctionStats` per function key (no per-call-depth breakdown), but their per-line timing is correct because the line is identified from the live `frame` on every event rather than from a single remembered key.
 - A few user-facing strings contain typos (e.g. `"filename not in folde"` in `print_stats`); preserve or fix deliberately, don't assume they're bugs to silently rewrite.
 - `get_stats()` returns the live internal dict, not a copy — callers can mutate profiler state through it, and `clear()` empties the same object.
-- `__init__` snapshots `sys.gettrace()`, but `__enter__` re-reads it; only the `__enter__` value is restored on exit. Constructing a profiler long before entering it is therefore safe.
+- `__init__` snapshots `sys.gettrace()`, but `__enter__` re-reads it; only the `__enter__` value is restored on exit. Constructing a profiler long before entering it is therefore safe. (Both apply to the `settrace` backend only.)
+- **`_on_line` must check `_admits`, not leave filtering to `PY_START`.** That event fires only for frames the interpreter *starts* while monitoring is armed, so a frame already on the stack at `__enter__` — the profiler's own `__enter__` among them — would otherwise have its lines recorded unfiltered.
+- **The HTML reports must stay dependency-free and self-contained.** Inline CSS, hand-built SVG, no script, no CDN. `htmldoc.embed_json` escapes `</` because a phase name containing `</script>` would otherwise break out of the data block, and phase names come from user code.
 - `print(...)` calls carry `# noqa: T201` (and `PLR2004`, `ARG002`) for rule sets not currently in `select`; leave them, they document intent if the rule set is widened.
 
 ## 1. Think Before Coding

@@ -1,6 +1,6 @@
 [project]
 name = "with_line_profiler"
-version = "0.4.1"
+version = "0.5.0"
 description = "Line-by-line profiling, plus a low-overhead accounting layer for long multi-process RL training runs"
 readme = "README.md"
 license = "MIT"
@@ -68,6 +68,9 @@ include = [
     { path = "tests", format = "sdist" },
     { path = "benchmarks", format = "sdist" },
     { path = "CHANGELOG.md", format = "sdist" },
+    # The README links out to these, so a downstream packager building from the sdist would
+    # otherwise ship documentation whose every link is dead.
+    { path = "docs", format = "sdist" },
 ]
 
 [tool.poetry.group.dev.dependencies]
