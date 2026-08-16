@@ -13,12 +13,31 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import CodeType, FrameType, TracebackType
-from typing import Optional
+from typing import Literal, Optional
 
 from lineprofiler.config import ProfilerConfig, find_project_root, get_config
 
 # Signature of a CPython trace function as installed via sys.settrace.
 TraceFunction = Callable[[FrameType, str, object], Optional["TraceFunction"]]
+
+# A function is identified by the file it lives in, its name and its first line.
+FunctionKey = tuple[str, str, int]
+
+# Which interpreter facility delivers the events.
+Backend = Literal["monitoring", "settrace"]
+
+# ``sys.monitoring`` arrived in 3.12. Resolved once here so the rest of the module can test
+# for it with an ``is None`` rather than a version comparison per call.
+_MONITORING = getattr(sys, "monitoring", None)
+
+# sys.monitoring.PROFILER_ID. Spelled as a literal so this module still imports on 3.10/3.11,
+# where the attribute does not exist. Coverage.py claims COVERAGE_ID (1), not this slot.
+_TOOL_ID = 2
+
+
+def _default_backend() -> Backend:
+    """Return ``"monitoring"`` where the interpreter has it (3.12+), else ``"settrace"``."""
+    return "monitoring" if _MONITORING is not None else "settrace"
 
 
 def _qualname_of(code: CodeType) -> str:
@@ -31,9 +50,6 @@ def _qualname_of(code: CodeType) -> str:
     wrong function — a wrong answer where this returns an honestly narrower one.
     """
     return getattr(code, "co_qualname", code.co_name)
-
-# A function is identified by the file it lives in, its name and its first line.
-FunctionKey = tuple[str, str, int]
 
 
 @dataclass
@@ -86,12 +102,28 @@ class LineProfiler:
     Only frames whose file lives inside ``project_folder`` are traced. Calls into
     the standard library or third-party packages are skipped, which keeps both the
     overhead and the output focused on the user's own code.
+
+    Backends
+    --------
+    Events come from ``sys.monitoring`` on 3.12+ and ``sys.settrace`` below it, chosen
+    automatically. The difference is visible in three places:
+
+    - **Coexistence.** ``sys.settrace`` is a single global hook, so that backend cannot run
+      alongside coverage.py, pdb or another tracing profiler. ``sys.monitoring`` gives each
+      tool its own slot, so the 3.12+ backend can.
+    - **What is captured.** ``sys.settrace`` only affects frames created *after* it is
+      installed, so the body of the ``with`` block itself is not profiled — only functions
+      called from it. ``sys.monitoring`` has no such restriction and does profile the block.
+    - **Nesting.** Two ``settrace`` profilers chain; two ``monitoring`` profilers cannot
+      share the tool slot, and the inner one is refused rather than allowed to double-count.
     """
 
     def __init__(
         self,
         project_folder: str | Path | None = None,
         config: ProfilerConfig | None = None,
+        *,
+        backend: Backend | None = None,
     ) -> None:
         """Initialize the profiler.
 
@@ -102,7 +134,18 @@ class LineProfiler:
             config: Optional include/exclude/function glob filters, on top of
                 ``project_folder``. Defaults to no extra filtering (everything under
                 ``project_folder`` is traced), which is the pre-existing behavior.
+            backend: Which event source to install, ``"monitoring"`` or ``"settrace"``.
+                Defaults to the best the interpreter offers. Passing ``"monitoring"``
+                below 3.12 raises rather than quietly downgrading, so a caller who asked
+                for the coexisting backend never silently gets the exclusive one.
         """
+        if backend == "monitoring" and _MONITORING is None:
+            raise ValueError(
+                "the monitoring backend needs Python 3.12 or newer; this interpreter has "
+                f"{sys.version_info.major}.{sys.version_info.minor}. Omit backend= to use "
+                "sys.settrace here.",
+            )
+        self._backend: Backend = backend or _default_backend()
         self._function_stats: dict[FunctionKey, FunctionStats] = {}
         self._enabled: bool = False
         self._last_time: float = 0.0
@@ -123,8 +166,13 @@ class LineProfiler:
             else:
                 self._project_folder = Path.cwd()
 
+    @property
+    def backend(self) -> Backend:
+        """Which event source this profiler installs: ``"monitoring"`` or ``"settrace"``."""
+        return self._backend
+
     def __enter__(self) -> LineProfiler:
-        """Enable profiling, registering the trace callback.
+        """Enable profiling, registering the event callbacks.
 
         Re-entering an instance that is already active is refused rather than allowed to
         corrupt it. The nested ``__enter__`` used to save *this profiler's own callback* as
@@ -132,9 +180,9 @@ class LineProfiler:
         clearing it — leaving a global trace function dispatched on every Python call for the
         rest of the process, invisibly, since ``_enabled`` was by then ``False``.
 
-        Note that the body of the ``with`` block is not itself profiled: ``sys.settrace``
-        only affects frames created after it is installed, so only functions *called* from
-        the block appear. Put the code you want measured in a function.
+        On the ``settrace`` backend the body of the ``with`` block is not itself profiled:
+        that hook only affects frames created after it is installed, so only functions
+        *called* from the block appear. The ``monitoring`` backend has no such restriction.
         """
         if self._enabled:
             raise RuntimeError(
@@ -142,10 +190,13 @@ class LineProfiler:
                 "its trace function for the lifetime of the process. Use a second instance.",
             )
         self._enabled = True
-        self._old_trace = sys.gettrace()
         self._last_key = None
         self._last_line = None
-        sys.settrace(self._trace_callback)
+        if self._backend == "monitoring":
+            self._enable_monitoring()
+        else:
+            self._old_trace = sys.gettrace()
+            sys.settrace(self._trace_callback)
         self._last_time = time.perf_counter()
         return self
 
@@ -155,10 +206,106 @@ class LineProfiler:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        """Disable profiling and restore the previous trace function."""
+        """Disable profiling and restore the interpreter to how it was found."""
         self._enabled = False
-        sys.settrace(self._old_trace)
-        self._old_trace = None
+        if self._backend == "monitoring":
+            self._disable_monitoring()
+        else:
+            sys.settrace(self._old_trace)
+            self._old_trace = None
+
+    def _enable_monitoring(self) -> None:
+        """Claim the profiler tool slot, register callbacks, and clear any stale opt-outs.
+
+        ``restart_events()`` is load-bearing, not hygiene. A code object this profiler
+        returned ``DISABLE`` for in an *earlier* session stays disabled for the life of the
+        interpreter, so a second ``with profiler:`` in the same process would record nothing
+        for it and report a confident zero. It is called before ``set_events`` so no event
+        can arrive between clearing the opt-outs and arming the callbacks.
+
+        Note it is global to every monitoring tool, not just this one: another tool's
+        deliberate ``DISABLE`` is re-enabled too. That costs them speed, never correctness.
+        """
+        mon = _MONITORING
+        if mon is None:  # pragma: no cover - guarded by _backend, which the constructor sets
+            raise RuntimeError("the monitoring backend is unavailable on this interpreter")
+        try:
+            mon.use_tool_id(_TOOL_ID, "lineprofiler")
+        except ValueError as exc:
+            raise RuntimeError(
+                "another tool holds sys.monitoring's profiler slot, so this LineProfiler "
+                "cannot start. Two line profilers would double-count every line; close the "
+                "other one, or pass backend='settrace' to use the older hook instead.",
+            ) from exc
+        events = mon.events
+        mon.register_callback(_TOOL_ID, events.LINE, self._on_line)
+        mon.register_callback(_TOOL_ID, events.PY_START, self._on_start)
+        mon.register_callback(_TOOL_ID, events.PY_RETURN, self._on_return)
+        mon.register_callback(_TOOL_ID, events.PY_UNWIND, self._on_return)
+        mon.restart_events()
+        mon.set_events(
+            _TOOL_ID,
+            events.LINE | events.PY_START | events.PY_RETURN | events.PY_UNWIND,
+        )
+
+    def _disable_monitoring(self) -> None:
+        """Stop events and hand the tool slot back, so a later profiler can claim it."""
+        mon = _MONITORING
+        if mon is None:  # pragma: no cover - unreachable for the same reason as above
+            return
+        events = mon.events
+        mon.set_events(_TOOL_ID, events.NO_EVENTS)
+        for event in (events.LINE, events.PY_START, events.PY_RETURN, events.PY_UNWIND):
+            mon.register_callback(_TOOL_ID, event, None)
+        mon.free_tool_id(_TOOL_ID)
+
+    def _on_line(self, code: CodeType, line_number: int) -> object:
+        """``LINE``: bill the elapsed gap to the previous line, then arm this one.
+
+        The admission check cannot be left to ``PY_START`` alone. That event fires only for
+        frames the interpreter *starts* while monitoring is armed, so any frame already on
+        the stack at ``__enter__`` — this profiler's own ``__enter__`` among them — would
+        otherwise have its remaining lines recorded unfiltered.
+        """
+        if not self._enabled or not self._admits(code):
+            return _MONITORING.DISABLE  # type: ignore[union-attr]
+        self._record_gap(time.perf_counter())
+        self._last_key = self._ensure_function_of(code)
+        self._last_line = line_number
+        self._last_time = time.perf_counter()
+        return None
+
+    def _on_start(self, code: CodeType, offset: int) -> object:  # noqa: ARG002
+        """``PY_START``: admit this code object, or opt out of it permanently.
+
+        Returning ``DISABLE`` is the monitoring counterpart of ``sys.settrace``'s
+        ``return None``, with one difference that matters: the interpreter stops delivering
+        events for that code object entirely rather than asking again on the next call. That
+        makes the filter free instead of merely cached — and is why ``__enter__`` has to
+        undo it with ``restart_events()``.
+        """
+        if not self._admits(code):
+            return _MONITORING.DISABLE  # type: ignore[union-attr]
+        self._record_gap(time.perf_counter())
+        self._ensure_function_of(code)
+        self._last_key = None
+        self._last_line = None
+        self._last_time = time.perf_counter()
+        return None
+
+    def _on_return(self, code: CodeType, offset: int, arg: object) -> object:  # noqa: ARG002
+        """``PY_RETURN`` and ``PY_UNWIND``: close out the frame's last line.
+
+        Both events share this callback because ``sys.settrace``'s ``return`` fires for an
+        exceptional exit as well as a normal one. With ``PY_RETURN`` alone the time spent in
+        a line that raised would be carried into whatever ran next — a wrong number rather
+        than a missing one.
+        """
+        self._record_gap(time.perf_counter())
+        self._last_key = None
+        self._last_line = None
+        self._last_time = time.perf_counter()
+        return None
 
     def _trace_callback(
         self,

@@ -24,12 +24,30 @@ from lineprofiler import accounting
 from lineprofiler.accounting import Profiler
 from lineprofiler.accounting.capabilities import cuda_synchronize
 
+
+def _a_tracer_is_active() -> bool:
+    """Whether anything is instrumenting execution, by either mechanism.
+
+    ``sys.gettrace()`` alone is not enough: a ``sys.monitoring`` tool — this package's own
+    3.12+ backend among them — instruments every line while leaving ``gettrace()`` at
+    ``None``, so a guard that checks only the old hook lets the timing assertions run
+    against an instrumented interpreter and fail for a reason that has nothing to do with
+    the hot path.
+    """
+    if sys.gettrace() is not None:
+        return True
+    monitoring = getattr(sys, "monitoring", None)
+    if monitoring is None:
+        return False
+    return any(monitoring.get_tool(tool) is not None for tool in range(6))
+
+
 pytestmark = [
     pytest.mark.overhead,
     # Coverage installs a global trace function that instruments every line, inflating these
     # by an order of magnitude. Timing assertions under it measure the instrumentation.
     pytest.mark.skipif(
-        sys.gettrace() is not None,
+        _a_tracer_is_active(),
         reason="a tracer is active (coverage?); hot-path timings are meaningless under one",
     ),
 ]

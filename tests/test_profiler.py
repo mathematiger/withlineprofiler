@@ -6,6 +6,7 @@ Standard-library and pytest internals live elsewhere and are filtered out.
 """
 from __future__ import annotations
 
+import contextlib
 import sys
 import time
 from pathlib import Path
@@ -14,10 +15,28 @@ from types import SimpleNamespace
 import pytest
 
 from lineprofiler import FunctionStats, LineProfiler, LineStats, start_profiling, stop_profiling
+from lineprofiler import profiler as profiler_module
 from lineprofiler.config import ENV_ENABLED, ProfilerConfig, get_config
-from lineprofiler.profiler import _qualname_of
+from lineprofiler.profiler import _MONITORING, _TOOL_ID, _qualname_of
 
 THIS_DIR = str(Path(__file__).resolve().parent)
+
+# Both event sources where the interpreter has both, so the older one keeps being exercised
+# on a runner that defaults to the newer. Without this the settrace path — the only one
+# 3.10 and 3.11 can use — would be untested everywhere CI actually runs.
+_BACKENDS = ("monitoring", "settrace") if _MONITORING is not None else ("settrace",)
+
+
+@pytest.fixture(params=_BACKENDS, autouse=True)
+def backend(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Run every profiler test against each event source this interpreter offers.
+
+    Patches the default rather than each construction site, so the thirty-odd
+    ``LineProfiler(project_folder=THIS_DIR)`` calls in this file need no edit.
+    """
+    chosen: str = request.param
+    monkeypatch.setattr(profiler_module, "_default_backend", lambda: chosen)
+    return chosen
 
 
 # --------------------------------------------------------------------------- #
@@ -56,6 +75,11 @@ def sleeper() -> int:
     time.sleep(0.05)  # this line should dominate the timing
     y = 2
     return x + y
+
+
+def raiser() -> None:
+    prepared = 1  # noqa: F841
+    raise ValueError("expected by the unwind test")
 
 
 def line_source(func_stats: FunctionStats, needle: str) -> LineStats:
@@ -381,14 +405,25 @@ def test_nesting_the_same_profiler_is_refused(tmp_path: Path) -> None:
     assert sys.gettrace() is incumbent, "the profiler leaked its tracer"
 
 
-def test_two_different_profilers_may_nest(tmp_path: Path) -> None:
-    """Only re-entering one instance is unsafe; distinct instances restore each other."""
+def test_two_different_profilers_nest_or_are_refused(backend: str) -> None:
+    """Distinct instances chain under ``settrace`` and are refused under ``monitoring``.
+
+    The backends genuinely differ here and neither behaviour is a bug. ``sys.settrace``
+    tracers chain, so the inner profiler restores the outer one on exit. ``sys.monitoring``
+    has one profiler slot, so the inner claim is refused — which is the better outcome of
+    the two: nesting double-counts every line either way, and the refusal says so instead
+    of quietly returning inflated numbers.
+    """
     incumbent = sys.gettrace()
     outer = LineProfiler(project_folder=THIS_DIR)
     inner = LineProfiler(project_folder=THIS_DIR)
 
-    with outer, inner:
-        add(1, 2)
+    if backend == "monitoring":
+        with outer, pytest.raises(RuntimeError, match="profiler slot"):
+            inner.__enter__()
+    else:
+        with outer, inner:
+            add(1, 2)
 
     assert sys.gettrace() is incumbent
 
@@ -426,6 +461,85 @@ def test_repo_root_still_finds_a_git_directory(tmp_path: Path) -> None:
     profiler = LineProfiler(project_folder=THIS_DIR)
 
     assert profiler._find_repo_root(str(module)) == tmp_path.resolve()
+
+
+# --------------------------------------------------------------------------- #
+# Backend selection and the monitoring event source
+# --------------------------------------------------------------------------- #
+def test_backend_defaults_to_what_the_interpreter_offers(backend: str) -> None:
+    assert LineProfiler(project_folder=THIS_DIR).backend == backend
+
+
+@pytest.mark.skipif(_MONITORING is not None, reason="needs an interpreter without monitoring")
+def test_monitoring_backend_is_refused_below_312() -> None:
+    with pytest.raises(ValueError, match="3.12 or newer"):
+        LineProfiler(project_folder=THIS_DIR, backend="monitoring")
+
+
+@pytest.mark.skipif(_MONITORING is None, reason="needs sys.monitoring")
+@pytest.mark.parametrize("backend", ["monitoring"])
+def test_monitoring_frees_the_tool_slot_on_exit(backend: str) -> None:
+    """A slot left claimed would refuse every later profiler in the process."""
+    assert _MONITORING is not None  # narrowed for the type checker; the skipif guarantees it
+    with LineProfiler(project_folder=THIS_DIR, backend="monitoring"):
+        add(1, 2)
+
+    assert _MONITORING.get_tool(_TOOL_ID) is None
+
+
+@pytest.mark.skipif(_MONITORING is None, reason="needs sys.monitoring")
+@pytest.mark.parametrize("backend", ["monitoring"])
+def test_a_second_session_still_records_a_previously_filtered_function(backend: str) -> None:
+    """Regression: ``DISABLE`` outlives the session that returned it.
+
+    ``sys.monitoring`` opt-outs are permanent for the code object until
+    ``restart_events()``, and they are *not* cleared by re-registering callbacks. So a
+    profiler that filtered ``add`` out in one session used to leave it filtered for every
+    later session in the same process — reporting a confident zero for a function that ran.
+    Delete the ``restart_events()`` call in ``_enable_monitoring`` and this test fails.
+    """
+    filtered = ProfilerConfig(enabled=True, functions=("loop_sum",))
+    with LineProfiler(project_folder=THIS_DIR, config=filtered, backend="monitoring"):
+        add(1, 2)
+
+    second = LineProfiler(project_folder=THIS_DIR, backend="monitoring")
+    with second:
+        add(1, 2)
+
+    assert stats_for(second, "add"), "the first session's opt-out leaked into the second"
+
+
+@pytest.mark.skipif(_MONITORING is None, reason="needs sys.monitoring")
+@pytest.mark.parametrize("backend", ["monitoring"])
+def test_monitoring_profiles_the_with_block_body(backend: str) -> None:
+    """What ``sys.settrace`` structurally cannot do, and the reason for the new backend.
+
+    ``sys.settrace`` only affects frames created after it is installed, so the block's own
+    frame is never traced. ``sys.monitoring`` has no such restriction.
+    """
+    profiler = LineProfiler(project_folder=THIS_DIR, backend="monitoring")
+    with profiler:
+        marker_in_the_block = sum(range(3))  # noqa: F841
+
+    body = stats_for(profiler, "test_monitoring_profiles_the_with_block_body")
+    assert line_source(body, "marker_in_the_block").hits == 1
+
+
+def test_an_exceptional_exit_does_not_bleed_into_the_next_line(backend: str) -> None:
+    """The unwind must close the raising frame, not leave its time on the caller's clock.
+
+    Under ``monitoring`` this needs ``PY_UNWIND`` registered alongside ``PY_RETURN``:
+    ``settrace``'s ``return`` event covers both exits, but ``PY_RETURN`` fires only for a
+    normal one, so without it the time spent raising is billed to whatever ran next.
+    """
+    profiler = LineProfiler(project_folder=THIS_DIR)
+    with profiler:
+        for _ in range(5):
+            with contextlib.suppress(ValueError):
+                raiser()
+
+    fs = stats_for(profiler, "raiser")
+    assert line_source(fs, "raise ValueError").hits == 5
 
 
 # --------------------------------------------------------------------------- #
