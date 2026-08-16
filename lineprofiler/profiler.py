@@ -641,6 +641,18 @@ class LineProfiler:
         """Return the raw profiling statistics (a live reference, not a copy)."""
         return self._function_stats
 
+    def to_html(self, path: str | Path, title: str = "lineprofiler") -> None:
+        """Write a self-contained HTML page: every profiled line, heat-coloured by time.
+
+        One file, no network and no dependencies, so it can be attached to a ticket or
+        opened months later on a machine that has neither.
+        """
+        from lineprofiler.html_source import render_source_html
+
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(render_source_html(self._function_stats, title), "utf-8")
+
     def clear(self) -> None:
         """Clear all profiling data and reset the timing state."""
         self._function_stats.clear()
