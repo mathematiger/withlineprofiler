@@ -8,6 +8,7 @@ dominate a global pie chart, whether or not self-play is the bottleneck.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from lineprofiler.accounting.analysis import (
@@ -248,12 +249,35 @@ def _role_block(run: MergedRun, role: str) -> str:
     return "\n".join(lines)
 
 
-def _share_rows(tree: PhaseTree) -> list[str]:
+@dataclass(frozen=True, slots=True)
+class SiblingShare:
+    """One row of the pipeline breakdown: a phase's wall time against its siblings' total.
+
+    Carries the numerator and denominator rather than a precomputed percentage so every
+    renderer divides them the same way. Two implementations of "share of parent" drifting
+    apart is the wrong-numbers failure this layer is built to avoid.
+    """
+
+    name: str
+    wall_ns: int
+    total_ns: int
+
+    @property
+    def percent(self) -> float:
+        """The share as a percentage, or 0.0 when nothing was measured."""
+        return 100.0 * self.wall_ns / self.total_ns if self.total_ns else 0.0
+
+
+def sibling_shares(tree: PhaseTree) -> list[SiblingShare]:
     """The pipeline breakdown: sibling phases as a share of their parent's wall time.
 
     A loop wrapped in a single outer phase would otherwise render as one 100% row, which
     says nothing. So the breakdown descends past any level that has only one phase, until
     it finds the first real split — that is the level where the work divides.
+
+    Time the parent held but did not pass to a child becomes a trailing ``Other`` row, once
+    it exceeds a tenth of a percent. The threshold lives here rather than in a renderer so
+    the text report and the HTML one never disagree about whether that row exists.
     """
     prefix = _first_branching_prefix(tree)
     siblings = [p for p in tree if len(p) == len(prefix) + 1 and p[:-1] == prefix]
@@ -263,15 +287,30 @@ def _share_rows(tree: PhaseTree) -> list[str]:
     if total <= 0:
         return []
 
-    rows = []
-    for path in sorted(siblings, key=lambda p: -tree[p].wall_ns):
-        stats = tree[path]
-        rows.append(f"{path[-1]:<28}{100.0 * stats.wall_ns / total:>7.1f}%"
-                    f"{format_ns(stats.wall_ns):>14}")
+    shares = [
+        SiblingShare(name=path[-1], wall_ns=tree[path].wall_ns, total_ns=total)
+        for path in sorted(siblings, key=lambda p: -tree[p].wall_ns)
+    ]
     if unattributed > total * 0.001:
-        share = 100.0 * unattributed / total
-        rows.append(f"{'Other':<28}{share:>7.1f}%{format_ns(unattributed):>14}")
-    return rows
+        shares.append(SiblingShare(name="Other", wall_ns=unattributed, total_ns=total))
+    return shares
+
+
+def wait_share(stats: PhaseStats) -> float:
+    """``wait_ns`` as a percentage of ``wall_ns``, or 0.0 for a phase with no wall time.
+
+    Pairs with wall time, never with self time: waiting inside a child still counts, so
+    ``wait / self`` exceeds 100% for any phase that wraps a blocking call.
+    """
+    return 100.0 * stats.wait_ns / stats.wall_ns if stats.wall_ns else 0.0
+
+
+def _share_rows(tree: PhaseTree) -> list[str]:
+    """Format the pipeline breakdown derived by :func:`sibling_shares`."""
+    return [
+        f"{share.name:<28}{share.percent:>7.1f}%{format_ns(share.wall_ns):>14}"
+        for share in sibling_shares(tree)
+    ]
 
 
 def _first_branching_prefix(tree: PhaseTree) -> PhasePath:
@@ -298,11 +337,10 @@ def _dominant_rows(tree: PhaseTree, limit: int = 6) -> list[str]:
     for path, stats in ranked[:limit]:
         if not path or stats.self_ns <= 0:
             continue
-        wait_share = 100.0 * stats.wait_ns / stats.wall_ns if stats.wall_ns else 0.0
         mark = "~" if stats.sample_stride else ""
         rows.append(
             f"{mark}{_label(path):<{28 - len(mark)}}{format_ns(stats.self_ns):>12}"
-            f"{wait_share:>7.0f}%"
+            f"{wait_share(stats):>7.0f}%"
             f"{format_ns(stats.hist.quantile(0.5)):>10}"
             f"{format_ns(stats.hist.quantile(0.99)):>10}",
         )
