@@ -77,6 +77,9 @@ Two choices worth knowing:
 | `lineprofiler report <dir> --format json` | the machine-readable document, for CI gates and diffs |
 | `lineprofiler report <dir> --format html -o out.html` | the page above |
 | `lineprofiler compare <a> <b> [--format json]` | what changed between two runs |
+| `lineprofiler trace <dir> -o trace.html` | the timeline page |
+| `lineprofiler trace <dir> --max-spans N` | cap what is drawn, keeping the longest spans |
+| `lineprofiler trace <dir> -q` | suppress the stderr progress lines |
 
 `--output`/`-o` writes to a path instead of stdout. It does not create parent directories: on
 a command line a path that does not exist is usually a typo, and failing loudly beats

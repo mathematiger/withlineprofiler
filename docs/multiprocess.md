@@ -24,6 +24,22 @@ counts processes by worker file rather than by pid, which collides across nodes.
 the newest and names the superseded ones rather than merging them, which used to inflate every
 total for a requeued job. Children inherit the attempt through `LINEPROFILER_RUN_ID`.
 
+**Runs record the code they measured.** The report header names the git revision, and marks a
+dirty tree with a file count and a hash of the diff:
+
+```
+Runtime 2m 56s   Processes 4   Roles actor x2, inference_server x1, learner x1
+Host node0   Run 20260817T091934-9ddbb7
+Source c49ce841 (+dirty: 26 files, diff sha 3f9a1c)
+```
+
+This closes a gap that silently invalidates analysis: a profile of the *committed* code, read
+against a working tree that has since fixed the constraint the profile found, is a claim about
+a program that no longer exists. One `git` call at startup, on the one rank that writes the run
+metadata, and silence — not an error — when there is no repository or no `git`. Pass
+`Profiler(source={...})` to supply your own instead; a config hash belongs here too, since a
+config change alters behaviour as much as a code change.
+
 **On preemption**, `SIGUSR1` and `SIGHUP` flush before exit alongside `SIGTERM` — Slurm's
 `--signal=USR1@120` idiom terminates without running `atexit`, so the last interval used to be
 lost exactly when you wanted it. `SIGKILL` remains unreachable; the periodic snapshot is what

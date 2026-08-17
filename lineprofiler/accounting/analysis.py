@@ -87,6 +87,44 @@ class GpuDevice:
 
 
 @dataclass(slots=True)
+class GpuPhaseUsage:
+    """Sampled device utilisation and allocator peaks while one phase was open.
+
+    The join the timeline could never make on its own: ``gpu.points`` is a flat series on its
+    own timebase, so "what was the GPU doing *during* forward?" was a manual intersection of
+    two artifacts. Every sample already carries the phase that was open when it was taken, so
+    the bucketing costs one pass.
+
+    Utilisation here is **instantaneous**, not cumulative — unlike the byte counters, which
+    are differenced between consecutive samples. Values are collected and quantiled, never
+    subtracted.
+    """
+
+    phase: str
+    utils: list[float] = field(default_factory=list)
+    peak_cuda_alloc: int = 0
+    peak_cuda_reserved: int = 0
+
+    @property
+    def samples(self) -> int:
+        """How many readings back this row. A handful of samples is a hint, not a finding."""
+        return len(self.utils)
+
+    def quantile(self, q: float) -> float:
+        """Utilisation at ``q``, or ``-1.0`` when nothing was measured for this phase.
+
+        Nearest-rank over the raw values rather than a histogram: a phase holds at most a few
+        thousand 1 Hz samples, so the exact figure is affordable and the bucket error is not
+        worth introducing.
+        """
+        if not self.utils:
+            return -1.0
+        ordered = sorted(self.utils)
+        index = min(len(ordered) - 1, max(0, int(q * len(ordered))))
+        return ordered[index]
+
+
+@dataclass(slots=True)
 class SampleAnalysis:
     """Everything the report derives from one run's resource samples."""
 
@@ -98,6 +136,7 @@ class SampleAnalysis:
     peak_cuda_reserved: int = 0
     gpu_util_mean: float = -1.0
     gpu_devices: list[GpuDevice] = field(default_factory=list)
+    gpu_by_phase: dict[str, GpuPhaseUsage] = field(default_factory=dict)
     read_series: list[float] = field(default_factory=list)
     write_series: list[float] = field(default_factory=list)
     io_gap_intervals: int = 0
@@ -108,6 +147,19 @@ class SampleAnalysis:
     @property
     def has_samples(self) -> bool:
         return self.memory.last_rss > 0 or self.totals.read_bytes > 0
+
+    @property
+    def has_gpu(self) -> bool:
+        """Whether any GPU reading reached this run at all.
+
+        One predicate rather than one per renderer: the text and HTML reports used to gate
+        their GPU blocks differently, so a run with CUDA memory but no NVML showed a GPU
+        section in one and nothing in the other. Silence reads as "no GPU involved", which is
+        the specific misreading that makes an unsynchronised device phase hard to catch.
+        """
+        return bool(
+            self.gpu_util_mean >= 0 or self.gpu_devices or self.peak_cuda_reserved,
+        )
 
     @property
     def unattributed_read_share(self) -> float:
@@ -339,7 +391,10 @@ def _accumulate_memory(
 
     by_phase: dict[str, list[Sample]] = {}
     for sample in with_rss:
-        by_phase.setdefault(sample.phase or "(root)", []).append(sample)
+        # NO_PHASE, not "(root)": the same admission the byte path makes. A sample taken while
+        # nothing was open says the sample rate was too coarse, and naming the root as the
+        # owner reads as a finding about the root instead.
+        by_phase.setdefault(sample.phase or NO_PHASE, []).append(sample)
     for phase, group in by_phase.items():
         if len(group) < 2:
             continue
@@ -397,6 +452,37 @@ def _fill_gpu(analysis: SampleAnalysis, per_process: list[list[Sample]]) -> None
     if utilisations:
         analysis.gpu_util_mean = sum(utilisations) / len(utilisations)
     analysis.gpu_devices = _gpu_devices(per_process)
+    analysis.gpu_by_phase = _gpu_by_phase(pooled)
+
+
+def _gpu_by_phase(samples: list[Sample]) -> dict[str, GpuPhaseUsage]:
+    """Bucket device readings by the phase that was open when each was taken.
+
+    Pooling across processes is safe here and is not safe for bytes: utilisation is an
+    instantaneous reading of a shared device, whereas the byte counters are cumulative and
+    per-process, which is why :func:`analyse_processes` differences those one process at a
+    time. A device reading taken by any worker describes the same device.
+
+    Whole-device utilisation (``gpu_utils``) is used rather than the per-process share,
+    matching what the timeline draws — the question this answers is "was the device busy while
+    this phase was open", not "was it busy on our behalf".
+    """
+    usage: dict[str, GpuPhaseUsage] = {}
+    for sample in samples:
+        if not sample.gpu_utils and not sample.cuda_reserved:
+            continue
+        phase = sample.phase or NO_PHASE
+        row = usage.get(phase)
+        if row is None:
+            row = usage.setdefault(phase, GpuPhaseUsage(phase=phase))
+        readings = [value for value in sample.gpu_utils.values() if value >= 0]
+        if readings:
+            # Mean over devices, as `Sample.gpu_util` already is: one row per phase, not one
+            # per phase per device, because the question is about the phase.
+            row.utils.append(sum(readings) / len(readings))
+        row.peak_cuda_alloc = max(row.peak_cuda_alloc, sample.cuda_alloc)
+        row.peak_cuda_reserved = max(row.peak_cuda_reserved, sample.cuda_reserved)
+    return usage
 
 
 def _gpu_devices(per_process: list[list[Sample]]) -> list[GpuDevice]:

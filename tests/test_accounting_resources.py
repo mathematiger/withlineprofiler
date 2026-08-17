@@ -24,8 +24,11 @@ from lineprofiler.accounting.analysis import (
 from lineprofiler.accounting.backend import BackendWindow
 from lineprofiler.accounting.cli import main as cli_main
 from lineprofiler.accounting.compare import compare, comparison_as_dict, render_comparison
+from lineprofiler.accounting.phasetree import PhaseStats
+from lineprofiler.accounting.report import _gpu_block
 from lineprofiler.accounting.sampler import ResourceSampler, Sample, _compact, read_samples
 from lineprofiler.accounting.snapshot import imbalance_of, new_run_id
+from lineprofiler.accounting.trace import FLAG_ASYNC_UNSYNCED
 
 # ── roles ───────────────────────────────────────────────────────────────────
 
@@ -978,6 +981,125 @@ def test_sync_is_ignored_when_the_profiler_is_disabled(tmp_path: Path) -> None:
         pass
 
 
+# ── un-awaited device work ──────────────────────────────────────────────────
+
+
+def test_an_async_phase_is_marked_in_the_report_and_a_synced_one_is_not(tmp_path: Path) -> None:
+    """The acceptance test for the whole feature, and the workflow it is built around.
+
+    A phase around unsynchronised device work reports submission time, which reads exactly
+    like device time and is smaller by orders of magnitude. Flipping it to ``sync=True`` is
+    how you turn one into the other, so the mark must disappear when you do — otherwise the
+    reader cannot tell which of the two a given run measured.
+    """
+    profiler = Profiler(
+        run_dir=tmp_path, role="server", enabled=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    with profiler:
+        for _ in range(3):
+            with profiler.phase("submit", async_work=True):
+                pass
+            with profiler.phase("awaited", sync=True, async_work=True):
+                pass
+        profiler.snapshot()
+
+    text = render(merge_run(tmp_path))
+
+    assert "†submit" in text
+    assert "†awaited" not in text
+    assert "wall time excludes un-awaited device work" in text
+    assert "sync=True" in text
+
+
+def test_a_phase_entered_both_ways_reports_the_share_that_was_unawaited(tmp_path: Path) -> None:
+    """A mixture must read as a mixture: "this number is partly wrong" is a distinct claim."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    with profiler:
+        for _ in range(2):
+            with profiler.phase("forward", async_work=True):
+                pass
+        for _ in range(6):
+            with profiler.phase("forward"):
+                pass
+        profiler.snapshot()
+
+    stats = merge_run(tmp_path).tree[("forward",)]
+
+    assert stats.calls == 8
+    assert stats.async_entries == 2
+    assert "2 of 8 entries" in render(merge_run(tmp_path))
+
+
+def test_an_ordinary_phase_is_never_marked(tmp_path: Path) -> None:
+    """The default must stay silent, or the mark distinguishes nothing.
+
+    ``sync=False`` is the default, so treating it as the declaration would mark every phase
+    of every run — including every phase of a CPU-only one, which has no device work to be
+    un-awaited.
+    """
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    with profiler:
+        with profiler.phase("cpu_only"):
+            pass
+        profiler.snapshot()
+
+    assert merge_run(tmp_path).tree[("cpu_only",)].async_entries == 0
+    assert "†" not in render(merge_run(tmp_path))
+
+
+def test_an_async_span_carries_the_flag(tmp_path: Path) -> None:
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None,
+        sample_interval_s=None, trace=True,
+    )
+    with profiler:
+        with profiler.phase("submit", async_work=True):
+            pass
+        with profiler.phase("plain"):
+            pass
+
+    trace = merge_run(tmp_path, with_trace=True).workers[0].trace
+    flagged = {
+        trace.path_of(span.phase_id)[-1]
+        for span in trace.spans
+        if span.flags & FLAG_ASYNC_UNSYNCED
+    }
+
+    assert flagged == {"submit"}
+
+
+def test_the_async_count_survives_the_snapshot_round_trip(tmp_path: Path) -> None:
+    """A field the hot path writes directly must also serialise, or it is lost at the merge."""
+    stats = PhaseStats(calls=4, async_entries=3)
+
+    assert PhaseStats.from_dict(stats.to_dict()).async_entries == 3
+
+
+def test_a_worker_file_without_the_field_reads_as_nothing_async() -> None:
+    """Back-compatibility: a 0.6.0 file declared nothing async, because it could not."""
+    old = {
+        "calls": 2, "wall_ns": 10, "cpu_ns": 5, "child_wall_ns": 0,
+        "hist": {}, "counters": {},
+    }
+
+    assert PhaseStats.from_dict(old).async_entries == 0
+
+
+def test_merging_sums_the_async_counts(tmp_path: Path) -> None:
+    """One worker submitting un-awaited work taints the merged node, as sampling does."""
+    first = PhaseStats(calls=3, async_entries=3)
+    second = PhaseStats(calls=5, async_entries=0)
+    first.merge(second)
+
+    assert first.calls == 8
+    assert first.async_entries == 3
+
+
 # ── the pattern the README documents under "Using it in tests" ──────────────
 
 
@@ -1017,3 +1139,132 @@ def test_a_role_that_never_started_is_visibly_absent(tmp_path: Path) -> None:
     profiler.close()
 
     assert "evaluator" not in merge_run(tmp_path, with_samples=False).roles
+
+
+# ── counter distribution ────────────────────────────────────────────────────
+
+
+def test_a_hard_cap_is_distinguishable_from_bursty_arrival(tmp_path: Path) -> None:
+    """The acceptance test: a mean cannot tell these apart, and they need opposite fixes.
+
+    "Mean 1.9 against a cap of 2" is equally consistent with "always exactly 2" (the cap is
+    binding, raise it) and "usually 1, occasionally 8" (the supply is not there, batch
+    harder). The sum reports the same figure for both.
+    """
+    capped = Profiler(
+        run_dir=tmp_path / "capped", role="server", enabled=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    with capped:
+        for _ in range(8):
+            with capped.phase("forward"):
+                capped.count("rows", 2)
+        capped.snapshot()
+
+    bursty = Profiler(
+        run_dir=tmp_path / "bursty", role="server", enabled=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    with bursty:
+        for amount in (1, 1, 1, 1, 1, 1, 1, 9):
+            with bursty.phase("forward"):
+                bursty.count("rows", amount)
+        bursty.snapshot()
+
+    capped_stats = merge_run(tmp_path / "capped").tree[("forward",)]
+    bursty_stats = merge_run(tmp_path / "bursty").tree[("forward",)]
+
+    assert capped_stats.counters["rows"] == bursty_stats.counters["rows"] == 16
+    assert (capped_stats.counter_min["rows"], capped_stats.counter_max["rows"]) == (2, 2)
+    assert (bursty_stats.counter_min["rows"], bursty_stats.counter_max["rows"]) == (1, 9)
+    assert "always 2" in render(merge_run(tmp_path / "capped"))
+    assert "1..9" in render(merge_run(tmp_path / "bursty"))
+
+
+def test_merging_extremes_does_not_treat_a_worker_total_as_one_observation(
+    tmp_path: Path,
+) -> None:
+    """The trap: merging through ``add_count`` would make the maximum a worker's whole sum."""
+    first = PhaseStats()
+    for amount in (2, 3):
+        first.add_count("rows", amount)
+    second = PhaseStats()
+    for amount in (1, 4):
+        second.add_count("rows", amount)
+    first.merge(second)
+
+    assert first.counters["rows"] == 10
+    assert first.counter_min["rows"] == 1
+    assert first.counter_max["rows"] == 4
+
+
+def test_counter_extremes_survive_the_snapshot_round_trip() -> None:
+    stats = PhaseStats()
+    stats.add_count("rows", 7)
+
+    restored = PhaseStats.from_dict(stats.to_dict())
+
+    assert restored.counter_min == {"rows": 7}
+    assert restored.counter_max == {"rows": 7}
+
+
+def test_a_worker_file_without_extremes_reads_as_having_none() -> None:
+    old = {
+        "calls": 1, "wall_ns": 10, "cpu_ns": 5, "child_wall_ns": 0,
+        "hist": {}, "counters": {"rows": 4},
+    }
+    restored = PhaseStats.from_dict(old)
+
+    assert restored.counters == {"rows": 4}
+    assert restored.counter_min == {}
+
+
+# ── GPU utilisation by phase ────────────────────────────────────────────────
+
+
+def test_a_gpu_heavy_phase_reads_differently_from_a_gpu_idle_one() -> None:
+    """The acceptance test, and the join that refutes an unsynchronised forward pass.
+
+    A phase named ``forward`` holding most of a server's time at 7% device utilisation is a
+    contradiction — but only if the two numbers appear on the same page.
+    """
+    samples = [
+        Sample(t=float(i), phase="train_step", gpu_utils={0: 80.0}, cuda_reserved=3_000_000)
+        for i in range(10)
+    ] + [
+        Sample(t=float(10 + i), phase="forward", gpu_utils={0: 6.0}, cuda_reserved=1_000_000)
+        for i in range(10)
+    ]
+
+    by_phase = analyse_processes([samples]).gpu_by_phase
+
+    assert by_phase["train_step"].quantile(0.5) == pytest.approx(80.0)
+    assert by_phase["forward"].quantile(0.5) == pytest.approx(6.0)
+    assert by_phase["train_step"].peak_cuda_reserved == 3_000_000
+
+
+def test_gpu_samples_with_no_phase_open_are_named_not_billed_to_the_root() -> None:
+    """The same admission the byte path makes: coarse sampling, not a finding about the root."""
+    samples = [Sample(t=float(i), phase="", gpu_utils={0: 50.0}) for i in range(3)]
+
+    assert "(no phase open)" in analyse_processes([samples]).gpu_by_phase
+
+
+def test_the_gpu_phase_table_reaches_the_report() -> None:
+    samples = [
+        Sample(t=float(i), phase="forward", gpu_utils={0: 9.0}, cuda_reserved=2_000_000)
+        for i in range(5)
+    ]
+
+    text = _gpu_block(analyse_processes([samples]))
+
+    assert "GPU BY PHASE (sampled)" in text
+    assert "forward" in text
+    assert "submits device work without awaiting it" in text
+
+
+def test_a_phase_with_no_gpu_reading_is_not_given_a_row() -> None:
+    """Absent is absent: a phase the sampler never caught must not read as 0% utilisation."""
+    samples = [Sample(t=float(i), phase="cpu_only", rss=1000) for i in range(3)]
+
+    assert analyse_processes([samples]).gpu_by_phase == {}

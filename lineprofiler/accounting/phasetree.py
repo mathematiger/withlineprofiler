@@ -47,6 +47,27 @@ class PhaseStats:
     measurement is precisely the failure this layer exists to avoid. Merging takes the largest
     stride: one sampled contributor makes the merged node an estimate too."""
 
+    counter_min: dict[str, int] = field(default_factory=dict)
+    """Smallest single ``count()`` amount seen for each counter name.
+
+    Paired with :attr:`counter_max`, this is what distinguishes a hard cap from bursty
+    arrival. ``counters`` is a running sum, so it yields a mean and nothing else — and for a
+    batching server the mean is the least interesting statistic, because "mean 1.9" is equally
+    consistent with "always exactly 2" (a cap that is binding) and "usually 1, occasionally 8"
+    (a supply that is not). Those demand opposite fixes. ``min == max`` says outright which
+    one you have."""
+
+    counter_max: dict[str, int] = field(default_factory=dict)
+    """Largest single ``count()`` amount seen for each counter name. See :attr:`counter_min`."""
+
+    async_entries: int = 0
+    """How many entries declared ``async_work=True`` — work still in flight when they exited.
+
+    Those entries' wall time is submission time, not the cost of the work they started, so a
+    node with a non-zero count here is measuring something other than what its name suggests.
+    A count rather than a flag: a phase entered both ways is partly misleading, and the ratio
+    against ``calls`` is what says how much."""
+
     @property
     def self_ns(self) -> int:
         """Wall time in this phase excluding time in its children."""
@@ -72,8 +93,17 @@ class PhaseStats:
         self.hist.observe(wall_ns)
 
     def add_count(self, name: str, amount: int) -> None:
-        """Attribute ``amount`` work units of kind ``name`` to this phase."""
+        """Attribute ``amount`` work units of kind ``name`` to this phase.
+
+        The extremes are tracked alongside the sum because the sum alone cannot answer the
+        question a batching workload actually asks. Two dict writes on a call that already
+        does one, and only on the counting path — a phase that counts nothing pays nothing.
+        """
         self.counters[name] = self.counters.get(name, 0) + amount
+        low = self.counter_min.get(name)
+        self.counter_min[name] = amount if low is None or amount < low else low
+        high = self.counter_max.get(name)
+        self.counter_max[name] = amount if high is None or amount > high else high
 
     def copy(self) -> PhaseStats:
         """Return a detached copy, so merging never mutates the source it was built from."""
@@ -99,8 +129,22 @@ class PhaseStats:
         # Any sampled contributor taints the total: presenting a partly-estimated sum as
         # measured is the wrong-number failure, so the coarsest stride wins.
         self.sample_stride = max(self.sample_stride, other.sample_stride)
+        self.async_entries += other.async_entries
         for name, amount in list(other.counters.items()):
-            self.add_count(name, amount)
+            self.counters[name] = self.counters.get(name, 0) + amount
+        # Deliberately not through add_count: `other`'s totals are sums over many calls, and
+        # feeding a sum in as though it were one observation would make the merged maximum the
+        # sum of a worker's whole run. The extremes merge as extremes.
+        self._merge_extremes(other)
+
+    def _merge_extremes(self, other: PhaseStats) -> None:
+        """Combine another node's per-call counter extremes into this one's."""
+        for name, amount in list(other.counter_min.items()):
+            low = self.counter_min.get(name)
+            self.counter_min[name] = amount if low is None or amount < low else low
+        for name, amount in list(other.counter_max.items()):
+            high = self.counter_max.get(name)
+            self.counter_max[name] = amount if high is None or amount > high else high
 
     def difference(self, baseline: PhaseStats) -> PhaseStats:
         """Return the work recorded since ``baseline`` was taken.
@@ -115,12 +159,18 @@ class PhaseStats:
             cpu_ns=max(0, self.cpu_ns - baseline.cpu_ns),
             child_wall_ns=max(0, self.child_wall_ns - baseline.child_wall_ns),
             sample_stride=self.sample_stride,
+            async_entries=max(0, self.async_entries - baseline.async_entries),
         )
         result.hist = self.hist.difference(baseline.hist)
         for name, amount in list(self.counters.items()):
             delta = amount - baseline.counters.get(name, 0)
             if delta > 0:
                 result.counters[name] = delta
+        # Extremes are not differenceable — the smallest batch seen since a baseline cannot be
+        # recovered from two running minima — so the window inherits the lifetime figures.
+        # Carrying them forward is honest about the range; subtracting them would invent one.
+        result.counter_min = dict(self.counter_min)
+        result.counter_max = dict(self.counter_max)
         return result
 
     def to_dict(self) -> dict[str, Any]:
@@ -132,7 +182,10 @@ class PhaseStats:
             "child_wall_ns": self.child_wall_ns,
             "hist": self.hist.to_sparse(),
             "counters": self.counters,
+            "counter_min": self.counter_min,
+            "counter_max": self.counter_max,
             "sample_stride": self.sample_stride,
+            "async_entries": self.async_entries,
         }
 
     @classmethod
@@ -140,7 +193,8 @@ class PhaseStats:
         """Rebuild a node from :meth:`to_dict` output.
 
         ``sample_stride`` defaults to ``0`` so a worker file written before sampling existed
-        reads back as fully measured, which it was.
+        reads back as fully measured, which it was. ``async_entries`` defaults the same way,
+        for the same reason: a file written before the flag existed declared nothing async.
         """
         return cls(
             calls=data["calls"],
@@ -149,7 +203,10 @@ class PhaseStats:
             child_wall_ns=data["child_wall_ns"],
             hist=DurationHistogram.from_sparse(data["hist"]),
             counters=dict(data["counters"]),
+            counter_min=dict(data.get("counter_min", {})),
+            counter_max=dict(data.get("counter_max", {})),
             sample_stride=data.get("sample_stride", 0),
+            async_entries=data.get("async_entries", 0),
         )
 
 

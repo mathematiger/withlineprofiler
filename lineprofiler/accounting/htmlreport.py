@@ -16,6 +16,7 @@ from pathlib import Path
 
 from lineprofiler.accounting.analysis import SampleAnalysis, analyse_processes, format_bytes
 from lineprofiler.accounting.phasetree import PhasePath, PhaseTree
+from lineprofiler.accounting.provenance import source_of
 from lineprofiler.accounting.report import (
     format_ns,
     report_as_dict,
@@ -161,9 +162,11 @@ def _header(run: MergedRun, title: str) -> str:
         tile("imbalance", f"{run.imbalance:.2f}"),
     ])
     run_id = escape(str(run.metadata.get("run_id", "unknown")))
+    source = source_of(run.metadata)
+    source_html = f" · {escape(source)}" if source else ""
     return (
         f"<h1>{escape(title)}</h1>\n"
-        f'<p class="sub mono">run {run_id}</p>\n'
+        f'<p class="sub mono">run {run_id}{source_html}</p>\n'
         f'<div class="tiles">{tiles}</div>'
     )
 
@@ -301,8 +304,20 @@ def _series_chart(series: list[float], label: str) -> str:
 
 
 def _gpu_block(analysis: SampleAnalysis) -> str:
-    if not analysis.gpu_devices:
+    # Shares `has_gpu` with the text report so the two can never disagree about whether this
+    # run had a GPU in it. The device table itself still needs per-device rows to draw.
+    if not analysis.has_gpu:
         return ""
+    if not analysis.gpu_devices:
+        tiles = "".join([
+            tile("VRAM allocated", format_bytes(analysis.peak_cuda_alloc)),
+            tile("VRAM reserved", format_bytes(analysis.peak_cuda_reserved)),
+        ])
+        return (
+            f"<h2>GPU</h2>\n<div class=\"tiles\">{tiles}</div>\n"
+            '<p class="note">No per-device utilisation was recorded — install nvidia-ml-py '
+            "to collect it.</p>"
+        )
     rows = "".join(
         f"<tr><td>GPU {device.index}</td><td>{device.busy_mean:.1f}%</td>"
         f"<td>{'n/a' if device.ours_mean < 0 else f'{device.ours_mean:.1f}%'}</td></tr>"

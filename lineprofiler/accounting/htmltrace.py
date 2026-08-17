@@ -22,9 +22,11 @@ Drawing decisions worth knowing:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from lineprofiler.accounting.analysis import analyse_processes
+from lineprofiler.accounting.provenance import source_of
 from lineprofiler.accounting.report import format_ns
 from lineprofiler.accounting.snapshot import MergedRun
 from lineprofiler.accounting.trace import FLAG_AUTO
@@ -56,39 +58,81 @@ _MAX_SEQUENCE_ROWS = 40
 to be read in order, and a few hundred rows of it would not be."""
 
 
-def render_trace_html(run: MergedRun, title: str = "lineprofiler trace") -> str:
+def render_trace_html(
+    run: MergedRun,
+    title: str = "lineprofiler trace",
+    max_spans: int | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> str:
     """Return a complete, self-contained timeline page for a merged run.
 
     Raises nothing when a run has no trace data: the page says so plainly and explains how to
     record some, which is more useful than an exception to someone who has just discovered
     the feature exists.
+
+    ``max_spans`` overrides the built-in cap, so a run too large to render at the default
+    degrades to a readable picture rather than failing after the expensive half of the work
+    has already succeeded. ``progress`` receives coarse status lines; the stages it reports
+    are the slow ones, so a caller can tell a long render from a stuck one.
     """
+    say = progress if progress is not None else _silent
     aligned = align_run(run)
+    say(f"aligned {len(aligned.spans):,} spans across {len(aligned.lanes)} lanes")
     if not aligned.spans:
         return document(title, _empty_body(title), data={"spans": []})
 
+    _warn_if_large(aligned, max_spans, say)
     chain = critical_path(aligned)
-    payload = _payload(aligned, chain, run)
+    say(f"critical path: {len(chain)} spans")
+    payload = _payload(aligned, chain, run, max_spans)
+    omitted = payload["omitted"]
+    if isinstance(omitted, int) and omitted:
+        say(f"omitted {omitted:,} spans below the drawing cap")
     body = "\n".join([
         _header(aligned, title, run),
         _lane_summary(aligned),
         _canvas_block(),
         _critical_path_block(chain, aligned),
         _sequence_block(aligned),
-        _caveats(aligned),
+        _caveats(aligned, omitted if isinstance(omitted, int) else 0),
     ])
+    say("writing HTML")
     return document(title, body, data=payload, style=_STYLE, script=_SCRIPT)
+
+
+def _silent(message: str) -> None:
+    """Default progress sink: the library call stays quiet unless asked not to."""
+
+
+def _warn_if_large(
+    aligned: AlignedTrace,
+    max_spans: int | None,
+    say: Callable[[str], None],
+) -> None:
+    """Say up front that this will be slow, and name the flag that makes it fast.
+
+    Estimated before the work rather than discovered during it: the point is to let someone
+    interrupt a render they did not want, which is only useful while it is still starting.
+    """
+    limit = max_spans if max_spans is not None else _MAX_SPANS_DRAWN
+    if len(aligned.spans) <= limit:
+        return
+    # Only suggest the flag to someone who has not already used it; repeating the advice back
+    # at a caller who took it reads as the tool not knowing what it was asked to do.
+    advice = "" if max_spans is not None else " — pass --max-spans to draw fewer"
+    say(f"{len(aligned.spans):,} spans exceeds the {limit:,} drawn; this may take a while{advice}")
 
 
 def write_trace_html(
     run: MergedRun,
     path: str | Path,
     title: str = "lineprofiler trace",
+    max_spans: int | None = None,
 ) -> None:
     """Write :func:`render_trace_html` to ``path``, creating parent directories if needed."""
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(render_trace_html(run, title), encoding="utf-8")
+    destination.write_text(render_trace_html(run, title, max_spans), encoding="utf-8")
 
 
 def _empty_body(title: str) -> str:
@@ -112,17 +156,25 @@ def _header(aligned: AlignedTrace, title: str, run: MergedRun) -> str:
     """Headline figures: how long, how many lanes, and how much of it was waiting."""
     waiting = _overall_wait_share(aligned)
     tiles = "".join([
-        tile("span", format_ns(aligned.duration_ns)),
+        # "traced span", not "runtime": this is first-span to last-span, which is legitimately
+        # shorter than the run's wall clock — a worker profiles for a while before its first
+        # phase and after its last. The two figures differing is expected, and an unlabelled
+        # difference reads as a broken timebase.
+        tile("traced span", format_ns(aligned.duration_ns)),
         tile("lanes", str(len(aligned.lanes))),
         tile("spans", f"{len(aligned.spans):,}"),
         tile("arrows", str(len(aligned.arrows))),
         tile("waiting", "n/a" if waiting < 0 else f"{waiting:.0f}%"),
     ])
     run_id = escape(str(run.metadata.get("run_id", "unknown")))
+    source = source_of(run.metadata)
+    source_html = f" · {escape(source)}" if source else ""
     return (
         f"<h1>{escape(title)}</h1>\n"
-        f'<p class="sub mono">run {run_id}</p>\n'
-        f'<div class="tiles">{tiles}</div>'
+        f'<p class="sub mono">run {run_id}{source_html}</p>\n'
+        f'<div class="tiles">{tiles}</div>\n'
+        '<p class="note">“traced span” is first span to last, which is shorter than the '
+        "run's wall clock: a worker starts before its first phase and ends after its last.</p>"
     )
 
 
@@ -227,13 +279,16 @@ def _canvas_block() -> str:
         '<div class="tl-controls">'
         '<button type="button" id="tl-reset">reset zoom</button>'
         '<button type="button" id="tl-critical">show critical path</button>'
+        '<button type="button" id="tl-brush" aria-pressed="false">select a range</button>'
         '<span class="note" id="tl-range"></span>'
         "</div>\n"
         '<div id="tl-wrap"><canvas id="tl-canvas"></canvas>'
         '<div id="tl-tip" hidden></div></div>\n'
+        '<p class="note" id="tl-selection"></p>\n'
         '<p class="note">Drag to pan, scroll to zoom, hover for detail, click a span to '
         "trace what it was waiting for. Width is wall time; colour is the share of it spent "
-        "waiting rather than running.</p>"
+        'waiting rather than running. Use “select a range” to ask what every other lane was '
+        "doing during a wait — the difference between a stall and a queue.</p>"
     )
 
 
@@ -277,13 +332,21 @@ def _critical_path_block(chain: list[PlacedSpan], aligned: AlignedTrace) -> str:
     )
 
 
-def _caveats(aligned: AlignedTrace) -> str:
+def _caveats(aligned: AlignedTrace, omitted: int = 0) -> str:
     """Everything that makes this timeline less than the whole truth.
 
     A dropped span, an unmatched wait and a cross-host clock are all reasons a reader should
     trust the picture slightly less, and each is invisible unless stated.
     """
     items: list[str] = []
+    if omitted:
+        # The count was always computed and embedded; it just never reached the page, so the
+        # one cap a reader is most likely to hit was also the only one that stayed silent.
+        items.append(
+            f"{omitted:,} span(s) are not drawn: the page keeps the longest spans up to its "
+            "cap, so short spans in dense regions are missing. Raise --max-spans to keep "
+            "more.",
+        )
     if aligned.dropped_spans:
         items.append(
             f"{aligned.dropped_spans:,} span(s) were dropped: the ring buffer wrapped, so "
@@ -325,7 +388,8 @@ def _payload(
     aligned: AlignedTrace,
     chain: list[PlacedSpan],
     run: MergedRun,
-) -> JsonValue:
+    max_spans: int | None = None,
+) -> dict[str, JsonValue]:
     """The data the page draws from, also embedded for anything that wants to read it.
 
     Times are re-based to the trace's own start and expressed in microseconds: the absolute
@@ -333,7 +397,7 @@ def _payload(
     what every figure on the page is actually about.
     """
     origin = aligned.t0_ns
-    drawn, omitted = _spans_to_draw(aligned.spans)
+    drawn, omitted = _spans_to_draw(aligned.spans, max_spans)
     lane_index = {lane: index for index, lane in enumerate(aligned.lanes)}
     critical = {id(span) for span in chain}
 
@@ -378,18 +442,22 @@ def _payload(
     }
 
 
-def _spans_to_draw(spans: list[PlacedSpan]) -> tuple[list[PlacedSpan], int]:
+def _spans_to_draw(
+    spans: list[PlacedSpan],
+    max_spans: int | None = None,
+) -> tuple[list[PlacedSpan], int]:
     """Cap what the page carries, keeping the longest spans and counting the rest.
 
     The longest rather than the first: a reader zooming into a busy region wants the shape of
     it, and the spans that define that shape are the ones with visible width. The number
     dropped is reported, never hidden.
     """
-    if len(spans) <= _MAX_SPANS_DRAWN:
+    limit = _MAX_SPANS_DRAWN if max_spans is None else max(1, max_spans)
+    if len(spans) <= limit:
         return spans, 0
-    kept = sorted(spans, key=lambda span: -span.duration_ns)[:_MAX_SPANS_DRAWN]
+    kept = sorted(spans, key=lambda span: -span.duration_ns)[:limit]
     kept.sort(key=lambda span: span.t0_ns)
-    return kept, len(spans) - _MAX_SPANS_DRAWN
+    return kept, len(spans) - limit
 
 
 def _gpu_series(run: MergedRun, aligned: AlignedTrace) -> JsonValue:
@@ -474,6 +542,8 @@ _SCRIPT = r"""
   var total = data.duration_us || 1;
   var view = { t0: 0, t1: total };
   var onlyCritical = false, hover = null, focus = null;
+  var brushing = false, brushFrom = null, brushTo = null;
+  var selectionLabel = document.getElementById('tl-selection');
 
   // Each lane is as tall as it is deep: one row per nesting level, so a callee is drawn
   // under its caller instead of over it. Computed once — every y on the page reads it.
@@ -543,7 +613,70 @@ _SCRIPT = r"""
     for (var s = 0; s < spans.length; s++) { drawSpan(spans[s], width); }
     drawArrows(width);
     drawGpu(width, muted, rule);
+    drawBrush(width, fg);
     rangeLabel.textContent = fmt(view.t1 - view.t0) + ' shown of ' + fmt(total);
+  }
+
+  function drawBrush(width, fg) {
+    if (brushFrom === null || brushTo === null) { return; }
+    var x0 = xOf(Math.min(brushFrom, brushTo), width);
+    var x1 = xOf(Math.max(brushFrom, brushTo), width);
+    if (x1 - x0 < 1) { return; }
+    // Drawn last so it sits over the spans it selects, and translucent so they stay readable:
+    // the point is to say which spans are included, not to hide them.
+    ctx.save();
+    ctx.globalAlpha = 0.18;
+    ctx.fillStyle = fg;
+    ctx.fillRect(x0, PAD_T, x1 - x0, lanesBottom - PAD_T);
+    ctx.restore();
+    ctx.strokeStyle = fg; ctx.lineWidth = 1;
+    ctx.strokeRect(x0 + 0.5, PAD_T + 0.5, x1 - x0 - 1, lanesBottom - PAD_T - 1);
+  }
+
+  function describeSelection() {
+    var from = Math.min(brushFrom, brushTo), to = Math.max(brushFrom, brushTo);
+    var window = to - from;
+    if (window <= 0) { selectionLabel.textContent = ''; return; }
+
+    // Union per lane, so a lane whose phases nest cannot exceed 100% of the window.
+    var byLane = {};
+    for (var i = 0; i < spans.length; i++) {
+      var sp = spans[i];
+      var lo = Math.max(sp.t, from), hi = Math.min(sp.t + sp.d, to);
+      if (hi <= lo) { continue; }
+      var name = lanes[sp.l] ? lanes[sp.l].id : String(sp.l);
+      if (!byLane[name]) { byLane[name] = []; }
+      byLane[name].push([lo, hi]);
+    }
+
+    var parts = [];
+    for (var lane in byLane) {
+      if (!Object.prototype.hasOwnProperty.call(byLane, lane)) { continue; }
+      parts.push([lane, 100 * covered(byLane[lane]) / window]);
+    }
+    parts.sort(function (a, b) { return b[1] - a[1]; });
+
+    var text = 'during ' + fmt(window) + ': ';
+    if (!parts.length) {
+      text += 'no lane had a phase open — a stall, not a queue.';
+    } else {
+      var shown = [];
+      for (var k = 0; k < parts.length && k < 6; k++) {
+        shown.push(parts[k][0] + ' busy ' + parts[k][1].toFixed(0) + '%');
+      }
+      text += shown.join(', ');
+    }
+    selectionLabel.textContent = text;
+  }
+
+  function covered(intervals) {
+    intervals.sort(function (a, b) { return a[0] - b[0]; });
+    var total = 0, cursor = -Infinity;
+    for (var i = 0; i < intervals.length; i++) {
+      var start = Math.max(intervals[i][0], cursor);
+      if (intervals[i][1] > start) { total += intervals[i][1] - start; cursor = intervals[i][1]; }
+    }
+    return total;
   }
 
   function drawAxis(width, muted, rule) {
@@ -722,13 +855,29 @@ _SCRIPT = r"""
 
   var dragging = false, dragX = 0, dragT = 0;
   el.addEventListener('mousedown', function (event) {
+    if (brushing) {
+      // A brush and a pan both start with a press on the canvas, so the mode decides which.
+      var rect = el.getBoundingClientRect();
+      brushFrom = tOf(event.clientX - rect.left, wrap.clientWidth);
+      brushTo = brushFrom;
+      tip.hidden = true;
+      draw();
+      return;
+    }
     dragging = true; dragX = event.clientX; dragT = view.t0;
     el.classList.add('dragging'); tip.hidden = true;
   });
   window.addEventListener('mouseup', function () {
     dragging = false; el.classList.remove('dragging');
+    if (brushFrom !== null && brushTo !== null) { describeSelection(); }
   });
   window.addEventListener('mousemove', function (event) {
+    if (brushing && brushFrom !== null) {
+      var box = el.getBoundingClientRect();
+      brushTo = tOf(event.clientX - box.left, wrap.clientWidth);
+      draw();
+      return;
+    }
     if (!dragging) { return; }
     var width = wrap.clientWidth;
     var perPx = (view.t1 - view.t0) / (width - PAD_L - 10);
@@ -759,6 +908,13 @@ _SCRIPT = r"""
   criticalButton.addEventListener('click', function () {
     onlyCritical = !onlyCritical;
     criticalButton.setAttribute('aria-pressed', onlyCritical ? 'true' : 'false');
+    draw();
+  });
+  var brushButton = document.getElementById('tl-brush');
+  brushButton.addEventListener('click', function () {
+    brushing = !brushing;
+    brushButton.setAttribute('aria-pressed', brushing ? 'true' : 'false');
+    if (!brushing) { brushFrom = null; brushTo = null; selectionLabel.textContent = ''; }
     draw();
   });
 

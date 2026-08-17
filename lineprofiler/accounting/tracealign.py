@@ -125,6 +125,12 @@ class AlignedTrace:
     roles: dict[str, str] = field(default_factory=dict)
     """Lane identity to the role of the worker that owns it."""
     hosts: set[str] = field(default_factory=set)
+    lifecycle_marks: list[Link] = field(default_factory=list)
+    """Request-lifecycle checkpoints, with ``t_ns`` already on the common epoch.
+
+    Kept apart from ``arrows`` because they answer a different question: an arrow says who
+    released whom, while these decompose one request's wait into named segments stamped in
+    the processes that own each transition."""
 
     @property
     def t0_ns(self) -> int:
@@ -480,6 +486,218 @@ def lane_working_share(trace: AlignedTrace, lane: str) -> float:
     return min(100.0, 100.0 * cpu / trace.duration_ns)
 
 
+@dataclass(frozen=True, slots=True)
+class Segment:
+    """One named interval of a request's life, aggregated over every request on a channel.
+
+    ``total_ns`` sums the segment across requests, so the shares compare like with like: the
+    question is which part of the wait dominates, and one request's breakdown answers it only
+    by accident.
+    """
+
+    channel: str
+    name: str
+    total_ns: int
+    count: int
+
+    @property
+    def mean_ns(self) -> float:
+        """Average length of this segment across the requests that reported it."""
+        return self.total_ns / self.count if self.count else 0.0
+
+
+def lifecycle_segments(trace: AlignedTrace) -> dict[str, list[Segment]]:
+    """Decompose each channel's request lifecycles into consecutive named segments.
+
+    Returns segments per channel, in the order the checkpoints occurred, so the result reads
+    as a breakdown of one request's journey rather than a set of unrelated totals.
+
+    Only complete, monotonic lifecycles contribute. A request whose checkpoints arrived out of
+    order across processes — the ordinary consequence of clock skew between hosts — is
+    dropped rather than contributing a negative segment, because a segment that cannot have
+    happened is worse than one that is missing.
+
+    Test specifically:
+        - a server sleeping a known 50 ms before admitting and 20 ms computing attributes
+          ≈50 ms and ≈20 ms to the right segments
+        - a lifecycle missing its end contributes nothing
+        - checkpoints arriving out of order are dropped, never counted as negative
+    """
+    by_request: dict[tuple[str, str], list[tuple[int, str]]] = {}
+    for link in trace.lifecycle_marks:
+        by_request.setdefault((link.channel, link.key), []).append((link.t_ns, link.kind))
+
+    totals: dict[tuple[str, str], list[int]] = {}
+    order: dict[str, list[str]] = {}
+    for (channel, _key), marks in by_request.items():
+        for name, span_ns in _segments_of(marks):
+            bucket = totals.setdefault((channel, name), [0, 0])
+            bucket[0] += span_ns
+            bucket[1] += 1
+            names = order.setdefault(channel, [])
+            if name not in names:
+                names.append(name)
+
+    segments: dict[str, list[Segment]] = {}
+    for channel, names in order.items():
+        segments[channel] = [
+            Segment(
+                channel=channel,
+                name=name,
+                total_ns=totals[(channel, name)][0],
+                count=totals[(channel, name)][1],
+            )
+            for name in names
+        ]
+    return segments
+
+
+def _segments_of(marks: list[tuple[int, str]]) -> list[tuple[str, int]]:
+    """Turn one request's checkpoints into consecutive ``from → to`` intervals.
+
+    Requires both ends of the lifecycle: a request still in flight when the trace was cut has
+    a genuine but unknown remainder, and closing it at the last mark would invent a fast
+    request out of an unfinished one.
+    """
+    kinds = {kind for _at, kind in marks}
+    if "begin" not in kinds or "end" not in kinds:
+        return []
+    ordered = sorted(marks)
+    if ordered[0][1] != "begin" or ordered[-1][1] != "end":
+        return []  # skewed or duplicated: not a lifecycle we can read
+
+    segments = []
+    for (start, from_kind), (end, to_kind) in zip(ordered, ordered[1:], strict=False):
+        if end < start:
+            return []
+        segments.append((f"{_label_of(from_kind)} → {_label_of(to_kind)}", end - start))
+    return segments
+
+
+def _label_of(kind: str) -> str:
+    """Human name for a lifecycle checkpoint: ``mark:admitted`` reads as ``admitted``."""
+    return kind[5:] if kind.startswith("mark:") else kind
+
+
+def overlap_ns(
+    first: list[tuple[int, int]],
+    second: list[tuple[int, int]],
+) -> int:
+    """Nanoseconds covered by both interval lists — their intersection, not their union.
+
+    The primitive behind "is this a hang, or is it queueing behind real work?", which is the
+    first question anyone asks about a phase that is 96% wait and has nothing in common with
+    the other answer as a problem. Answering it previously meant extracting the JSON embedded
+    in an 11.7 MB page and intersecting the intervals by hand.
+
+    Overlaps *within* each list are merged first, so a nested phase cannot make its own lane
+    count twice and push the result past either input's extent.
+
+    Test specifically:
+        - disjoint inputs overlap by zero
+        - identical inputs overlap by their own length
+        - nested intervals on one side are counted once, not once per level
+        - the result is symmetric in its arguments
+    """
+    left = _merged(first)
+    right = _merged(second)
+    total = 0
+    index = 0
+    for start, end in left:
+        # Advance past everything that ends before this interval opens; both lists are sorted,
+        # so the cursor never rewinds and the walk stays linear rather than quadratic.
+        while index < len(right) and right[index][1] <= start:
+            index += 1
+        probe = index
+        while probe < len(right) and right[probe][0] < end:
+            total += min(end, right[probe][1]) - max(start, right[probe][0])
+            probe += 1
+    return total
+
+
+def _merged(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Sort and coalesce overlapping intervals, dropping empty ones."""
+    ordered = sorted((start, end) for start, end in intervals if end > start)
+    merged: list[tuple[int, int]] = []
+    for start, end in ordered:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def concurrent_activity(
+    trace: AlignedTrace,
+    blocked: list[PlacedSpan],
+) -> dict[str, float]:
+    """Share of ``blocked``'s total time during which each *other* role had a phase open.
+
+    Turns "this worker waited 280 s" into "and the server was computing for 88% of it", which
+    is the difference between a hang and a queue — two problems with nothing in common that
+    look identical in a phase table.
+
+    Returns a share per role in ``0.0..100.0``, excluding the lanes the blocked spans are
+    themselves on: a lane cannot be concurrent with itself in any useful sense.
+
+    Test specifically:
+        - a worker blocked 100 ms while another is busy exactly 60 ms reports ≈60%
+        - a role on several lanes is counted once, not once per lane
+        - blocked spans with no concurrent activity report nothing
+    """
+    windows = _merged([(span.t0_ns, span.t1_ns) for span in blocked])
+    total = sum(end - start for start, end in windows)
+    if total <= 0:
+        return {}
+
+    own = {span.lane for span in blocked}
+    by_role: dict[str, list[tuple[int, int]]] = {}
+    for span in trace.spans:
+        if span.lane in own:
+            continue
+        by_role.setdefault(span.role or span.lane, []).append((span.t0_ns, span.t1_ns))
+
+    # Grouped by role rather than lane: "the inference server was busy" is the finding, and
+    # spelling it as four lane ids — each a worker#thread that means nothing to the reader —
+    # both buries it and understates it, since any one thread covers a fraction of what the
+    # role as a whole covered. Merging inside `overlap_ns` keeps the union honest.
+    return {
+        role: 100.0 * overlap_ns(windows, intervals) / total
+        for role, intervals in by_role.items()
+    }
+
+
+def role_occupancy(trace: AlignedTrace) -> dict[str, tuple[float, float]]:
+    """Mean ``(busy, working)`` share per role, over that role's lanes.
+
+    The pair is the bottleneck statement for a queue-driven worker: "busy 97%, working 35%"
+    says the process was inside a phase almost always and on a CPU rarely, which is a
+    different problem from either number alone. Averaged over lanes rather than summed, so
+    the figures stay comparable to the per-lane ones a reader sees on the timeline.
+
+    Lanes whose CPU time was never measured are excluded from the working mean rather than
+    counted as zero; a role with no measured lane reports ``-1.0`` for it, the convention this
+    module uses everywhere for "not measured".
+    """
+    busy_by_role: dict[str, list[float]] = {}
+    working_by_role: dict[str, list[float]] = {}
+    for lane in trace.lanes:
+        role = trace.roles.get(lane, "")
+        busy_by_role.setdefault(role, []).append(lane_busy_share(trace, lane))
+        working = lane_working_share(trace, lane)
+        if working >= 0:
+            working_by_role.setdefault(role, []).append(working)
+
+    occupancy: dict[str, tuple[float, float]] = {}
+    for role, busy_shares in busy_by_role.items():
+        working_shares = working_by_role.get(role, [])
+        occupancy[role] = (
+            sum(busy_shares) / len(busy_shares),
+            sum(working_shares) / len(working_shares) if working_shares else -1.0,
+        )
+    return occupancy
+
+
 def _is_leaf(span: PlacedSpan, siblings: list[PlacedSpan]) -> bool:
     """Whether no other span on the lane sits strictly inside ``span``.
 
@@ -541,10 +759,37 @@ def align_run(run: object) -> AlignedTrace:
             aligned.hosts.add(str(host))
 
     aligned.arrows, aligned.unmatched_waits = match_links(links_by_worker)
+    aligned.lifecycle_marks = _placed_lifecycle_marks(links_by_worker)
     aligned.spans.sort(key=lambda span: span.t0_ns)
     aligned.lanes = _ordered_lanes(aligned.spans)
     aligned.roles = {span.lane: span.role for span in aligned.spans}
     return aligned
+
+
+def _placed_lifecycle_marks(
+    links_by_worker: dict[str, tuple[list[Link], list[ClockAnchor]]],
+) -> list[Link]:
+    """Lifecycle checkpoints from every worker, moved onto the common epoch.
+
+    The alignment is what makes the decomposition possible at all: each checkpoint is stamped
+    by whichever process owns that transition, on its own ``perf_counter`` origin, so they are
+    only comparable once mapped through that worker's anchors.
+    """
+    placed: list[Link] = []
+    for links, anchors in links_by_worker.values():
+        for link in links:
+            if link.kind in {"signal", "wait"}:
+                continue
+            placed.append(
+                Link(
+                    channel=link.channel,
+                    key=link.key,
+                    kind=link.kind,
+                    t_ns=to_common_epoch(link.t_ns, anchors),
+                    thread_id=link.thread_id,
+                ),
+            )
+    return placed
 
 
 def _distinct_labels(workers: list[object]) -> dict[int, str]:

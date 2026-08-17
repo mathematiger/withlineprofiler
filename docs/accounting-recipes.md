@@ -86,6 +86,88 @@ sync shows up as wait, a spinning one burns CPU and shows up as none.
 Kernel-level attribution is still `backend="torch"`; this only fixes which phase the time
 lands on.
 
+#### When you cannot afford to synchronise
+
+Synchronising costs the pipelining, so the common case is a run left unsynchronised — and the
+common case is therefore a phase table whose numbers answer a different question than they
+appear to. Nothing in the output used to record which way `sync` was set, so two runs
+producing identical-looking tables could mean completely different things.
+
+Declare it instead:
+
+```python
+with profiler.phase("forward", async_work=True):
+    out = model.recurrent_inference(hidden, action)   # kernels still in flight at exit
+```
+
+The phase is measured exactly as before; what changes is that the report says so:
+
+```
+DOMINANT PHASES                     self    wait       p50       p99
+†forward                          1m 31s      1%     6.3ms    11.5ms
+
+  † = wall time excludes un-awaited device work (async_work=True). This is
+      submission time, not device compute. Re-run that phase with sync=True to
+      attribute the device time to it:
+      forward                 13,349 entries
+```
+
+`async_work` is ignored when `sync=True` — that phase *did* wait for its work — so flipping
+one to the other is how you turn a submission time into a device time, and the mark
+disappears when you do. It costs one bool test per phase, so it is safe on an inner loop, and
+it applies to anything that submits without awaiting: device queues, `io_uring`, non-blocking
+sockets, background executors.
+
+The corroborating evidence is the `GPU BY PHASE (sampled)` block, which buckets the 1 Hz
+device samples by the phase open when each was taken:
+
+```
+GPU BY PHASE (sampled)          p50    p95        VRAM   samples
+train_step/fwd                  81%    91%      3.2 GB        20
+forward                          8%     9%      1.1 GB        20
+```
+
+A phase holding most of a process's time at 8% device utilisation is the contradiction that
+says the wall time is submission time — previously a manual join between the phase table and
+the timeline's GPU series, which are on different timebases.
+
+#### Decomposing a queue wait
+
+`wait%` says a phase was blocked; it cannot say on *what*. A single `queue_wait` total fuses
+intervals whose remedies point in opposite directions — the request sitting unclaimed (batch
+harder), the server assembling a batch around it (shrink the window), the server computing it
+(cheaper model), the reply travelling back (fewer hops). `signal()`/`wait_on()` cannot split
+them either: the producer signals at *response* time, so an arrow spans only the last of the
+four.
+
+Mark the checkpoints instead, in whichever process owns each transition:
+
+```python
+# client, before the put
+profiling.trace_begin("inference", request_id)
+# server, on dequeue into a batch
+profiling.trace_mark("inference", request_id, "admitted")
+profiling.trace_mark("inference", request_id, "computed")
+# client, after the get
+profiling.trace_end("inference", request_id)
+```
+
+```
+REQUEST LIFECYCLE
+inference                        422.8ms  (6 req)
+    ├─ begin → admitted             301.0ms    71%    50.2ms/ea
+    ├─ admitted → computed          120.8ms    29%    20.1ms/ea
+    └─ computed → end               931.3us     0%   155.2us/ea
+```
+
+71% before admission is a batching problem, not a model problem. Marks reuse the link ring
+and its drop policy, so the cost is the same order as `signal()`. At high request rates pass
+`sample=0.01`: selection is by key hash rather than a counter, so every checkpoint of a given
+request is kept or dropped together — across processes, without any shared state.
+
+Incomplete lifecycles contribute nothing rather than a partial segment, and checkpoints that
+arrive out of order (cross-host clock skew) are dropped rather than counted as negative time.
+
 ### When a measurement is missing
 
 The layer distinguishes "measured zero" from "could not measure", because conflating them
@@ -115,6 +197,8 @@ Measured on Python 3.12 with `benchmarks/bench_accounting.py`, per phase enter+e
 | `phase(io=True)` | 44322 |
 | `phase(sample=0.01)`, skipped entry | 1156 |
 | `count()` | 384 |
+| `phase(async_work=True)` | 3911 — free next to `measure_cpu=True` |
+| `trace_mark()`, `trace=True` | 1277 |
 
 `sync=True` is absent from the table because its cost is not the profiler's: it is however
 long the GPU still had to run. Phases that do *not* set it are unaffected — the check is one
@@ -324,6 +408,30 @@ is for:
 ```
 lineprofiler trace profile/ -o trace.html
 ```
+
+The first question about any long wait is binary: **is this a hang, or is it queueing behind
+real work?** The two look identical in a phase table and have nothing in common as problems.
+The report answers it per role, from the trace:
+
+```
+  while actor waited, concurrently active: server 88%, learner 3%
+```
+
+Work happening elsewhere means queueing; silence everywhere means a stall, and the report
+says that outright instead of leaving a blank. On the timeline page, **select a range** and
+brush across a wait to get the same breakdown for that moment.
+
+Scriptable, without parsing the page:
+
+```python
+from lineprofiler.accounting import overlap_ns
+
+overlap_ns([(wait_start, wait_end)], [(busy_start, busy_end)])   # nanoseconds in both
+```
+
+Large runs render with `--max-spans N`, which keeps the longest spans and states how many it
+dropped rather than failing after the profiled run has already succeeded. Progress goes to
+stderr, so a slow render is distinguishable from a stuck one; `-q` silences it.
 
 ### What it costs to adopt
 

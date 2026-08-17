@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from lineprofiler.accounting import Profiler
+from lineprofiler.accounting.profiler import _lifecycle_admits
 from lineprofiler.accounting.snapshot import merge_run, new_run_id, read_trace
 from lineprofiler.accounting.trace import (
     FLAG_AUTO,
@@ -32,11 +33,14 @@ from lineprofiler.accounting.tracealign import (
     PlacedSpan,
     align_run,
     alignment_accuracy_note,
+    concurrent_activity,
     critical_path,
     lane_busy_share,
     lane_working_share,
+    lifecycle_segments,
     match_links,
     max_depth_of,
+    overlap_ns,
     place_spans,
     to_common_epoch,
 )
@@ -588,3 +592,175 @@ def test_one_threads_nesting_never_deepens_another() -> None:
     ])
 
     assert [span.depth for span in place_spans(trace, "w", "r")] == [0, 0]
+
+
+# ── overlap and concurrency ─────────────────────────────────────────────────
+
+
+def _role_span(role: str, t0: int, t1: int, cpu: int = -1) -> PlacedSpan:
+    """A span carrying a real role, which the shared ``_span`` helper does not."""
+    return PlacedSpan(
+        worker=role, role=role, thread_id=0, path=("p",),
+        t0_ns=t0, t1_ns=t1, cpu_ns=cpu, flags=0,
+    )
+
+
+def test_disjoint_intervals_do_not_overlap() -> None:
+    assert overlap_ns([(0, 100)], [(200, 300)]) == 0
+
+
+def test_identical_intervals_overlap_entirely() -> None:
+    assert overlap_ns([(0, 100)], [(0, 100)]) == 100
+
+
+def test_nested_intervals_are_counted_once() -> None:
+    """A phase inside a phase must not let one lane count the same nanosecond twice."""
+    assert overlap_ns([(0, 100), (10, 50), (20, 30)], [(0, 100)]) == 100
+
+
+def test_overlap_is_symmetric() -> None:
+    assert overlap_ns([(0, 100)], [(60, 200)]) == overlap_ns([(60, 200)], [(0, 100)])
+
+
+def test_a_blocked_worker_reports_the_share_another_was_busy() -> None:
+    """The acceptance test: A blocks 100 ms, B is busy exactly 60 of them.
+
+    This is the question behind every 96%-wait phase — a hang and a queue look identical in
+    the phase table and have nothing in common as problems.
+    """
+    blocked = _role_span("actor", 0, 100, cpu=0)
+    trace = AlignedTrace(spans=[blocked, _role_span("server", 20, 80)])
+
+    shares = concurrent_activity(trace, [blocked])
+
+    assert shares["server"] == pytest.approx(60.0)
+
+
+def test_a_role_spread_over_lanes_is_counted_once_not_once_per_lane() -> None:
+    """Two threads of one server covering the same window is 100% busy, not 200%."""
+    blocked = _role_span("actor", 0, 100, cpu=0)
+    first = PlacedSpan(
+        worker="server", role="server", thread_id=0, path=("a",),
+        t0_ns=0, t1_ns=100, cpu_ns=-1, flags=0,
+    )
+    second = PlacedSpan(
+        worker="server", role="server", thread_id=1, path=("b",),
+        t0_ns=0, t1_ns=100, cpu_ns=-1, flags=0,
+    )
+    trace = AlignedTrace(spans=[blocked, first, second])
+
+    assert concurrent_activity(trace, [blocked])["server"] == pytest.approx(100.0)
+
+
+def test_a_stall_reports_no_concurrent_activity() -> None:
+    """Nothing running anywhere is the other answer, and must be distinguishable."""
+    blocked = _role_span("actor", 0, 100, cpu=0)
+    trace = AlignedTrace(spans=[blocked])
+
+    assert concurrent_activity(trace, [blocked]) == {}
+
+
+# ── request lifecycles ──────────────────────────────────────────────────────
+
+
+def _mark(key: str, kind: str, at: int) -> Link:
+    return Link(channel="inference", key=key, kind=kind, t_ns=at, thread_id=0)
+
+
+def test_a_lifecycle_decomposes_into_named_segments() -> None:
+    """The acceptance test: a known 50 ms before admitting and 20 ms computing.
+
+    One ``queue_wait`` bar fuses intervals whose remedies point in opposite directions —
+    batch harder, shrink the window, cheaper model, fewer hops. This is what separates them.
+    """
+    trace = AlignedTrace(lifecycle_marks=[
+        _mark("7", "begin", 0),
+        _mark("7", "mark:admitted", 50_000_000),
+        _mark("7", "mark:computed", 70_000_000),
+        _mark("7", "end", 70_500_000),
+    ])
+
+    segments = {segment.name: segment for segment in lifecycle_segments(trace)["inference"]}
+
+    assert segments["begin → admitted"].total_ns == 50_000_000
+    assert segments["admitted → computed"].total_ns == 20_000_000
+    assert segments["computed → end"].total_ns == 500_000
+
+
+def test_segments_are_totalled_across_requests() -> None:
+    """One request's breakdown answers the question only by accident."""
+    marks = []
+    for index in range(3):
+        base = index * 1_000_000_000
+        marks.extend([
+            _mark(str(index), "begin", base),
+            _mark(str(index), "mark:admitted", base + 10_000_000),
+            _mark(str(index), "end", base + 15_000_000),
+        ])
+
+    channels = lifecycle_segments(AlignedTrace(lifecycle_marks=marks))
+    segments = {segment.name: segment for segment in channels["inference"]}
+
+    assert segments["begin → admitted"].total_ns == 30_000_000
+    assert segments["begin → admitted"].count == 3
+    assert segments["begin → admitted"].mean_ns == pytest.approx(10_000_000)
+
+
+def test_an_unfinished_lifecycle_contributes_nothing() -> None:
+    """Closing it at the last mark would turn an unfinished request into a fast one."""
+    trace = AlignedTrace(lifecycle_marks=[
+        _mark("7", "begin", 0),
+        _mark("7", "mark:admitted", 50_000_000),
+    ])
+
+    assert lifecycle_segments(trace) == {}
+
+
+def test_checkpoints_out_of_order_are_dropped_not_counted_as_negative() -> None:
+    """Cross-host skew is ordinary; a segment that cannot have happened is not."""
+    trace = AlignedTrace(lifecycle_marks=[
+        _mark("7", "mark:admitted", 0),
+        _mark("7", "begin", 50_000_000),
+        _mark("7", "end", 70_000_000),
+    ])
+
+    assert lifecycle_segments(trace) == {}
+
+
+def test_lifecycle_marks_do_not_become_arrows() -> None:
+    """The two mechanisms answer different questions and must not contaminate each other."""
+    links = [
+        _link("inference", "7", "begin", 0),
+        _link("inference", "7", "end", 10),
+        _link("inference", "7", "signal", 5),
+        _link("inference", "7", "wait", 8),
+    ]
+
+    arrows, unmatched = match_links({"w": (links, _ANCHORS)})
+
+    assert len(arrows) == 1
+    assert unmatched == []
+
+
+def test_a_sampled_lifecycle_keeps_or_drops_every_mark_of_one_request(tmp_path: Path) -> None:
+    """Selection is by key, not a counter: the marks are recorded in different processes.
+
+    A counter would admit a request's ``admitted`` mark on the server while dropping its
+    ``begin`` on the client, leaving segments no request ever experienced.
+    """
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None,
+        sample_interval_s=None, trace=True,
+    )
+    with profiler:
+        for index in range(200):
+            profiler.trace_mark("inference", index, "admitted", sample=0.1)
+        profiler.snapshot()
+
+    recorded = merge_run(tmp_path, with_trace=True).workers[0].trace.links
+    kept = {link.key for link in recorded}
+
+    assert 5 < len(kept) < 60, f"expected roughly a tenth of 200, kept {len(kept)}"
+    # Every mark of a kept key survives, which is what a second pass must reproduce.
+    for key in list(kept)[:5]:
+        assert _lifecycle_admits(int(key), 0.1)

@@ -2,7 +2,7 @@
 
     lineprofiler report <run_dir> [--no-samples] [--format text|json|html] [-o PATH]
     lineprofiler compare <run_a> <run_b> [--format text|json] [-o PATH]
-    lineprofiler trace <run_dir> [--format html|json] [-o PATH]
+    lineprofiler trace <run_dir> [--max-spans N] [--quiet] [--format html|json] [-o PATH]
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from lineprofiler.accounting.compare import comparison_as_dict, render_comparison
@@ -70,6 +71,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="draw the recorded timeline: which worker waited, when, and for whom",
     )
     trace.add_argument("run_dir", help="directory passed to Profiler(run_dir=...)")
+    trace.add_argument(
+        "--max-spans",
+        type=int,
+        default=None,
+        help=(
+            "draw at most this many spans, keeping the longest. A large run degrades to a "
+            "readable picture instead of failing to render at all; the number dropped is "
+            "stated on the page"
+        ),
+    )
+    trace.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        help="suppress the progress lines written to stderr",
+    )
     # html first: a timeline is a picture, and the text form of one is a wall of numbers.
     _add_output_arguments(trace, formats=("html", "json"), default="html")
     return parser
@@ -112,7 +129,11 @@ def _add_output_arguments(
 
 
 def _render_report(args: argparse.Namespace) -> str:
-    run = merge_run(args.run_dir, with_samples=not args.no_samples)
+    # Traces are read when they exist: the report's occupancy, concurrency and request
+    # lifecycle blocks all derive from them, and defaulting them away meant a run recorded
+    # with trace=True rendered without the three blocks it was instrumented for. Costs
+    # nothing on the common run, which has no sidecars to read.
+    run = merge_run(args.run_dir, with_samples=not args.no_samples, with_trace=True)
     if args.format == "json":
         return json.dumps(report_as_dict(run), indent=2)
     if args.format == "html":
@@ -123,12 +144,21 @@ def _render_report(args: argparse.Namespace) -> str:
 
 
 def _render_trace(args: argparse.Namespace) -> str:
-    """Render the timeline. Samples are read too, so the GPU lanes have something to draw."""
+    """Render the timeline. Samples are read too, so the GPU lanes have something to draw.
+
+    Progress goes to stderr because rendering a large run takes minutes, and silence for
+    minutes is indistinguishable from a hang — the same ambiguity the timeline itself exists
+    to resolve, one level up. Two verification runs were lost to a render that was working.
+    """
+    progress = _progress_reporter(quiet=getattr(args, "quiet", False))
+    progress(f"loading workers from {args.run_dir}")
     run = merge_run(args.run_dir, with_samples=True, with_trace=True)
+    progress(f"loaded {len(run.workers)} workers")
     if args.format == "json":
         from lineprofiler.accounting.tracealign import align_run
 
         aligned = align_run(run)
+        progress(f"aligned {len(aligned.spans):,} spans")
         return json.dumps(
             {
                 "duration_ns": aligned.duration_ns,
@@ -151,7 +181,22 @@ def _render_trace(args: argparse.Namespace) -> str:
         )
     from lineprofiler.accounting.htmltrace import render_trace_html
 
-    return render_trace_html(run)
+    return render_trace_html(run, max_spans=args.max_spans, progress=progress)
+
+
+def _progress_reporter(quiet: bool) -> Callable[[str], None]:
+    """Return a stderr progress callback, or one that says nothing.
+
+    stderr rather than stdout: the rendered page routinely goes to stdout for redirection,
+    and progress lines mixed into an HTML file would corrupt it.
+    """
+    if quiet:
+        return lambda message: None
+
+    def report(message: str) -> None:
+        print(f"lineprofiler: {message}", file=sys.stderr)  # noqa: T201
+
+    return report
 
 
 def _render_compare(args: argparse.Namespace) -> str:

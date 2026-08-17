@@ -303,3 +303,30 @@ def test_tracing_costs_nothing_when_it_is_off(run_dir: Path) -> None:
         assert _per_call_ns(action) < BUDGET_NS["with_cpu"]
     finally:
         untraced.close()
+
+
+def test_declaring_async_work_costs_about_what_a_plain_phase_costs(run_dir: Path) -> None:
+    """One bool store on entry and one bool test on exit, and nothing else.
+
+    A ratio rather than an absolute, for the same reason as the tracing test above: the plain
+    phase is already bounded, and what matters is that the declaration did not turn the hot
+    path into something that has to think. If this fails, the flag stopped being free for the
+    runs that use it — and it is meant to be usable on the phase in the inner loop.
+    """
+    profiler = Profiler(
+        run_dir=run_dir / "async", enabled=True, snapshot_interval_s=None,
+        sample_interval_s=None,
+    )
+
+    def plain() -> None:
+        with profiler.phase("p"):
+            pass
+
+    def declared() -> None:
+        with profiler.phase("q", async_work=True):
+            pass
+
+    try:
+        assert _per_call_ns(declared) < _per_call_ns(plain) * 1.5
+    finally:
+        profiler.close()

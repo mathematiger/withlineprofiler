@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import hashlib
 import os
 import re
 import signal
@@ -57,6 +58,7 @@ from lineprofiler.accounting.selfio import reset as selfio_reset
 from lineprofiler.accounting.snapshot import SnapshotWriter, new_run_id
 from lineprofiler.accounting.trace import (
     DEFAULT_CAPACITY,
+    FLAG_ASYNC_UNSYNCED,
     FLAG_SAMPLED,
     UNMEASURED,
     ClockAnchor,
@@ -300,6 +302,7 @@ class Profiler:
         trace: bool | str | None = None,
         trace_capacity: int = DEFAULT_CAPACITY,
         trace_functions: list[str] | None = None,
+        source: dict[str, object] | None = None,
     ) -> None:
         self.enabled: bool = _resolve_enabled(enabled)
         self.measure_cpu: bool = measure_cpu
@@ -309,6 +312,9 @@ class Profiler:
         self.run_id: str = run_id or os.environ.get(ENV_RUN_ID, "") or new_run_id()
         self.role: str = role or os.environ.get(ENV_ROLE, "") or "main"
         self.backend: Backend = Backend.parse(backend)
+        # Held so a forked child re-uses what the parent established rather than shelling out
+        # to git again — the source cannot have changed across a fork.
+        self._source: dict[str, object] | None = source
 
         if install:
             install_profiler(self)
@@ -363,7 +369,9 @@ class Profiler:
         self._env_keys_propagated = _propagate_to_children(
             self.run_dir, self.run_id, self._trace_mode,
         )
-        self._writer = SnapshotWriter(self.run_dir, role=self.role, run_id=self.run_id)
+        self._writer = SnapshotWriter(
+            self.run_dir, role=self.role, run_id=self.run_id, source=self._source,
+        )
         self._start_tracing()
         self._start_backend_window(backend_window, window_phase)
         self._start_sampler(sample_interval_s)
@@ -385,6 +393,7 @@ class Profiler:
         io: bool = False,
         sync: bool = False,
         sample: float = 1.0,
+        async_work: bool = False,
     ) -> _PhaseScope | _NullScope | _SuppressedScope:
         """Open a named region, nested under the phase currently open on this thread.
 
@@ -403,6 +412,22 @@ class Profiler:
                 actively measuring, not on every phase in the loop, and take timings from a
                 run where it is off once you know where the work is. A no-op when torch is
                 absent or no CUDA device is visible.
+            async_work: Declare that this phase submits work it does not wait for — CUDA
+                kernels, a device queue, ``io_uring``, a background executor. The phase is
+                still measured exactly as it would be otherwise; what changes is that the
+                report *says so*, marking the row and naming the reason.
+
+                This exists because the unmarked case is indistinguishable from the marked
+                one. A phase around an unsynchronised forward pass reports the time to
+                *enqueue* the kernels, which reads as though it were the cost of running
+                them — and the two differ by more than an order of magnitude. Two runs
+                producing identical-looking tables can mean completely different things, and
+                without the declaration the reader has no way to tell which.
+
+                Ignored when ``sync=True``: that phase did wait for its work, so its wall
+                time means what it appears to mean and marking it would be wrong. Flipping
+                ``async_work=True`` to ``sync=True`` is the intended way to turn a submission
+                time into a device time, and the marker disappears when you do.
             sample: Measure one entry in ``round(1/sample)`` and scale the result, for a
                 region worth splitting but too hot to afford at full rate. ``1.0`` (the
                 default) measures every entry.
@@ -447,12 +472,15 @@ class Profiler:
             - ``sync=True`` synchronises once on entry and once on exit, and the exit
               synchronisation happens before the clock is read
             - ``sync=True`` without a CUDA device records the phase like any other
+            - ``async_work=True`` marks the node and the span; the same phase with
+              ``sync=True`` marks neither
+            - a phase entered both ways counts only the unsynchronised entries
         """
         if not self.enabled:
             return _NULL_SCOPE
         if sample != 1.0:
-            return self._sampled_phase(name, io, sync, sample)
-        return _PhaseScope(self, name, io, sync)
+            return self._sampled_phase(name, io, sync, sample, async_work)
+        return _PhaseScope(self, name, io, sync, 1, async_work)
 
     def _sampled_phase(
         self,
@@ -460,6 +488,7 @@ class Profiler:
         io: bool,
         sync: bool,
         sample: float,
+        async_work: bool = False,
     ) -> _PhaseScope | _NullScope | _SuppressedScope:
         """Decide a sampled entry *before* allocating a scope for it.
 
@@ -482,7 +511,7 @@ class Profiler:
         if seen % stride:
             state.suppressed = True
             return state.suppressor
-        return _PhaseScope(self, name, io, sync, stride)
+        return _PhaseScope(self, name, io, sync, stride, async_work)
 
     def io_counters(self) -> IoSnapshot:
         """Return this process's cumulative byte counters at the disk and syscall layers.
@@ -861,7 +890,9 @@ class Profiler:
         selfio_reset()
         _live_profilers.clear()
         _live_profilers.append(str(self.run_dir))
-        self._writer = SnapshotWriter(self.run_dir, role=self.role, run_id=self.run_id)
+        self._writer = SnapshotWriter(
+            self.run_dir, role=self.role, run_id=self.run_id, source=self._source,
+        )
         self._sampler = None
         self._flush_timer = None
         # The child inherited a buffer describing work the parent did, and an interning table
@@ -974,6 +1005,49 @@ class Profiler:
         buffer = self._trace
         if buffer is not None:
             buffer.record_link(channel, str(key), "wait", self._trace_thread_id())
+
+    def trace_begin(self, channel: str, key: object) -> None:
+        """Mark the moment a request identified by ``key`` was submitted on ``channel``.
+
+        Opens a *request lifecycle*: several named checkpoints for one key, stamped in the
+        processes that own them, decomposed offline into named segments.
+
+        This exists because :meth:`signal`/:meth:`wait_on` structurally cannot answer the
+        question a queue wait actually poses. A single ``queue_wait`` bar fuses four intervals
+        with **opposite** remedies — the request sitting unclaimed (batch harder), the server
+        assembling a batch around it (shrink the window), the server computing it (cheaper
+        model), and the reply travelling back (fewer hops). A two-point link spans only the
+        last of those, because the producer signals at *response* time: in the run this was
+        built from, every arrow together covered 3.6% of the measured wait.
+        """
+        self._record_lifecycle(channel, key, "begin")
+
+    def trace_mark(self, channel: str, key: object, name: str, sample: float = 1.0) -> None:
+        """Mark a named checkpoint for ``key``, wherever in the pipeline it is reached.
+
+        Call it in the process that owns the transition — the server marks ``admitted`` when
+        it dequeues into a batch, ``compute_start`` when the batch begins. Timestamps taken in
+        the owning process are what make the decomposition attributable rather than inferred.
+
+        ``sample`` keeps the *shape* of the breakdown without paying for every request: at
+        thirteen thousand requests in three minutes, one in a hundred still resolves the
+        segments. Selection is by key hash, not a counter, so every mark of a given request is
+        kept or dropped together — a lifecycle missing its middle checkpoints would decompose
+        into segments that never happened.
+        """
+        if sample < 1.0 and not _lifecycle_admits(key, sample):
+            return
+        self._record_lifecycle(channel, key, f"mark:{name}")
+
+    def trace_end(self, channel: str, key: object) -> None:
+        """Mark the moment the response for ``key`` was received. Closes the lifecycle."""
+        self._record_lifecycle(channel, key, "end")
+
+    def _record_lifecycle(self, channel: str, key: object, kind: str) -> None:
+        """Record one lifecycle checkpoint, reusing the link ring and its drop policy."""
+        buffer = self._trace
+        if buffer is not None:
+            buffer.record_link(channel, str(key), kind, self._trace_thread_id())
 
     def _start_backend_window(self, window: tuple[int, int] | None, phase_name: str) -> None:
         """Arm the heavy-profiler window, if one was configured."""
@@ -1150,9 +1224,9 @@ class _PhaseScope:
     """Context manager for one phase entry. Allocated per call, so it nests safely."""
 
     __slots__ = (
-        "_cpu0", "_cpu_span", "_function", "_io", "_io0", "_name", "_profiler", "_self_io0",
-        "_skipped", "_state", "_stats", "_stride", "_sync", "_trace_path", "_trace_tid",
-        "_wall0", "_wall1",
+        "_async_work", "_cpu0", "_cpu_span", "_function", "_io", "_io0", "_name", "_profiler",
+        "_self_io0", "_skipped", "_state", "_stats", "_stride", "_sync", "_trace_path",
+        "_trace_tid", "_wall0", "_wall1",
     )
 
     def __init__(
@@ -1162,6 +1236,7 @@ class _PhaseScope:
         io: bool = False,
         sync: bool = False,
         stride: int = 1,
+        async_work: bool = False,
     ) -> None:
         self._profiler = profiler
         self._name = name
@@ -1171,6 +1246,13 @@ class _PhaseScope:
         # Resolved here rather than read at both ends: a phase that does not synchronise
         # then costs one `is not None` test instead of two attribute loads and a branch.
         self._sync = profiler._cuda_sync if sync else None
+        # `sync` wins: a phase that drains the queue at both ends *did* wait for its work, so
+        # its wall time already means what it appears to mean and marking it would be the
+        # wrong claim. Resolved here, not at exit, so the hot path reads one settled bool.
+        # Note this tests `sync`, not `self._sync` — a caller who asked to synchronise on a
+        # box with no CUDA device is not submitting device work either, and marking them
+        # would fire the warning on every CPU-only run of GPU-capable code.
+        self._async_work = async_work and not sync
         self._state: _ThreadState | None = None
         self._stats: PhaseStats | None = None
         self._wall0 = 0
@@ -1303,6 +1385,11 @@ class _PhaseScope:
             # Marks every derived figure on this node as an estimate. Set on exit rather than
             # at admission so a node only claims to be sampled once it actually is.
             stats.sample_stride = scale
+        if self._async_work:
+            # Counted, not flagged: a phase entered both with and without the declaration is
+            # partly submission time and partly real, and the ratio against `calls` is what
+            # says how much. One bool test on every other phase, which is the whole cost.
+            stats.async_entries += scale
 
         if self._io:
             self._record_io(stats, scale)
@@ -1334,13 +1421,16 @@ class _PhaseScope:
         phase_id = buffer.path_ids.get(path)
         if phase_id is None:
             phase_id = buffer.intern(path)
+        flags = FLAG_SAMPLED if scale != 1 else 0
+        if self._async_work:
+            flags |= FLAG_ASYNC_UNSYNCED
         buffer.record(
             phase_id=phase_id,
             thread_id=self._trace_tid,
             t0_ns=self._wall0,
             t1_ns=self._wall1,
             cpu_ns=self._cpu_span if self._profiler.measure_cpu else UNMEASURED,
-            flags=FLAG_SAMPLED if scale != 1 else 0,
+            flags=flags,
         )
 
     def _record_io(self, stats: PhaseStats, scale: int = 1) -> None:
@@ -1493,6 +1583,7 @@ def phase(
     io: bool = False,
     sync: bool = False,
     sample: float = 1.0,
+    async_work: bool = False,
 ) -> _PhaseScope | _NullScope | _SuppressedScope:
     """Open a phase on the installed profiler, or do nothing when there is none.
 
@@ -1509,7 +1600,7 @@ def phase(
     profiler = _installed
     if profiler is None:
         return _NULL_SCOPE
-    return profiler.phase(name, io, sync, sample)
+    return profiler.phase(name, io, sync, sample, async_work)
 
 
 def count(name: str, n: int = 1) -> None:
@@ -1542,6 +1633,27 @@ def wait_on(channel: str, key: object) -> None:
         profiler.wait_on(channel, key)
 
 
+def trace_begin(channel: str, key: object) -> None:
+    """Open a request lifecycle on the installed profiler. See :meth:`Profiler.trace_begin`."""
+    profiler = _installed
+    if profiler is not None:
+        profiler.trace_begin(channel, key)
+
+
+def trace_mark(channel: str, key: object, name: str, sample: float = 1.0) -> None:
+    """Record a lifecycle checkpoint. See :meth:`Profiler.trace_mark`."""
+    profiler = _installed
+    if profiler is not None:
+        profiler.trace_mark(channel, key, name, sample)
+
+
+def trace_end(channel: str, key: object) -> None:
+    """Close a request lifecycle. See :meth:`Profiler.trace_end`."""
+    profiler = _installed
+    if profiler is not None:
+        profiler.trace_end(channel, key)
+
+
 def current() -> str:
     """Return the deepest phase open on the installed profiler, or ``""`` when there is none.
 
@@ -1549,6 +1661,21 @@ def current() -> str:
     """
     profiler = _installed
     return profiler.current_phase() if profiler is not None else ""
+
+
+def _lifecycle_admits(key: object, sample: float) -> bool:
+    """Whether ``key``'s lifecycle is one of the sampled ones.
+
+    Decided from a hash of the key rather than a counter, so every checkpoint of a given
+    request agrees without any shared state — which matters because the checkpoints are
+    recorded in *different processes*. A counter would admit a request's ``admitted`` mark on
+    the server and drop its ``begin`` on the client, leaving a lifecycle that decomposes into
+    segments no request ever experienced.
+    """
+    if sample <= 0.0:
+        return False
+    digest = hashlib.blake2b(str(key).encode("utf-8", "replace"), digest_size=8).digest()
+    return int.from_bytes(digest, "big") % 10_000 < sample * 10_000
 
 
 def _stride_of(sample: float) -> int:

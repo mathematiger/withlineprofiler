@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import time
 from array import array
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -43,6 +44,14 @@ FLAG_AUTO = 1
 
 FLAG_SAMPLED = 2
 """The span's phase is entered under ``sample=``, so it represents one entry in ``n``."""
+
+FLAG_ASYNC_UNSYNCED = 4
+"""The phase declared ``async_work=True``: work it submitted was still in flight at exit.
+
+The span's wall time is therefore submission time, not the cost of the work — and the work
+itself lands on whichever later span happens to synchronise. Recorded so a renderer can say
+so, because a wall time that looks like a measurement but answers a different question is the
+failure this layer exists to avoid."""
 
 DEFAULT_CAPACITY = 200_000
 """Spans retained per worker. At 48 bytes a span this is ~10 MB, which is affordable next to
@@ -195,7 +204,7 @@ class TraceBuffer:
         self.path_ids: dict[PhasePath, int] = {}
         self._paths: list[PhasePath] = []
         self._link_capacity = max(16, capacity // _LINK_CAPACITY_DIVISOR)
-        self._links: list[Link] = []
+        self._links: deque[Link] = deque(maxlen=self._link_capacity)
         self.dropped_links = 0
 
     def intern(self, path: PhasePath) -> int:
@@ -252,8 +261,11 @@ class TraceBuffer:
         Links are far rarer than spans, so this holds objects rather than parallel arrays;
         the clarity is worth more than the allocation at this frequency.
         """
+        # A deque with maxlen, not a list: the old `pop(0)` shifted every surviving link on
+        # each overflow, which was tolerable while links were a handful per iteration and is
+        # not now that a request lifecycle records several marks per request. Eviction is O(1)
+        # and keeps the newest, exactly as the span ring does.
         if len(self._links) >= self._link_capacity:
-            self._links.pop(0)
             self.dropped_links += 1
         self._links.append(
             Link(
@@ -287,8 +299,10 @@ class TraceBuffer:
             )
             for index in self._live_indices()
         ]
-        links = self._links
-        self._links = []
+        # list(), and a fresh deque rather than clear(): callers serialise the result and
+        # must not hold a view onto the buffer that keeps filling behind them.
+        links = list(self._links)
+        self._links = deque(maxlen=self._link_capacity)
         self.write = 0
         self.wrapped = False
         return spans, links
@@ -320,7 +334,7 @@ class TraceBuffer:
         self.dropped_links = 0
         self.path_ids = {}
         self._paths = []
-        self._links = []
+        self._links = deque(maxlen=self._link_capacity)
         self.dropped_links = 0
 
 

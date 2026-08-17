@@ -28,6 +28,9 @@ from lineprofiler.accounting.profiler import (
     signal_ready,
     start,
     stop,
+    trace_begin,
+    trace_end,
+    trace_mark,
     uninstall_profiler,
     wait_on,
 )
@@ -35,6 +38,7 @@ from lineprofiler.accounting.report import render, report_as_dict
 from lineprofiler.accounting.sampler import ResourceSampler, Sample
 from lineprofiler.accounting.snapshot import MergedRun, WorkerSnapshot, merge_run
 from lineprofiler.accounting.trace import Span, TraceBuffer, WorkerTrace
+from lineprofiler.accounting.tracealign import lifecycle_segments, overlap_ns
 
 __all__ = [
     "Backend",
@@ -58,7 +62,9 @@ __all__ = [
     "install_profiler",
     "installed_profiler",
     "merge_run",
+    "lifecycle_segments",
     "merge_trees",
+    "overlap_ns",
     "phase",
     "render",
     "render_comparison",
@@ -66,6 +72,9 @@ __all__ = [
     "signal_ready",
     "start",
     "stop",
+    "trace_begin",
+    "trace_end",
+    "trace_mark",
     "uninstall_profiler",
     "wait_on",
 ]

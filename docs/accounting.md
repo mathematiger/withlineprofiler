@@ -111,8 +111,11 @@ which is why this is not a reason to keep passing the object around.
 
 | Function | Equivalent |
 |---|---|
-| `accounting.phase(name, io=…, sync=…)` | `profiler.phase(...)` |
+| `accounting.phase(name, io=…, sync=…, async_work=…)` | `profiler.phase(...)` |
 | `accounting.count(name, n)` | `profiler.count(...)` |
+| `accounting.trace_begin(channel, key)` | `profiler.trace_begin(...)` |
+| `accounting.trace_mark(channel, key, name, sample=…)` | `profiler.trace_mark(...)` |
+| `accounting.trace_end(channel, key)` | `profiler.trace_end(...)` |
 | `accounting.current()` | the deepest open phase, or `""` — useful on a log line |
 | `accounting.installed_profiler()` | the installed instance, or `None` |
 

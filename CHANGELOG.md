@@ -4,6 +4,157 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0]
+
+Eight gaps found by a real investigation — "MuZero actors spend 96% of self-play blocked, on
+what?" — where this layer held the data but not the affordance, and twice where it produced a
+confidently wrong reading. The through-line is the failure the `sample_stride` docstring names:
+*an estimate that cannot be told apart from a measurement*. Most of what follows is that same
+failure one level up — a measurement that is correct but unlabelled, so the reader cannot tell
+which question it answers.
+
+### Added — a phase can say its device work was never awaited
+
+`phase(name, async_work=True)` declares that a phase submits work it does not wait for: CUDA
+kernels, a device queue, `io_uring`, a background executor. The phase is measured exactly as
+before; what changes is that the report marks the row `†` and names the remedy.
+
+The reading this prevents is expensive. CUDA launches are asynchronous, so a phase around an
+unsynchronised forward pass reports the time to *enqueue* — which looks exactly like the cost
+of running, and differs by orders of magnitude. In the run this came from, `forward` held 1m 31s
+at a plausible 6.3 ms p50 while the GPU sat at 7% utilisation. Every number was right; the
+implication was not.
+
+`sync=True` wins over `async_work=True` — that phase did wait for its work — so flipping one to
+the other turns a submission time into a device time and the mark disappears. Costs one bool
+test per phase, so it belongs on the phase in the inner loop. Deliberately **not** inferred from
+`sync=False`: that is the default, so inferring it would mark every phase of every run,
+including every phase of a CPU-only one, and the mark would distinguish nothing.
+
+### Added — `GPU BY PHASE`, and the GPU block no longer goes silent
+
+Device samples are bucketed by the phase open when each was taken, with utilisation quantiles
+and per-phase VRAM peaks. `Sample` already carried the phase; the join simply had nowhere to
+land, so "what was the GPU doing *during* `forward`?" meant intersecting the phase table with
+the timeline's `gpu.points` series by hand, on two different timebases. That join is what
+refutes the paragraph above, which makes it load-bearing rather than cosmetic.
+
+The text and HTML reports gated their GPU blocks differently, so a run with CUDA memory but no
+NVML showed a block in one and nothing in the other. Both now share `SampleAnalysis.has_gpu`,
+and a run with samples but no GPU data says so in one line instead of rendering nothing —
+silence reads as "no GPU involved", which is precisely how an idle device stays invisible.
+
+### Added — request lifecycles: `trace_begin` / `trace_mark` / `trace_end`
+
+One key, several named checkpoints, stamped in the processes that own them, decomposed offline
+into named segments:
+
+```
+REQUEST LIFECYCLE
+inference                        422.8ms  (6 req)
+    ├─ begin → admitted             301.0ms    71%    50.2ms/ea
+    ├─ admitted → computed          120.8ms    29%    20.1ms/ea
+    └─ computed → end               931.3us     0%   155.2us/ea
+```
+
+`signal()`/`wait_on()` could not do this and never could: the producer signals at *response*
+time, so an arrow spans only the last of the four intervals a queue wait actually contains.
+Measured on the run this came from, every arrow together covered **3.6%** of the wait. The four
+intervals have opposite remedies — batch harder, shrink the batching window, cheaper model,
+fewer hops — so the fused total is correct and unactionable.
+
+Marks reuse the link ring, its drop policy and its clock alignment. `sample=` selects by key
+hash rather than a counter, so every checkpoint of one request is kept or dropped together
+across processes without shared state; a counter would keep a request's `admitted` mark on the
+server while dropping its `begin` on the client, yielding segments no request experienced.
+Incomplete lifecycles contribute nothing, and checkpoints that arrive out of order — ordinary
+cross-host skew — are dropped rather than counted as negative time.
+
+### Added — source provenance in the run metadata and every report header
+
+```
+Source c49ce841 (+dirty: 26 files, diff sha 3f9a1c)
+```
+
+A trace recorded the environment thoroughly and said nothing about the code. That silently
+invalidates analysis: the investigation this came from drew a conclusion from a profile of the
+*committed* code while the working tree had already fixed the constraint the profile found — a
+claim about a program that no longer existed.
+
+One `git` call at startup, on the one rank that writes the metadata, after the dedupe. Empty on
+any failure: not a repository, no `git`, a timeout. Provenance is a courtesy the report prints
+when it can, never a reason a run fails or stalls. `Profiler(source={...})` overrides it, which
+is also where a config hash belongs.
+
+### Added — counter spread, so a cap is distinguishable from a burst
+
+`counters` was a running sum, which yields a mean and nothing else. For a batching server the
+mean is the least interesting statistic: "1.9 rows per forward against a cap of 2" is equally
+consistent with *always exactly 2* (the cap binds — raise it) and *usually 1, occasionally 8*
+(the supply is not there — batch harder). `counter_min`/`counter_max` render as `always 2` or
+`1..9`, and the two readings stop looking alike.
+
+The cheap half of the proposal deliberately: per-instance histograms would add 512 buckets per
+counter per phase against the existing `MAX_PHASES` budget, and `min == max` is the whole
+finding.
+
+### Added — "is this a hang, or is it queueing?"
+
+`overlap_ns(a, b)` intersects two interval lists — the primitive that question needs, and the
+one that had to be reimplemented by hand against JSON extracted from an 11.7 MB page. Exported
+publicly. `concurrent_activity` builds on it, and the report answers per role:
+
+```
+  while actor waited, concurrently active: server 88%, learner 3%
+```
+
+Work elsewhere means queueing; silence everywhere means a stall, and the report says which.
+The timeline page gains a **select a range** mode: brush a wait and every other lane's busy
+share for that window is summarised beneath the chart.
+
+### Added — `busy` / `working` in the text report, and named denominators
+
+`busy 97% / working 35%` *is* the bottleneck statement for an actor, and it was HTML-only.
+Both terms are now defined in the report where they appear.
+
+The role block stated percentages without stating what they were *of*. Four denominators were
+plausible and they read materially differently, so the base is named outright, and columns that
+sum across processes are marked `(Σ2 proc)` — a total exceeding the run's own runtime is correct
+for a multi-process role and reads as an error until the summing is stated.
+
+### Changed — the trace render degrades instead of failing
+
+A 26-process render hit a 900 s timeout and produced nothing, *after* the profiled run had
+succeeded: the expensive half of the work discarded to save the cheap half. `lineprofiler trace`
+now takes `--max-spans N`, prints coarse progress to stderr (`-q` silences it), and estimates
+up front when a run exceeds the cap.
+
+The span cap already existed and already counted what it dropped — but the count reached
+neither the page nor the JS, despite a docstring promising "never hidden". It now appears in the
+caveats. The timeline's `duration_us` is relabelled **traced span**, with a note: first span to
+last is legitimately shorter than the run's wall clock, and the unexplained difference cost a
+reader time.
+
+### Fixed — link overflow was O(n) from the front
+
+`record_link` evicted with `list.pop(0)`, shifting every surviving link. Tolerable at a handful
+of links per iteration, not at several lifecycle marks per request. Now a `deque` with `maxlen`:
+O(1), keeping the newest, exactly as the span ring does.
+
+### Fixed — sampled memory with no phase open was billed to `(root)`
+
+The byte path called this `(no phase open)` and explained why: it is an admission that the
+sample rate was too coarse, not a finding about the root. The memory path used `(root)` and
+therefore read as the latter. Both now agree.
+
+### Notes
+
+`PhaseStats` gains `async_entries`, `counter_min` and `counter_max`; `SampleAnalysis` gains
+`gpu_by_phase`. All read through defaults, so a 0.6.0 worker file still parses — a file written
+before these existed declared nothing async and recorded no extremes, which is what the defaults
+say. The hot path is unchanged: `phase(async_work=True)` measures 4227 ns/call against 4224 for
+a plain `measure_cpu=True` phase, and `test_overhead.py` bounds it as a ratio.
+
 ## [0.6.0]
 
 The report could say *how much* time a phase spent waiting, but never *when*, or *for whom*.

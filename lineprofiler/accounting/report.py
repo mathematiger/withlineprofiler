@@ -18,7 +18,16 @@ from lineprofiler.accounting.analysis import (
     sparkline,
 )
 from lineprofiler.accounting.phasetree import PhasePath, PhaseStats, PhaseTree
+from lineprofiler.accounting.provenance import source_of
 from lineprofiler.accounting.snapshot import MergedRun, WorkerSnapshot, imbalance_of
+from lineprofiler.accounting.tracealign import (
+    AlignedTrace,
+    PlacedSpan,
+    align_run,
+    concurrent_activity,
+    lifecycle_segments,
+    role_occupancy,
+)
 
 _WIDTH = 62
 _RULE = "─" * _WIDTH
@@ -42,9 +51,12 @@ def render(run: MergedRun) -> str:
         - a run with two roles renders a separate block for each
     """
     analysis = analyse_processes(run.samples_by_process())
+    aligned = _aligned_or_none(run)
+    occupancy = role_occupancy(aligned) if aligned is not None else {}
     blocks = [_header(run)]
     for role in run.roles:
-        blocks.append(_role_block(run, role))
+        blocks.append(_role_block(run, role, occupancy.get(role), aligned))
+    blocks.append(_lifecycle_block(aligned))
     blocks.append(_exact_io_block(run.tree))
     blocks.append(_io_block(analysis))
     blocks.append(_gpu_block(analysis))
@@ -73,6 +85,7 @@ def report_as_dict(run: MergedRun) -> dict[str, Any]:
     document: dict[str, Any] = {
         "run": {
             "run_id": run.metadata.get("run_id"),
+            "source": run.metadata.get("source", {}),
             "hosts": run.hosts,
             "processes": len(run.workers),
             "roles": run.roles,
@@ -205,14 +218,21 @@ def _header(run: MergedRun) -> str:
     """Runtime, process and worker counts, the nodes involved, and the run's identity."""
     runtime = max((w.written_at - w.started_at for w in run.workers), default=0.0)
     roles = ", ".join(f"{role} x{len(run.workers_of(role))}" for role in run.roles) or "none"
-    return (
+    lines = [
         f"Runtime {format_ns(runtime * 1e9)}   "
         # One worker file is one process. Counting distinct pids undercounted every
         # multi-node run: pid namespaces are per-node, so ranks on different nodes collide.
         f"Processes {len(run.workers)}   "
-        f"Roles {roles}\n"
-        f"{_hosts_line(run)}"
-    )
+        f"Roles {roles}",
+        _hosts_line(run),
+    ]
+    # Omitted rather than guessed at when absent: a run from a directory that is not a
+    # repository, or one written before this was recorded, must not be given a revision it
+    # never claimed.
+    source = source_of(run.metadata)
+    if source:
+        lines.append(source)
+    return "\n".join(lines)
 
 
 def _hosts_line(run: MergedRun) -> str:
@@ -228,7 +248,29 @@ def _hosts_line(run: MergedRun) -> str:
     return f"Host {single}{suffix}"
 
 
-def _role_block(run: MergedRun, role: str) -> str:
+def _aligned_or_none(run: MergedRun) -> AlignedTrace | None:
+    """The aligned trace, or ``None`` when the run recorded none.
+
+    Tracing is off by default, so most reports will not have one. Absent is absent — a figure
+    derived from a timeline must not be shown for a run that has no timeline.
+    """
+    # Links as well as spans: a worker may record only lifecycle checkpoints — instrumenting
+    # a queue boundary does not require naming a phase around it — and gating on spans alone
+    # dropped the whole request breakdown for exactly that caller.
+    if not any(
+        getattr(worker, "trace", None) and (worker.trace.spans or worker.trace.links)
+        for worker in run.workers
+    ):
+        return None
+    return align_run(run)
+
+
+def _role_block(
+    run: MergedRun,
+    role: str,
+    occupancy: tuple[float, float] | None = None,
+    aligned: AlignedTrace | None = None,
+) -> str:
     """Render one role's phase share and its heaviest phases."""
     tree = run.tree_of(role)
     workers = run.workers_of(role)
@@ -240,13 +282,90 @@ def _role_block(run: MergedRun, role: str) -> str:
         "",
         f"{role.upper()}  ({len(workers)} process{'es' if len(workers) != 1 else ''}, "
         f"imbalance {imbalance_of(workers):.2f})",
+        # Name what the percentages are *of*. Four different denominators are plausible here
+        # — wall clock, busy time, summed self time, the role's total across processes — and
+        # they give materially different readings, so leaving the reader to infer it means
+        # leaving them to infer it wrongly.
+        f"  % of {_share_basis(len(workers))}",
         _RULE,
     ]
-    lines.extend(_share_rows(tree))
+    lines.extend(_share_rows(tree, len(workers)))
+    lines.extend(_occupancy_rows(occupancy))
     lines.append("")
     lines.extend(_dominant_rows(tree))
+    lines.extend(_concurrency_rows(role, aligned))
     lines.extend(_iteration_rows(tree))
     return "\n".join(lines)
+
+
+def _concurrency_rows(role: str, aligned: AlignedTrace | None, limit: int = 3) -> list[str]:
+    """What everyone else was doing while this role's most wait-heavy phase was blocked.
+
+    A hang and a queue look identical in a phase table and have nothing in common as problems.
+    Naming the lanes that were busy during the wait separates them: work happening elsewhere
+    means queueing, silence everywhere means a hang.
+    """
+    if aligned is None:
+        return []
+    blocked = _blocked_spans(aligned, role)
+    if not blocked:
+        return []
+    shares = concurrent_activity(aligned, blocked)
+    busiest = sorted(shares.items(), key=lambda item: -item[1])[:limit]
+    busiest = [(lane, share) for lane, share in busiest if share >= 1.0]
+    if not busiest:
+        return [
+            "",
+            f"  while {role} waited, no other lane was active — this is a stall, not a queue.",
+        ]
+    named = ", ".join(f"{lane} {share:.0f}%" for lane, share in busiest)
+    return ["", f"  while {role} waited, concurrently active: {named}"]
+
+
+def _blocked_spans(aligned: AlignedTrace, role: str) -> list[PlacedSpan]:
+    """The role's spans that spent most of their time off-CPU.
+
+    Overlapping and nested spans are harmless here: :func:`concurrent_activity` merges its
+    windows before measuring, so the same blocked microsecond cannot be counted twice however
+    deeply the phases nest.
+    """
+    return [
+        span for span in aligned.spans
+        if span.role == role and span.cpu_measured and span.duration_ns > 0
+        and span.wait_ns > span.duration_ns * 0.5
+    ]
+
+
+def _occupancy_rows(occupancy: tuple[float, float] | None) -> list[str]:
+    """State how much of the run this role held a phase open, and how much it was on a CPU.
+
+    The gap between the two is the bottleneck statement — a role busy 97% and working 35% is
+    waiting for something two thirds of the time, and neither figure says that alone. Both
+    terms are defined inline rather than assumed: "busy" and "working" are ordinary words
+    doing precise work here, and a reader who guesses at them guesses wrong.
+    """
+    if occupancy is None:
+        return []
+    busy, working = occupancy
+    rows = ["", f"{'busy (phase open)':<28}{busy:>7.1f}%"]
+    if working < 0:
+        rows.append(f"{'working (on CPU)':<28}{'n/a':>8}")
+        return rows
+    rows.append(f"{'working (on CPU)':<28}{working:>7.1f}%")
+    rows.append("  busy = a phase was open; working = on a CPU inside one. The gap is waiting.")
+    return rows
+
+
+def _share_basis(processes: int) -> str:
+    """Name the denominator the share column divides by, and say when it is a sum.
+
+    A total that exceeds the run's wall clock is correct for a multi-process role and reads
+    as an error unless the summing is stated.
+    """
+    basis = "phase wall time at the first branching level"
+    if processes > 1:
+        return f"{basis}, summed over {processes} processes"
+    return basis
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,10 +424,15 @@ def wait_share(stats: PhaseStats) -> float:
     return 100.0 * stats.wait_ns / stats.wall_ns if stats.wall_ns else 0.0
 
 
-def _share_rows(tree: PhaseTree) -> list[str]:
-    """Format the pipeline breakdown derived by :func:`sibling_shares`."""
+def _share_rows(tree: PhaseTree, processes: int = 1) -> list[str]:
+    """Format the pipeline breakdown derived by :func:`sibling_shares`.
+
+    The wall column is marked when it sums several processes, so a figure larger than the
+    run's own runtime reads as the aggregate it is rather than as a bug.
+    """
+    suffix = f" (Σ{processes} proc)" if processes > 1 else ""
     return [
-        f"{share.name:<28}{share.percent:>7.1f}%{format_ns(share.wall_ns):>14}"
+        f"{share.name:<28}{share.percent:>7.1f}%{format_ns(share.wall_ns):>14}{suffix}"
         for share in sibling_shares(tree)
     ]
 
@@ -330,25 +454,41 @@ def _dominant_rows(tree: PhaseTree, limit: int = 6) -> list[str]:
     children never outranks the child doing the work.
 
     A row derived from a sampled phase is prefixed with ``~``: its numbers are scaled
-    estimates, and every other number in this report is measured.
+    estimates, and every other number in this report is measured. A row whose phase declared
+    ``async_work=True`` is prefixed with ``†``: its wall time is submission time, not the cost
+    of the work it started. A phase that is both carries both marks.
     """
     ranked = sorted(tree.items(), key=lambda item: -item[1].self_ns)
     rows = [f"{'DOMINANT PHASES':<28}{'self':>12}{'wait':>8}{'p50':>10}{'p99':>10}"]
     for path, stats in ranked[:limit]:
         if not path or stats.self_ns <= 0:
             continue
-        mark = "~" if stats.sample_stride else ""
+        mark = _marks_of(stats)
         rows.append(
             f"{mark}{_label(path):<{28 - len(mark)}}{format_ns(stats.self_ns):>12}"
             f"{wait_share(stats):>7.0f}%"
             f"{format_ns(stats.hist.quantile(0.5)):>10}"
             f"{format_ns(stats.hist.quantile(0.99)):>10}",
         )
-        rows.extend(_counter_rows(stats.counters, stats.wall_ns))
+        rows.extend(_counter_rows(stats.counters, stats.wall_ns, stats))
     if len(rows) <= 1:
         return []
     rows.extend(_sampling_note(tree))
+    rows.extend(_async_note(tree))
     return rows
+
+
+def _marks_of(stats: PhaseStats) -> str:
+    """The prefix characters qualifying a row's numbers, in a stable order.
+
+    Both marks say the same kind of thing — this figure is not the plain measurement it looks
+    like — so they compose rather than override. The label field is narrowed by the width of
+    whatever this returns, which keeps the columns aligned however many marks apply.
+    """
+    marks = "~" if stats.sample_stride else ""
+    if stats.async_entries:
+        marks += "†"
+    return marks
 
 
 def _sampling_note(tree: PhaseTree) -> list[str]:
@@ -369,6 +509,35 @@ def _sampling_note(tree: PhaseTree) -> list[str]:
         "  ~ = estimated from a sample, not measured. Totals are scaled by the rate:",
         *(f"      {format_label(name, 23):<24}1 entry in {stride:,}" for name, stride in sampled),
     ]
+
+
+def _async_note(tree: PhaseTree) -> list[str]:
+    """Say what a ``†`` row's wall time actually measured, and how to measure the other thing.
+
+    The reading this prevents is the expensive one: a phase around an unsynchronised device
+    submission holds most of a process's time at a plausible per-call latency, and every part
+    of that is true except the implication that the device was busy for it. Naming the
+    remedy in the note matters as much as the mark — ``sync=True`` is what turns the
+    submission time into a device time, and it is not obvious from the symbol.
+    """
+    marked = sorted(
+        {"/".join(path): (stats.async_entries, stats.calls)
+         for path, stats in tree.items() if stats.async_entries}.items(),
+    )
+    if not marked:
+        return []
+    rows = [
+        "",
+        "  † = wall time excludes un-awaited device work (async_work=True). This is",
+        "      submission time, not device compute. Re-run that phase with sync=True to",
+        "      attribute the device time to it:",
+    ]
+    for name, (async_entries, calls) in marked:
+        # A phase entered both ways is only partly submission time, and saying which part is
+        # the difference between "this number is wrong" and "this number is a mixture".
+        share = "" if async_entries >= calls else f" of {calls:,}"
+        rows.append(f"      {format_label(name, 23):<24}{async_entries:,}{share} entries")
+    return rows
 
 
 def _iteration_rows(tree: PhaseTree) -> list[str]:
@@ -392,8 +561,12 @@ def _iteration_rows(tree: PhaseTree) -> list[str]:
     ]
 
 
-def _counter_rows(counters: dict[str, int], wall_ns: int) -> list[str]:
-    """Work counters and their rate per second of the phase's wall time.
+def _counter_rows(
+    counters: dict[str, int],
+    wall_ns: int,
+    stats: PhaseStats | None = None,
+) -> list[str]:
+    """Work counters, their rate per second of the phase's wall time, and their spread.
 
     The ``io_*`` counters are skipped: they hold bytes, not work units, so a "per each"
     figure would be nonsense. They are rendered by :func:`_exact_io_block` instead.
@@ -412,9 +585,64 @@ def _counter_rows(counters: dict[str, int], wall_ns: int) -> list[str]:
         per_unit = wall_ns / total if total else 0.0
         rows.append(
             f"    + {format_label(name, 21):<22}{total:>9,} "
-            f"{rate:>11,.1f}/s {format_ns(per_unit):>8}/ea",
+            f"{rate:>11,.1f}/s {format_ns(per_unit):>8}/ea"
+            f"{_counter_spread(name, stats)}",
         )
     return rows
+
+
+def _counter_spread(name: str, stats: PhaseStats | None) -> str:
+    """Render one counter's per-call range, or nothing when it never varied usefully.
+
+    A single observation has no spread worth printing, and a counter always called with the
+    same amount says so most compactly as ``always n`` — which is the whole finding when that
+    amount is a configured cap. Anything else prints the range, because the distance between
+    the ends is what separates "capped" from "bursty".
+    """
+    if stats is None:
+        return ""
+    low = stats.counter_min.get(name)
+    high = stats.counter_max.get(name)
+    if low is None or high is None:
+        return ""
+    if low == high:
+        return f"  always {low:,}"
+    return f"  {low:,}..{high:,}"
+
+
+def _lifecycle_block(aligned: AlignedTrace | None) -> str:
+    """Where a request's time actually went, between submission and response.
+
+    The block a queue-driven pipeline is instrumented for. A single ``queue_wait`` total is
+    correct and unactionable, because it fuses intervals whose remedies point in opposite
+    directions — more batching, less batching, a cheaper model, fewer hops. Splitting it names
+    which one you have.
+    """
+    if aligned is None:
+        return ""
+    channels = lifecycle_segments(aligned)
+    if not channels:
+        return ""
+
+    lines = ["", "REQUEST LIFECYCLE", _RULE]
+    for channel in sorted(channels):
+        segments = channels[channel]
+        total = sum(segment.total_ns for segment in segments)
+        if total <= 0:
+            continue
+        requests = max(segment.count for segment in segments)
+        lines.append(f"{format_label(channel, 27):<28}{format_ns(total):>12}  ({requests:,} req)")
+        for index, segment in enumerate(segments):
+            branch = "└─" if index == len(segments) - 1 else "├─"
+            share = 100.0 * segment.total_ns / total
+            lines.append(
+                f"    {branch} {format_label(segment.name, 25):<26}"
+                f"{format_ns(segment.total_ns):>10}{share:>6.0f}%"
+                f"{format_ns(segment.mean_ns):>10}/ea",
+            )
+    if len(lines) <= 3:
+        return ""
+    return "\n".join(lines)
 
 
 def _exact_io_block(tree: PhaseTree) -> str:
@@ -565,16 +793,67 @@ def _io_sparklines(analysis: SampleAnalysis) -> list[str]:
 
 def _gpu_block(analysis: SampleAnalysis) -> str:
     """Sampled utilisation per device, this run's share of it, and peak allocator state."""
-    if analysis.gpu_util_mean < 0 and not analysis.gpu_devices and not analysis.peak_cuda_reserved:
-        return ""
+    if not analysis.has_gpu:
+        return _gpu_absent_block(analysis)
     lines = ["", "GPU", _RULE]
     lines.extend(_gpu_utilisation_rows(analysis))
     if analysis.peak_cuda_reserved:
         lines.append(f"{'VRAM allocated (peak)':<28}{format_bytes(analysis.peak_cuda_alloc):>14}")
         lines.append(f"{'VRAM reserved (peak)':<28}{format_bytes(analysis.peak_cuda_reserved):>14}")
+    lines.extend(_gpu_phase_rows(analysis))
     lines.append("")
     lines.extend(_gpu_footnote(analysis))
     return "\n".join(lines)
+
+
+def _gpu_phase_rows(analysis: SampleAnalysis, limit: int = 6) -> list[str]:
+    """Device utilisation while each phase was open, heaviest first.
+
+    This is the table that makes an unsynchronised submission visible on the page instead of
+    requiring a hand-rolled join: a phase named ``forward`` holding 97.9% of a server's time
+    at 7% device utilisation is a contradiction anyone can see, and it was previously spread
+    across two artifacts on two timebases.
+    """
+    rows = [
+        usage for usage in analysis.gpu_by_phase.values()
+        if usage.samples and usage.quantile(0.5) >= 0
+    ]
+    if not rows:
+        return []
+    rows.sort(key=lambda usage: -usage.quantile(0.5))
+    lines = [
+        "",
+        f"{'GPU BY PHASE (sampled)':<28}{'p50':>7}{'p95':>7}{'VRAM':>12}{'samples':>10}",
+    ]
+    for usage in rows[:limit]:
+        vram = format_bytes(usage.peak_cuda_reserved) if usage.peak_cuda_reserved else "n/a"
+        lines.append(
+            f"{format_label(usage.phase, 27):<28}"
+            f"{usage.quantile(0.5):>6.0f}%{usage.quantile(0.95):>6.0f}%"
+            f"{vram:>12}{usage.samples:>10,}",
+        )
+    return lines
+
+
+def _gpu_absent_block(analysis: SampleAnalysis) -> str:
+    """Say that no GPU data was collected, rather than saying nothing at all.
+
+    Only when samples exist. An absent GPU section is indistinguishable from a run with no
+    GPU in it, and a reader who cannot see the device sitting idle has no way to doubt a
+    phase table that appears to show it saturated — which is exactly how an unsynchronised
+    forward pass gets read as a GPU bottleneck. A run with no samples at all is a different
+    situation and already says so elsewhere.
+    """
+    if not analysis.has_samples:
+        return ""
+    return "\n".join([
+        "",
+        "GPU",
+        _RULE,
+        "  No GPU data was collected. If this run used one, install nvidia-ml-py and",
+        "  re-read the report without --no-samples; a phase around device work reports",
+        "  submission time until something proves the device was busy.",
+    ])
 
 
 def _gpu_footnote(analysis: SampleAnalysis) -> list[str]:
@@ -585,10 +864,31 @@ def _gpu_footnote(analysis: SampleAnalysis) -> list[str]:
             "   just yours; 'this run' is the share NVML attributes to this run's own",
             "   pids. Neither is a compute-vs-wait split: for that, run with",
             "   backend='torch' and analyse the trace.)",
+            *_gpu_phase_footnote(analysis),
         ]
     return [
         "  (utilisation is whole-device busy time from NVML, not a compute-vs-wait",
         "   split. For that, run with backend='torch' and analyse the trace.)",
+        *_gpu_phase_footnote(analysis),
+    ]
+
+
+def _gpu_phase_footnote(analysis: SampleAnalysis) -> list[str]:
+    """State the attribution rule for the per-phase rows, and its one sharp edge.
+
+    The same caveat ``_exact_io_block`` carries for bytes, plus the async one: a phase that
+    submits work without awaiting it will have its device time land under whichever *later*
+    phase happens to synchronise. Left unsaid, the per-phase table would appear to refute the
+    very mismeasurement it is there to expose.
+    """
+    if not analysis.gpu_by_phase:
+        return []
+    return [
+        "",
+        "  (per-phase rows attribute each 1 Hz sample to the phase open when it was",
+        "   taken. A phase that submits device work without awaiting it may have that",
+        "   work land under a later phase, so low utilisation on an async phase is",
+        "   expected — and is the reason its wall time is submission time.)",
     ]
 
 

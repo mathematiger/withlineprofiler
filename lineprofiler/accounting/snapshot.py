@@ -26,6 +26,7 @@ from typing import Any
 
 from lineprofiler.accounting.identity import describe as describe_placement
 from lineprofiler.accounting.phasetree import PhaseTree, merge_trees, tree_from_dict, tree_to_dict
+from lineprofiler.accounting.provenance import describe_source
 from lineprofiler.accounting.sampler import (
     Sample,
     open_process,
@@ -64,7 +65,13 @@ class SnapshotWriter:
         - killing the process between snapshots leaves the previous snapshot intact
     """
 
-    def __init__(self, run_dir: Path, role: str = "main", run_id: str | None = None) -> None:
+    def __init__(
+        self,
+        run_dir: Path,
+        role: str = "main",
+        run_id: str | None = None,
+        source: dict[str, object] | None = None,
+    ) -> None:
         self.run_dir = run_dir
         self.role = role
         self.run_id = run_id or new_run_id()
@@ -86,7 +93,7 @@ class SnapshotWriter:
         self._process = open_process()
         try:
             self.worker_dir.mkdir(parents=True, exist_ok=True)
-            _write_metadata_once(run_dir, self.run_id)
+            _write_metadata_once(run_dir, self.run_id, source)
         except OSError as error:
             # An observability tool must never be the reason a twelve-hour job dies. A run
             # directory that cannot be created means no output, not a failed training run.
@@ -502,7 +509,11 @@ def _write_atomic(temporary: Path, target: Path, document: str) -> None:
         os.close(directory)
 
 
-def _write_metadata_once(run_dir: Path, run_id: str) -> None:
+def _write_metadata_once(
+    run_dir: Path,
+    run_id: str,
+    source: dict[str, object] | None = None,
+) -> None:
     """Record run-level context, once per attempt.
 
     Ranks of the same attempt skip the write after the first; a *new* attempt into the same
@@ -512,10 +523,17 @@ def _write_metadata_once(run_dir: Path, run_id: str) -> None:
     was not enough: on a shared filesystem its answer is cached, so on a thousand-rank launch
     many ranks pass the check and then write the same path at once, leaving JSON that parses
     as nothing and a report that prints ``Host ?``.
+
+    ``source`` overrides the git lookup, for an embedding program that knows its own revision
+    — or wants to record a config hash instead, a config change altering behaviour as much as
+    a code change does.
     """
     path = run_dir / "metadata.json"
     if _read_metadata(path.parent).get("run_id") == run_id:
         return
+    # After the dedupe, so only the rank that actually writes pays for the subprocess.
+    if source is None:
+        source = describe_source()
     payload = {
         "version": FORMAT_VERSION,
         "run_id": run_id,
@@ -526,6 +544,7 @@ def _write_metadata_once(run_dir: Path, run_id: str) -> None:
         "argv": sys.argv,
         "host": socket.gethostname(),
         "python": sys.version,
+        "source": source,
     }
     document = json.dumps(payload, indent=2)
     process = open_process()
