@@ -82,3 +82,91 @@ Two choices worth knowing:
 a command line a path that does not exist is usually a typo, and failing loudly beats
 scattering directories. The library call `write_html()` does create them, since a caller
 writing to `reports/run-17.html` from code means it.
+
+## The trace timeline
+
+```
+lineprofiler trace profile/ -o trace.html
+```
+
+The report answers *where did the time go?* This answers the question a set of totals
+structurally cannot: *why was this worker idle at that moment, and who was it waiting for?*
+A phase tree can say `queue_get` was 80% wait; only a timeline can show that the wait began
+the instant the learner finished and ended when actor 3 finally published its batch.
+
+The page carries:
+
+- **One lane per worker thread, on a shared clock.** Idle time is drawn as absence, so a
+  starved worker reads as a row full of gaps.
+- **Nesting, as rows within a lane.** A phase entered inside another is drawn beneath its
+  caller, one row per level, so a lane reads as a call structure and not a flat list: you can
+  see that `iteration` spent its time in `queue_get` and then `train_step`, in that order.
+  Deeper than eight levels folds onto the last row, and the page says how many did.
+- **A "Call order" table**, restating each lane's calls in the order they ran, indented by
+  depth. The chart shows order by position, which is the right way to see it and the wrong way
+  to quote it — a busy lane collapses into a stripe, and this does not.
+- **Wait shading inside each span**, using the same blend as the icicle chart: reddish is
+  working, blue is blocked. There is a test asserting the two agree.
+- **Arrows from a producer to the consumer it released**, drawn from `signal`/`wait_on`.
+- **A critical path**: the chain of spans that actually set the run's length, walked backwards
+  through those arrows. This is the part that turns "everything looks slow" into an ordered
+  list of what waited on what.
+- **A lane table separating "phase open" from "on CPU".** The gap between those two columns
+  *is* the waiting.
+- **GPU utilisation lanes** from the 1 Hz sampler, so an empty CPU lane can be checked against
+  a busy or idle device.
+
+### This page ships JavaScript
+
+It is the only one that does. The constraint it relaxes is narrow: still one file, still no
+CDN, no webfont and no network — a timeline over a hundred thousand spans needs pan and zoom,
+and static SVG cannot provide them. The report and source pages remain script-free and their
+tests still assert it.
+
+Text is written to the page with `textContent`, never `innerHTML`. Phase names come from your
+code, and a profiling artifact gets mailed around and opened by other people.
+
+### Recording a trace
+
+Tracing is **off by default**, because the phase tree is bounded and a timeline is not. Four
+ways to turn it on, in increasing order of what they ask of your code:
+
+| | change to your code | what you get |
+|---|---|---|
+| `LINEPROFILER_TRACE=auto` | **nothing** | lanes and nesting derived from function calls |
+| `LINEPROFILER_TRACE=1` | **nothing** | lanes from the phases you already name |
+| `Profiler(..., trace=True)` | **one word** | the same, set in code |
+| `signal()` / `wait_on()` | **two lines per queue** | arrows and a cross-process critical path |
+
+```python
+profiler = Profiler(run_dir="profile", role="actor", trace=True)
+```
+
+Only the last tier needs new calls, and they go at the queue boundaries you already know are
+interesting:
+
+```python
+queue.put(batch)
+profiler.signal("batch", batch.id)        # in the producer
+
+with profiler.phase("queue_get"):
+    batch = queue.get()
+profiler.wait_on("batch", batch.id)       # in the consumer
+```
+
+An unmatched `wait_on` is reported on the page as unmatched — never raised. Half a pipeline
+being instrumented is the normal state of an incremental rollout, and it must cost you arrows
+rather than a crash.
+
+### What it cannot tell you
+
+- **The buffer is bounded** (`trace_capacity`, 200k spans by default). A wrapped ring keeps
+  the *newest* spans and the page says how many it dropped; a truncated trace never renders
+  as a complete one.
+- **`trace="auto"` cannot measure CPU time.** `thread_time_ns()` is a real syscall at ~590 ns,
+  which is not affordable per function call. Auto spans are drawn hatched and their wait is
+  reported as *unknown*, not as zero. Use it to find where the phases belong, then name them.
+- **Cross-host alignment is only as good as NTP.** Within one host the shared axis is exact.
+  Across hosts, treat sub-millisecond gaps as noise — the page says which case it is in.
+- **`trace="auto"` needs Python 3.12+** (`sys.monitoring`) and cannot run alongside
+  coverage.py, pdb or `backend="viztracer"`. It fails loudly rather than recording nothing.

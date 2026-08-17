@@ -33,6 +33,7 @@ from lineprofiler.accounting.sampler import (
     read_samples,
 )
 from lineprofiler.accounting.selfio import record_bytes_written
+from lineprofiler.accounting.trace import ClockAnchor, Link, Span, WorkerTrace
 
 FORMAT_VERSION = 1
 
@@ -77,6 +78,7 @@ class SnapshotWriter:
         stem = f"w_{self.run_id}_{self.pid}_{uuid.uuid4().hex[:8]}"
         self.path = self.worker_dir / f"{stem}.json"
         self.samples_path = self.worker_dir / f"{stem}.samples"
+        self.trace_path = self.worker_dir / f"{stem}.trace"
         self.started_at = time.time()
         self.write_failures = 0
         self.last_error: str | None = None
@@ -134,6 +136,108 @@ class SnapshotWriter:
         """Attach the heavy-profiler artifact description to the next snapshot."""
         self._backend = description
 
+    def append_trace(
+        self,
+        spans: list[Span],
+        links: list[Link],
+        paths: list[tuple[str, ...]],
+        anchors: list[ClockAnchor],
+        dropped: int,
+        dropped_links: int,
+    ) -> bool:
+        """Append a batch of spans to this worker's trace sidecar.
+
+        Appended rather than atomically replaced, unlike the aggregate snapshot. The two
+        differ because the data does: the snapshot is *complete state*, so rewriting it whole
+        is what makes a torn write harmless, whereas a trace only grows — rewriting a
+        200k-span array on every 30-second flush would turn a cheap snapshot into tens of
+        megabytes of churn. A torn final line here costs the last batch and leaves every
+        earlier one readable, which :func:`read_trace` relies on.
+        """
+        if not spans and not links:
+            return True
+        payload = {
+            "paths": ["/".join(path) for path in paths],
+            "anchors": [anchor.to_dict() for anchor in anchors],
+            "dropped": dropped,
+            "dropped_links": dropped_links,
+            "spans": [
+                [s.phase_id, s.thread_id, s.t0_ns, s.t1_ns, s.cpu_ns, s.flags] for s in spans
+            ],
+            "links": [link.to_dict() for link in links],
+        }
+        line = json.dumps(payload) + "\n"
+        before = read_io_snapshot(self._process)
+        try:
+            with self.trace_path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+        except OSError as error:
+            self._note_failure(error)
+            return False
+        after = read_io_snapshot(self._process)
+        if before.available and after.available:
+            record_bytes_written(
+                len(line.encode("utf-8")),
+                max(0, after.write_bytes - before.write_bytes),
+            )
+        return True
+
+
+def read_trace(path: Path) -> WorkerTrace:
+    """Read one worker's trace sidecar, discarding only what is unreadable.
+
+    Every batch is an independent line, so a run killed mid-write loses its last line and
+    nothing else. A malformed line is skipped rather than failing the read: the same rule the
+    worker files follow — one bad file, or here one bad line, must not cost the whole run's
+    trace.
+
+    The interning table and anchors are cumulative across batches; later lines carry the full
+    table, so the last one seen wins.
+    """
+    trace = WorkerTrace()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return trace
+
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            batch = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue  # a torn final line, or a partially flushed one
+        try:
+            _absorb_batch(trace, batch)
+        except (KeyError, TypeError, ValueError):
+            continue
+    return trace
+
+
+def _absorb_batch(trace: WorkerTrace, batch: dict[str, Any]) -> None:
+    """Fold one sidecar line into the accumulating trace."""
+    paths = batch.get("paths")
+    if isinstance(paths, list) and len(paths) >= len(trace.paths):
+        trace.paths = [tuple(key.split("/")) if key else () for key in paths]
+    anchors = batch.get("anchors")
+    if isinstance(anchors, list) and anchors:
+        trace.anchors = [ClockAnchor.from_dict(item) for item in anchors]
+    trace.dropped = max(trace.dropped, int(batch.get("dropped", 0)))
+    trace.dropped_links = max(trace.dropped_links, int(batch.get("dropped_links", 0)))
+    for row in batch.get("spans", []):
+        trace.spans.append(
+            Span(
+                phase_id=int(row[0]),
+                thread_id=int(row[1]),
+                t0_ns=int(row[2]),
+                t1_ns=int(row[3]),
+                cpu_ns=int(row[4]),
+                flags=int(row[5]),
+            ),
+        )
+    for item in batch.get("links", []):
+        trace.links.append(Link.from_dict(item))
+
 
 @dataclass(slots=True)
 class WorkerSnapshot:
@@ -150,6 +254,8 @@ class WorkerSnapshot:
     run_id: str = UNKNOWN_RUN
     placement: dict[str, Any] = dataclass_field(default_factory=dict)
     write_failures: int = 0
+    trace: WorkerTrace = dataclass_field(default_factory=WorkerTrace)
+    """Recorded spans and links, empty unless ``merge_run(with_trace=True)`` read them."""
 
     @property
     def wall_ns(self) -> int:
@@ -267,7 +373,11 @@ def imbalance_of(workers: list[WorkerSnapshot]) -> float:
     return max(totals) / (sum(totals) / len(totals))
 
 
-def merge_run(run_dir: str | Path, with_samples: bool = True) -> MergedRun:
+def merge_run(
+    run_dir: str | Path,
+    with_samples: bool = True,
+    with_trace: bool = False,
+) -> MergedRun:
     """Read every worker file under ``run_dir`` and merge them into one phase tree.
 
     Args:
@@ -279,6 +389,9 @@ def merge_run(run_dir: str | Path, with_samples: bool = True) -> MergedRun:
             them, and the derived intervals roughly double the peak. The phase trees for the
             same run are a few megabytes in total. Dropping samples costs the I/O, memory and
             GPU blocks and nothing else.
+        with_trace: Read each worker's trace sidecar too. Off by default for the same reason
+            samples can be dropped — spans outnumber phases by orders of magnitude — so the
+            ordinary report pays nothing for files it does not draw.
 
     Test specifically:
         - the merge is unaffected by the order in which worker files are read
@@ -295,6 +408,8 @@ def merge_run(run_dir: str | Path, with_samples: bool = True) -> MergedRun:
         if worker is None:
             unreadable.append(path)
             continue
+        if with_trace:
+            worker.trace = read_trace(path.with_suffix(".trace"))
         found.append(worker)
 
     workers, superseded = _split_by_attempt(found)

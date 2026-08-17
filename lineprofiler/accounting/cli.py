@@ -2,6 +2,7 @@
 
     lineprofiler report <run_dir> [--no-samples] [--format text|json|html] [-o PATH]
     lineprofiler compare <run_a> <run_b> [--format text|json] [-o PATH]
+    lineprofiler trace <run_dir> [--format html|json] [-o PATH]
 """
 
 from __future__ import annotations
@@ -24,6 +25,8 @@ def main(argv: list[str] | None = None) -> int:
         _emit(_render_report(args), args.output)
     elif args.command == "compare":
         _emit(_render_compare(args), args.output)
+    elif args.command == "trace":
+        _emit(_render_trace(args), args.output)
     return 0
 
 
@@ -61,22 +64,31 @@ def _build_parser() -> argparse.ArgumentParser:
     compare.add_argument("run_a")
     compare.add_argument("run_b")
     _add_output_arguments(compare, formats=("text", "json"))
+
+    trace = subcommands.add_parser(
+        "trace",
+        help="draw the recorded timeline: which worker waited, when, and for whom",
+    )
+    trace.add_argument("run_dir", help="directory passed to Profiler(run_dir=...)")
+    # html first: a timeline is a picture, and the text form of one is a wall of numbers.
+    _add_output_arguments(trace, formats=("html", "json"), default="html")
     return parser
 
 
 def _add_output_arguments(
     parser: argparse.ArgumentParser,
     formats: tuple[str, ...],
+    default: str = "text",
 ) -> None:
-    """Add the output selection shared by both subcommands.
+    """Add the output selection shared by the subcommands.
 
-    ``compare`` is offered only the formats it can actually produce, so an unsupported
-    choice is rejected by argparse with the valid list rather than failing later.
+    Each is offered only the formats it can actually produce, so an unsupported choice is
+    rejected by argparse with the valid list rather than failing later.
     """
     parser.add_argument(
         "--format",
         choices=formats,
-        default="text",
+        default=default,
         help=(
             "output format. json lets a run gate CI or be diffed across sweep arms without "
             "re-deriving the shares and quantiles; html is a single self-contained file "
@@ -108,6 +120,38 @@ def _render_report(args: argparse.Namespace) -> str:
 
         return render_html(run)
     return render(run)
+
+
+def _render_trace(args: argparse.Namespace) -> str:
+    """Render the timeline. Samples are read too, so the GPU lanes have something to draw."""
+    run = merge_run(args.run_dir, with_samples=True, with_trace=True)
+    if args.format == "json":
+        from lineprofiler.accounting.tracealign import align_run
+
+        aligned = align_run(run)
+        return json.dumps(
+            {
+                "duration_ns": aligned.duration_ns,
+                "lanes": aligned.lanes,
+                "spans": len(aligned.spans),
+                "arrows": [
+                    {
+                        "channel": arrow.channel,
+                        "key": arrow.key,
+                        "from": arrow.src_worker,
+                        "to": arrow.dst_worker,
+                        "delay_ns": arrow.delay_ns,
+                    }
+                    for arrow in aligned.arrows
+                ],
+                "unmatched_waits": aligned.unmatched_waits,
+                "dropped_spans": aligned.dropped_spans,
+            },
+            indent=2,
+        )
+    from lineprofiler.accounting.htmltrace import render_trace_html
+
+    return render_trace_html(run)
 
 
 def _render_compare(args: argparse.Namespace) -> str:

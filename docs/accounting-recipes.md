@@ -314,3 +314,71 @@ as a complete result to a program either.
 Set `enabled=True` explicitly in tests rather than relying on `LINEPROFILER_PROFILE`, and pass
 `snapshot_interval_s=None, sample_interval_s=None` to keep the run deterministic and
 thread-free; call `close()` to flush.
+
+## Seeing *why* a worker was idle
+
+The report tells you `queue_get` was 80% wait. It cannot tell you what the learner was
+waiting *for*, because a total has no position on a clock. That is what the trace timeline
+is for:
+
+```
+lineprofiler trace profile/ -o trace.html
+```
+
+### What it costs to adopt
+
+Measured, not estimated — the numbers below are `git diff --stat` over a real
+two-actor/one-learner pipeline, each tier applied as its own commit:
+
+| tier | your diff | what it buys |
+|---|---|---|
+| `LINEPROFILER_TRACE=auto` | **0 lines** | lanes and nesting derived from function calls |
+| `LINEPROFILER_TRACE=1` | **0 lines** | lanes from the phases you already name |
+| `trace=True` | **1 line per `Profiler(...)`** | the same, set in code |
+| `signal()` / `wait_on()` | **1 line per queue endpoint** | arrows, and a critical path that crosses processes |
+
+Adding `phase()` to a codebase that has none is the *existing* cost of this package — about
+28 lines on the pipeline above — and it buys the text report and icicle chart too. Nothing in
+the timeline requires it: start at `auto`, find where the time goes, then name the four or
+five phases it points at.
+
+### The two-line version
+
+```python
+queue.put(batch)
+profiler.signal("batch", batch.id)        # producer: it is ready
+
+with profiler.phase("queue_get"):
+    batch = queue.get()
+profiler.wait_on("batch", batch.id)       # consumer: I needed it here
+```
+
+`key` only has to match on both sides — a step number, an id, a UUID. An unmatched `wait_on`
+is reported on the page, never raised.
+
+### Reading the result
+
+Start with the **lane table**, which separates *phase open* from *on CPU*:
+
+```
+lane                role       phase open    on CPU   blocked
+actor 263801#0      actor           96.4%     95.0%      1.3%
+learner 263800#0    learner         96.9%     38.5%     58.4%
+```
+
+The learner has a phase open almost the whole run and spends 38% of it on a CPU. That 58%
+gap is the answer, and the **critical path** below the chart names who caused it: alternating
+`queue_get` at 100% wait and `train_step` at 1%, with an arrow back to whichever actor was
+still generating.
+
+The fix that follows is an architecture change — more actors, a deeper queue, cheaper env
+steps — and it is the sort of change you want evidence for before making.
+
+### When *not* to reach for it
+
+- **Not for a twelve-hour run at `auto`.** Auto-tracing costs per *function call*. Use it as a
+  discovery tool over a few iterations, then switch to named phases for the long run.
+- **Not to measure CPU time on auto spans.** They cannot; the page says *unknown* rather than
+  guessing. Named phases measure it.
+- **Not as a substitute for Perfetto or nsys** when you need kernel-level or per-line detail.
+  `backend="torch"` still exists for exactly that, for a bounded window.

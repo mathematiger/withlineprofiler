@@ -76,13 +76,33 @@ lineprofiler report profile/                        # the run, as a table
 lineprofiler report profile/ --format html -o r.html # ...or as a page you can share
 ```
 
+### Why was that worker idle?
+
+A report says `queue_get` was 80% wait. It cannot say *when*, or *what for* — a total has no
+position on a clock. Turn on the timeline and the answer is a picture:
+
+```python
+Profiler(run_dir="profile", role="actor", trace=True)
+```
+
+```
+lineprofiler trace profile/ -o trace.html
+```
+
+One lane per worker on a shared clock, idle time drawn as absence, and — where you mark a
+queue with `signal()` / `wait_on()` — arrows from a producer to the consumer it unblocked,
+plus the critical path that actually set the run's length.
+
+Nothing to instrument first: `LINEPROFILER_TRACE=auto` derives the lanes from function calls
+in your project, with no change to your code at all.
+
 ## Documentation
 
 - [The line profiler](https://github.com/mathematiger/withlineprofiler/blob/main/docs/line-profiler.md) — the `with` block, `start_profiling()`, and what it does not do
 - [The accounting layer](https://github.com/mathematiger/withlineprofiler/blob/main/docs/accounting.md) — phases, counters, and instrumenting without threading an argument
 - [Accounting recipes](https://github.com/mathematiger/withlineprofiler/blob/main/docs/accounting-recipes.md) — reading the report, I/O and GPU bottlenecks, overhead budgets, exporting to W&B
 - [Multiple processes and nodes](https://github.com/mathematiger/withlineprofiler/blob/main/docs/multiprocess.md) — Slurm, forking, preemption, heavy backends
-- [HTML reports](https://github.com/mathematiger/withlineprofiler/blob/main/docs/html-reports.md) — the icicle chart, the annotated source view, and the embedded data block
+- [HTML reports](https://github.com/mathematiger/withlineprofiler/blob/main/docs/html-reports.md) — the icicle chart, the trace timeline, the annotated source view, and the embedded data block
 - [Configuration](https://github.com/mathematiger/withlineprofiler/blob/main/docs/configuration.md) — environment variables, `[tool.lineprofiler]`, optional dependencies
 - [Comparison with other profilers](https://github.com/mathematiger/withlineprofiler/blob/main/docs/comparison.md) — `line_profiler`, py-spy, Scalene, VizTracer, and when to use those instead
 

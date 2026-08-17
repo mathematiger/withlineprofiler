@@ -73,11 +73,23 @@ svg { display: block; max-width: 100%; height: auto; }
 """
 
 
-def document(title: str, body: str, data: JsonValue = None) -> str:
+def document(
+    title: str,
+    body: str,
+    data: JsonValue = None,
+    style: str = "",
+    script: str = "",
+) -> str:
     """Wrap ``body`` in a complete HTML page, optionally embedding ``data`` as JSON.
 
     The JSON block is the machine-readable record the page was drawn from, carried along so
     a reader can extract the exact numbers behind any figure without re-running anything.
+
+    ``style`` and ``script`` are appended *inline*, never linked. The report and source pages
+    pass neither and stay script-free; the trace timeline passes a script because panning and
+    zooming a hundred thousand spans cannot be done with static SVG. Inline is what preserves
+    the property that actually matters — the file opens offline, six months later, with no
+    network — which a CDN reference would break just as thoroughly as a stylesheet link.
     """
     payload = ""
     if data is not None:
@@ -85,13 +97,15 @@ def document(title: str, body: str, data: JsonValue = None) -> str:
             '\n<script type="application/json" id="lineprofiler-data">'
             f"{embed_json(data)}</script>"
         )
+    extra_style = f"\n<style>{style}</style>" if style else ""
+    behaviour = f"\n<script>{script}</script>" if script else ""
     return (
         "<!doctype html>\n"
         '<html lang="en">\n<head>\n<meta charset="utf-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
         f"<title>{escape(title)}</title>\n"
-        f"<style>{_STYLE}</style>\n</head>\n<body>\n<main>\n"
-        f"{body}\n</main>{payload}\n</body>\n</html>\n"
+        f"<style>{_STYLE}</style>{extra_style}\n</head>\n<body>\n<main>\n"
+        f"{body}\n</main>{payload}{behaviour}\n</body>\n</html>\n"
     )
 
 

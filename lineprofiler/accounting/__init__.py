@@ -25,13 +25,16 @@ from lineprofiler.accounting.profiler import (
     install_profiler,
     installed_profiler,
     phase,
+    signal_ready,
     start,
     stop,
     uninstall_profiler,
+    wait_on,
 )
 from lineprofiler.accounting.report import render, report_as_dict
 from lineprofiler.accounting.sampler import ResourceSampler, Sample
 from lineprofiler.accounting.snapshot import MergedRun, WorkerSnapshot, merge_run
+from lineprofiler.accounting.trace import Span, TraceBuffer, WorkerTrace
 
 __all__ = [
     "Backend",
@@ -44,7 +47,10 @@ __all__ = [
     "ResourceSampler",
     "Sample",
     "SampleAnalysis",
+    "Span",
+    "TraceBuffer",
     "WorkerSnapshot",
+    "WorkerTrace",
     "analyse",
     "compare",
     "count",
@@ -57,7 +63,9 @@ __all__ = [
     "render",
     "render_comparison",
     "report_as_dict",
+    "signal_ready",
     "start",
     "stop",
     "uninstall_profiler",
+    "wait_on",
 ]

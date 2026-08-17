@@ -29,6 +29,10 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager
 from functools import wraps
 from pathlib import Path
+
+# Aliased because ``Profiler.signal`` shadows the module name inside the class body, where
+# these appear as annotations; the module itself is still used everywhere else.
+from signal import Signals as SignalNumber
 from time import perf_counter_ns, thread_time_ns
 from types import FrameType
 from typing import ParamSpec, TypeVar, overload
@@ -51,6 +55,13 @@ from lineprofiler.accounting.sampler import (
 from lineprofiler.accounting.selfio import bytes_written as selfio_bytes_written
 from lineprofiler.accounting.selfio import reset as selfio_reset
 from lineprofiler.accounting.snapshot import SnapshotWriter, new_run_id
+from lineprofiler.accounting.trace import (
+    DEFAULT_CAPACITY,
+    FLAG_SAMPLED,
+    UNMEASURED,
+    ClockAnchor,
+    TraceBuffer,
+)
 
 ENV_ENABLE = "LINEPROFILER_PROFILE"
 """Environment variable consulted once, at construction, for the default of ``enabled``."""
@@ -64,6 +75,11 @@ ENV_RUN_DIR = "LINEPROFILER_RUN_DIR"
 ENV_RUN_ID = "LINEPROFILER_RUN_ID"
 """Environment variable joining a child to its parent's *attempt*, so that a rerun into the
 same directory is a separate run rather than extra workers on the previous one."""
+
+ENV_TRACE = "LINEPROFILER_TRACE"
+"""Environment variable enabling the trace timeline: ``1`` for named phases, ``auto`` to also
+derive spans from function calls. Propagated to children, so a launcher can turn the timeline
+on for a whole pipeline without touching any worker's code."""
 
 MAX_DEPTH = 32
 """Phases nested deeper than this are folded into their ancestor, bounding the tree size."""
@@ -142,7 +158,7 @@ def _forkable_profilers() -> list[Profiler]:
 
 
 def _relink_signal_chain(
-    signum: signal.Signals,
+    signum: SignalNumber,
     ours: _Handler,
     previous: _Handler,
     skip: Profiler,
@@ -238,6 +254,19 @@ class Profiler:
             process with two very different answers to "where did the time go?". Off by
             default: it changes the shape of the reported tree, and most processes have only
             one interesting thread.
+        trace: Record a timeline of individual phase entries, not just their totals, so the
+            report can show *when* each phase ran and which worker was idle while another
+            worked. ``True`` traces the phases you named; ``"auto"`` additionally derives
+            spans from function calls in your project, which needs no ``phase()`` calls at
+            all but cannot measure CPU time per span. Defaults to ``LINEPROFILER_TRACE``.
+            Off by default — the phase tree is bounded, a timeline is not, so this keeps only
+            the most recent ``trace_capacity`` spans.
+        trace_capacity: Spans retained per worker before the oldest are overwritten. The
+            count that had to be dropped is carried into the report: a truncated timeline
+            must never render as a complete one.
+        trace_functions: Qualified-name globs limiting which functions ``trace="auto"``
+            records, e.g. ``["train*", "*.step"]``. Without them every function in the
+            project is traced, which is affordable for a bounded window and not much else.
 
     Statistics are accumulated per thread and merged only when a snapshot is written, so the
     hot path takes no locks and needs none. A snapshot taken while another thread is inside
@@ -268,6 +297,9 @@ class Profiler:
         install: bool = False,
         strict_names: bool = False,
         thread_names: bool = False,
+        trace: bool | str | None = None,
+        trace_capacity: int = DEFAULT_CAPACITY,
+        trace_functions: list[str] | None = None,
     ) -> None:
         self.enabled: bool = _resolve_enabled(enabled)
         self.measure_cpu: bool = measure_cpu
@@ -291,7 +323,7 @@ class Profiler:
         self._snapshot_failures = 0
         self._delta_baseline: PhaseTree = {}
         self._name_shapes: dict[str, int] = {}
-        self._chained_signals: dict[signal.Signals, tuple[_Handler, _Handler]] = {}
+        self._chained_signals: dict[SignalNumber, tuple[_Handler, _Handler]] = {}
         self._snapshot_callbacks: list[Callable[[PhaseTree], None]] = []
         self._callback_failures = 0
         self._phase_overflow = 0
@@ -302,6 +334,17 @@ class Profiler:
         self._record_function: Callable[[str], AbstractContextManager[object]] | None = None
         self._cuda_sync: Callable[[], None] | None = None
         self._env_keys_propagated: list[str] = []
+        # None is the hot path's off switch: _PhaseScope tests identity, exactly as it does
+        # for _sync, _nvtx and _record_function, so an untraced phase pays one pointer
+        # compare. Assigned before the `enabled` guard so the attribute always exists.
+        self._trace: TraceBuffer | None = None
+        self._trace_mode: str = _resolve_trace(trace)
+        self._trace_capacity = trace_capacity
+        self._trace_functions = trace_functions
+        self._anchors: list[ClockAnchor] = []
+        self._auto: object | None = None
+        self._next_thread_id = 0
+        self._thread_id_lock = threading.Lock()
 
         if not self.enabled:
             return
@@ -317,8 +360,11 @@ class Profiler:
         self._cuda_sync = cuda_synchronize()
 
         _warn_if_already_live(self.run_dir)
-        self._env_keys_propagated = _propagate_to_children(self.run_dir, self.run_id)
+        self._env_keys_propagated = _propagate_to_children(
+            self.run_dir, self.run_id, self._trace_mode,
+        )
         self._writer = SnapshotWriter(self.run_dir, role=self.role, run_id=self.run_id)
+        self._start_tracing()
         self._start_backend_window(backend_window, window_phase)
         self._start_sampler(sample_interval_s)
         self._install_exit_hooks()
@@ -480,6 +526,30 @@ class Profiler:
         if self._writer is None:
             return
         self._writer.write(self.merged_tree())
+        self._flush_trace()
+
+    def _flush_trace(self) -> None:
+        """Append everything recorded since the last flush to the trace sidecar.
+
+        Draining bounds what is held in memory *between flushes* rather than for the run, so
+        with the default 30-second interval the ring rarely fills at all. When it does, the
+        drop count travels with the batch and ends up on the page.
+        """
+        buffer = self._trace
+        if buffer is None or self._writer is None or buffer.is_empty():
+            return
+        # A fresh anchor per flush: two points bracketing a long run let the reader correct
+        # for drift between the monotonic and wall clocks rather than assume there is none.
+        self._anchors.append(ClockAnchor.take())
+        spans, links = buffer.drain()
+        self._writer.append_trace(
+            spans=spans,
+            links=links,
+            paths=buffer.paths(),
+            anchors=self._anchors,
+            dropped=buffer.dropped,
+            dropped_links=buffer.dropped_links,
+        )
 
     def merged_tree(self) -> PhaseTree:
         """Return the union of every thread's phase tree for this process.
@@ -601,6 +671,9 @@ class Profiler:
             self._window.close()
             if self._writer is not None:
                 self._writer.record_backend(self._window.describe())
+        # Before the final snapshot: the tracer must stop recording before its buffer is
+        # drained, or spans arriving during the flush are silently lost.
+        self._stop_auto_tracing()
         self.snapshot()
         if str(self.run_dir) in _live_profilers:
             _live_profilers.remove(str(self.run_dir))
@@ -791,6 +864,13 @@ class Profiler:
         self._writer = SnapshotWriter(self.run_dir, role=self.role, run_id=self.run_id)
         self._sampler = None
         self._flush_timer = None
+        # The child inherited a buffer describing work the parent did, and an interning table
+        # whose ids the child would reassign to different paths. Both would be written into
+        # the child's own sidecar as if it had done them.
+        if self._trace is not None:
+            self._trace.clear()
+            self._anchors = [ClockAnchor.take()]
+            self._next_thread_id = 0
         self._start_sampler(self._sample_interval_s)
         self._start_flush_timer()
 
@@ -804,6 +884,96 @@ class Profiler:
             phase_of=self.current_phase,
         )
         self._sampler.start()
+
+    def _start_tracing(self) -> None:
+        """Create the span buffer and take the first clock anchor, if tracing is on.
+
+        The anchor is taken here rather than lazily because it dates the *origin* of this
+        worker's monotonic clock; taken later it would still be correct, but every span
+        before it would have to be extrapolated backwards from a single point.
+        """
+        if self._trace_mode == "off":
+            return
+        self._trace = TraceBuffer(self._trace_capacity)
+        self._anchors = [ClockAnchor.take()]
+        if self._trace_mode == "auto":
+            self._start_auto_tracing()
+
+    def _start_auto_tracing(self) -> None:
+        """Derive spans from function calls, so untouched code still produces a timeline.
+
+        Imported here rather than at module scope: this is the one place the accounting layer
+        reaches into the line profiler's machinery, and a top-level import would make every
+        ``accounting`` user pay for a module they mostly do not use.
+        """
+        from lineprofiler.accounting.autotrace import AutoTracer
+
+        tracer = AutoTracer(
+            buffer=self._trace,
+            thread_id_of=self._trace_thread_id,
+            functions=self._trace_functions,
+        )
+        tracer.start()
+        self._auto = tracer
+
+    def _stop_auto_tracing(self) -> None:
+        """Release the monitoring hooks, if function tracing was running."""
+        tracer = self._auto
+        if tracer is not None:
+            stop = getattr(tracer, "stop", None)
+            if stop is not None:
+                stop()
+            self._auto = None
+
+    def _trace_thread_id(self) -> int:
+        """A small integer identifying the calling thread, stable for the run.
+
+        Spans store this rather than ``threading.get_ident()`` because the ident is a large
+        machine-specific number that would bloat every span and mean nothing to a reader —
+        and, more importantly, because **CPython reuses an ident once its thread has exited**.
+        Keying on it merged three sequential worker threads onto one lane, each apparently
+        doing all three threads' work: a confident wrong picture rather than a missing one.
+
+        Derived instead from the per-thread ``_ThreadState``, which ``threading.local()``
+        creates exactly once per thread and never recycles. The id is assigned on that
+        object's first phase and read from it thereafter, so this stays a single attribute
+        load on the hot path with no lock and no dictionary.
+        """
+        state = self._thread_state()
+        if state.trace_id < 0:
+            with self._thread_id_lock:
+                state.trace_id = self._next_thread_id
+                self._next_thread_id += 1
+        return state.trace_id
+
+    def signal(self, channel: str, key: object) -> None:
+        """Mark that the item ``key`` on ``channel`` is now available to other workers.
+
+        Pairs with :meth:`wait_on` in whichever process consumes it. The two together are
+        what let the timeline draw an arrow from a producer to the consumer that was blocked
+        on it — the difference between seeing that a worker idled and seeing *what it idled
+        for*. Call it right after the ``put``, ``send`` or file write that publishes the item.
+
+        ``key`` is stringified, so a step number, an id or a UUID all work; it only has to be
+        the same value on both sides. A no-op when tracing is off, at the cost of one
+        identity test, so the calls are safe to leave in permanently.
+        """
+        buffer = self._trace
+        if buffer is not None:
+            buffer.record_link(channel, str(key), "signal", self._trace_thread_id())
+
+    def wait_on(self, channel: str, key: object) -> None:
+        """Mark that this worker needed the item ``key`` on ``channel`` to continue.
+
+        Call it immediately *after* the blocking ``get`` or ``recv`` returns, so the
+        timestamp marks the moment the wait ended. An unmatched call is reported in the trace
+        as unmatched and never raises: half of a pipeline being instrumented is the normal
+        state of an incremental rollout, and it must cost you fewer arrows rather than a
+        crash.
+        """
+        buffer = self._trace
+        if buffer is not None:
+            buffer.record_link(channel, str(key), "wait", self._trace_thread_id())
 
     def _start_backend_window(self, window: tuple[int, int] | None, phase_name: str) -> None:
         """Arm the heavy-profiler window, if one was configured."""
@@ -827,7 +997,7 @@ class Profiler:
         for signum in _EXIT_SIGNALS:
             self._chain_signal(signum)
 
-    def _chain_signal(self, signum: signal.Signals) -> None:
+    def _chain_signal(self, signum: SignalNumber) -> None:
         """Install a flushing handler for one signal, preserving whatever was there."""
         try:
             previous = signal.getsignal(signum)
@@ -940,7 +1110,7 @@ class _ThreadState:
 
     __slots__ = (
         "names", "nodes", "paths", "sampled", "scale", "suppressed", "suppressor", "thread",
-        "tree",
+        "trace_id", "tree",
     )
 
     def __init__(self) -> None:
@@ -951,6 +1121,12 @@ class _ThreadState:
         self.nodes: list[PhaseStats] = [root]
         # Read once, on this thread's first phase, never on the hot path.
         self.thread: str = threading.current_thread().name
+        self.trace_id: int = -1
+        """Lane this thread's spans are drawn on; -1 until tracing assigns one.
+
+        Lives here rather than in a dict keyed by ``threading.get_ident()`` because that
+        ident is reused after a thread exits, which merged sequential threads onto one lane.
+        This object is created once per thread and never recycled."""
         self.suppressed: bool = False
         """Set while inside a sampled phase whose entry was not selected. Everything beneath
         records nothing: sampling a phase samples its whole subtree, or children would be
@@ -974,8 +1150,9 @@ class _PhaseScope:
     """Context manager for one phase entry. Allocated per call, so it nests safely."""
 
     __slots__ = (
-        "_cpu0", "_function", "_io", "_io0", "_name", "_profiler", "_self_io0", "_skipped",
-        "_state", "_stats", "_stride", "_sync", "_wall0",
+        "_cpu0", "_cpu_span", "_function", "_io", "_io0", "_name", "_profiler", "_self_io0",
+        "_skipped", "_state", "_stats", "_stride", "_sync", "_trace_path", "_trace_tid",
+        "_wall0", "_wall1",
     )
 
     def __init__(
@@ -998,6 +1175,10 @@ class _PhaseScope:
         self._stats: PhaseStats | None = None
         self._wall0 = 0
         self._cpu0 = 0
+        self._wall1 = 0
+        self._cpu_span = 0
+        self._trace_path: PhasePath | None = None
+        self._trace_tid = 0
         self._io0 = IoSnapshot()
         self._self_io0 = (0, 0)
         self._function: AbstractContextManager[object] | None = None
@@ -1028,6 +1209,11 @@ class _PhaseScope:
         state.nodes.append(self._stats)
         if self._stride != 1:
             state.scale *= self._stride
+        # Captured on entry because __exit__ pops the stack before it records: reading the
+        # path there would attribute the span to this phase's parent.
+        if self._profiler._trace is not None:
+            self._trace_path = path
+            self._trace_tid = self._profiler._trace_thread_id()
         window = self._profiler._window
         if window is not None:
             window.on_phase_enter(self._name)
@@ -1075,8 +1261,10 @@ class _PhaseScope:
             return  # the outermost skipped phase owns the flag and clears it
         if self._sync is not None:
             self._sync()  # first: the kernels this phase launched are part of its cost
-        wall = perf_counter_ns() - self._wall0
+        self._wall1 = perf_counter_ns()
+        wall = self._wall1 - self._wall0
         cpu = thread_time_ns() - self._cpu0 if self._profiler.measure_cpu else 0
+        self._cpu_span = cpu
         function = self._function
         if function is not None:
             function.__exit__(None, None, None)
@@ -1119,9 +1307,41 @@ class _PhaseScope:
         if self._io:
             self._record_io(stats, scale)
 
+        # The timeline. Every value here was already computed above for the aggregates, so
+        # this is a store, not a measurement — and it is skipped entirely on one identity
+        # test when tracing is off, which is the default.
+        buffer = self._profiler._trace
+        if buffer is not None:
+            self._record_span(buffer, state, scale)
+
         window = self._profiler._window
         if window is not None:
             window.on_phase_exit(self._name)
+
+    def _record_span(self, buffer: TraceBuffer, state: _ThreadState, scale: int) -> None:
+        """Append this entry to the trace ring.
+
+        Kept out of ``__exit__``'s body so the untraced path — the default — stays a single
+        identity test with no extra locals to set up.
+
+        A sampled phase records the entries it actually measured, flagged as sampled. It
+        deliberately does *not* fabricate the ``n-1`` entries it skipped: the aggregate
+        scales by stride because a total legitimately estimates, but a timeline draws
+        individual events and inventing spans that never happened would be a picture of a run
+        that did not occur.
+        """
+        path = self._trace_path if self._trace_path is not None else state.paths[-1]
+        phase_id = buffer.path_ids.get(path)
+        if phase_id is None:
+            phase_id = buffer.intern(path)
+        buffer.record(
+            phase_id=phase_id,
+            thread_id=self._trace_tid,
+            t0_ns=self._wall0,
+            t1_ns=self._wall1,
+            cpu_ns=self._cpu_span if self._profiler.measure_cpu else UNMEASURED,
+            flags=FLAG_SAMPLED if scale != 1 else 0,
+        )
 
     def _record_io(self, stats: PhaseStats, scale: int = 1) -> None:
         """Attribute the bytes this phase moved, measured at its own boundaries.
@@ -1299,6 +1519,29 @@ def count(name: str, n: int = 1) -> None:
         profiler.count(name, n)
 
 
+def signal_ready(channel: str, key: object) -> None:
+    """Publish ``key`` on ``channel`` for the installed profiler. See :meth:`Profiler.signal`.
+
+    Named ``signal_ready`` rather than ``signal`` because this module imports the stdlib
+    ``signal`` module, which the exit hooks depend on; the method on :class:`Profiler` keeps
+    the shorter name, where there is nothing to collide with.
+    """
+    profiler = _installed
+    if profiler is not None:
+        profiler.signal(channel, key)
+
+
+def wait_on(channel: str, key: object) -> None:
+    """Record that this worker blocked for ``key`` on ``channel``.
+
+    See :meth:`Profiler.wait_on`. A no-op when no profiler is installed, so the call is safe
+    to leave in library code that is only sometimes profiled.
+    """
+    profiler = _installed
+    if profiler is not None:
+        profiler.wait_on(channel, key)
+
+
 def current() -> str:
     """Return the deepest phase open on the installed profiler, or ``""`` when there is none.
 
@@ -1324,6 +1567,36 @@ def _resolve_enabled(enabled: bool | None) -> bool:
     if enabled is not None:
         return enabled
     return _truthy(os.environ.get(ENV_ENABLE, ""))
+
+
+def _resolve_trace(trace: bool | str | None) -> str:
+    """Resolve the trace mode to ``"off"``, ``"phases"`` or ``"auto"``.
+
+    Accepts the environment's string form and the constructor's boolean one, so a launcher
+    exporting ``LINEPROFILER_TRACE=auto`` and a caller passing ``trace=True`` land in the
+    same place. An unrecognised value raises rather than falling back to off: a typo in a
+    launcher script that silently disabled tracing would be found only by noticing an empty
+    timeline much later.
+    """
+    if trace is None:
+        raw = os.environ.get(ENV_TRACE, "").strip()
+        if not raw:
+            return "off"
+        trace = raw
+    if trace is True:
+        return "phases"
+    if trace is False:
+        return "off"
+    lowered = str(trace).strip().lower()
+    if lowered in {"auto", "functions"}:
+        return "auto"
+    if lowered in {"1", "true", "phases", "on", "yes"}:
+        return "phases"
+    if lowered in {"0", "false", "off", "no", ""}:
+        return "off"
+    raise ValueError(
+        f"trace must be True, False, 'phases' or 'auto', got {trace!r}",
+    )
 
 
 def _resolve_run_dir(run_dir: str | Path | None) -> Path:
@@ -1352,7 +1625,7 @@ def _truthy(value: str) -> bool:
     return bool(value.strip()) and value not in {"0", "false", "False"}
 
 
-def _propagate_to_children(run_dir: Path, run_id: str) -> list[str]:
+def _propagate_to_children(run_dir: Path, run_id: str, trace_mode: str = "off") -> list[str]:
     """Export the switch and run directory so child processes enable themselves.
 
     A worker started with ``spawn`` inherits the environment but not the parent's objects,
@@ -1372,6 +1645,12 @@ def _propagate_to_children(run_dir: Path, run_id: str) -> list[str]:
     "separate attempts" protection in :func:`_split_by_attempt` instead of providing it.
     """
     to_set = {ENV_ENABLE: "1", ENV_RUN_DIR: str(run_dir), ENV_RUN_ID: run_id}
+    if trace_mode != "off":
+        # Only exported when on, so a traced parent turns its children's timelines on too —
+        # a pipeline's lanes are useless with only one worker in them — while an untraced
+        # parent leaves the variable untouched rather than exporting an explicit "off" that
+        # would override a child's own setting.
+        to_set[ENV_TRACE] = trace_mode
     newly_set = [key for key in to_set if key not in os.environ]
     for key in newly_set:
         os.environ[key] = to_set[key]

@@ -4,6 +4,72 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0]
+
+The report could say *how much* time a phase spent waiting, but never *when*, or *for whom*.
+This release adds the view that answers that, and three ways to reach it that ask progressively
+more of your code — starting with none at all.
+
+### Added — a trace timeline: lanes on one clock, with arrows
+
+`lineprofiler trace <run_dir> -o trace.html` draws one lane per worker thread on a shared time
+axis: wait shading inside each span, GPU utilisation lanes beneath, arrows from a producer to
+the consumer it unblocked, and a **critical path** walked backwards through those arrows — the
+chain of spans that actually determined how long the run took.
+
+A phase tree is a set of totals, and a total has no position on a clock. So this records
+individual entries in a **fixed-capacity ring buffer** (`trace=True`, `trace_capacity=200_000`),
+which keeps memory flat over a twelve-hour run and reports how many spans it had to drop. A
+truncated timeline never renders as a complete one.
+
+Tracing is **off by default**. The phase tree is bounded; a timeline is not.
+
+Each lane is drawn as a small **flame chart**: one row per nesting level, so a phase called
+from inside another sits beneath its caller rather than on top of it, and a lane reads as a
+call structure instead of a list. A **Call order** table restates the same thing exactly —
+each lane's calls in the order they ran, indented by depth — because a dense lane collapses
+into a stripe on any chart. Nesting past eight levels folds onto the last row, and the number
+folded is stated.
+
+### Added — `signal()` / `wait_on()`, for cross-process causality
+
+Two calls at a queue boundary — `signal("batch", key)` where you publish, `wait_on("batch",
+key)` where you block — let the merge match a producer to the consumer it released. That is
+the only part of the timeline needing new calls, and it is one line per endpoint. An unmatched
+`wait_on` is reported on the page as unmatched, never raised: half a pipeline being
+instrumented is the normal state of an incremental rollout.
+
+### Added — `trace="auto"`, which needs no instrumentation at all
+
+Derives spans from function entry and exit via `sys.monitoring` (3.12+), scoped to your project
+by the same `.git`-rooted detection the line profiler uses — so stdlib, site-packages and this
+package itself stay out of the picture. A codebase with no `phase()` calls gets a timeline from
+`LINEPROFILER_TRACE=auto` and no diff whatsoever.
+
+It cannot measure CPU time: `thread_time_ns()` is a real syscall at ~590 ns, which is not
+affordable per function call. Those spans are drawn hatched and their wait reported as
+*unknown* — never as zero, which would read as "this never waited". Use it to find where the
+phases belong, then name them.
+
+### Changed — the trace page ships JavaScript; the other two still do not
+
+Pan and zoom over a hundred thousand spans cannot be done with static SVG. The timeline page
+inlines vanilla JS — still one file, no CDN, no webfont, no network — and asserts that
+separately. `report.html` and the source page remain script-free, and their tests are
+unchanged. Text reaches the page through `textContent`, never `innerHTML`: phase names come
+from user code, and a profiling artifact gets mailed around and opened by other people.
+
+### Notes
+
+- Spans are written to an append-only `<worker>.trace` sidecar, not into the worker snapshot.
+  The snapshot is complete state rewritten atomically; folding a span array into it would
+  rewrite tens of megabytes on every flush. A torn final line costs that batch and nothing
+  earlier.
+- `merge_run(..., with_trace=True)` is opt-in, so the existing report pays nothing for files
+  it does not draw.
+- Untraced phases are unaffected: the gate is one identity test, bounded by `test_overhead.py`.
+  Tracing adds roughly 1 µs per phase when on.
+
 ## [0.5.0]
 
 Four changes aimed at the same problem: the package was hard to adopt, hard to discover, and

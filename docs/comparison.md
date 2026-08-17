@@ -62,3 +62,31 @@ Verified against the `line_profiler` 5.0 changelog, the py-spy README, the Scale
 the VizTracer documentation. Last checked 2026-08. A comparison table that silently rots is
 the documentation equivalent of a wrong number — if you find a claim here that is out of
 date, please open an issue.
+
+## Trace timeline vs VizTracer / Perfetto / nsys
+
+`lineprofiler trace` overlaps their territory, so it is worth being explicit about where it
+stops.
+
+**Use the trace timeline when** the question is *which worker was idle, and who was it waiting
+for?* It is built for a multi-process pipeline: lanes on a shared clock across processes and
+hosts, wait-vs-work shading from measured CPU time, and arrows you declare at your own queue
+boundaries. It records aggregates by default and spans only when asked, so it can be left on.
+
+**Use VizTracer or Perfetto when** you need every call in one process at full fidelity, a
+flame graph over call stacks, or a UI with real search. VizTracer traces everything by
+default; that is its strength and the reason it is not something you leave running for twelve
+hours.
+
+**Use nsys or `torch.profiler` when** the answer is on the GPU — kernel timings, memory
+transfers, stream overlap. This package deliberately does not reimplement those:
+`backend="torch"` starts a Kineto capture for a bounded window, and `annotate=True` puts your
+phase names into an externally started nsys capture.
+
+What the trace timeline does **not** do:
+
+- No C extensions or kernels — a `torch` call is one opaque span.
+- No per-line detail; that is `LineProfiler`'s job.
+- `trace="auto"` measures wall time only, and says so on the page rather than implying zero
+  wait.
+- It is bounded by a ring buffer, so a long run keeps the most recent spans, not all of them.

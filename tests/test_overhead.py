@@ -62,6 +62,7 @@ BUDGET_NS = {
     "count": 1_600,
     "ambient_uninstalled": 1_600,
     "sampled": 6_000,
+    "traced": 20_000,
 }
 
 
@@ -261,3 +262,44 @@ def test_counting_stays_cheaper_than_a_sampled_phase(run_dir: Path) -> None:
         assert _per_call_ns(counting) < _per_call_ns(sampled)
     finally:
         profiler.close()
+
+
+def test_a_traced_phase_stays_under_budget(run_dir: Path) -> None:
+    """Tracing costs a store per phase, not a measurement: every value it records was already
+    computed for the aggregates."""
+    profiler = Profiler(
+        run_dir=run_dir, enabled=True, snapshot_interval_s=None,
+        sample_interval_s=None, trace=True,
+    )
+
+    def action() -> None:
+        with profiler.phase("p"):
+            pass
+
+    try:
+        assert _per_call_ns(action) < BUDGET_NS["traced"]
+    finally:
+        profiler.close()
+
+
+def test_tracing_costs_nothing_when_it_is_off(run_dir: Path) -> None:
+    """The default path must not pay for a feature it does not use.
+
+    Guarded as a ratio rather than an absolute: the untraced profiler is the baseline the rest
+    of this file already bounds, and what matters here is that adding the trace code to
+    ``_PhaseScope`` left it where it was. The gate is one identity test, so anything beyond
+    noise means the branch stopped being free.
+    """
+    untraced = Profiler(
+        run_dir=run_dir / "off", enabled=True, snapshot_interval_s=None,
+        sample_interval_s=None,
+    )
+
+    def action() -> None:
+        with untraced.phase("p"):
+            pass
+
+    try:
+        assert _per_call_ns(action) < BUDGET_NS["with_cpu"]
+    finally:
+        untraced.close()

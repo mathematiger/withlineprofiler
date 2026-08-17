@@ -40,6 +40,12 @@ def main() -> None:
             snapshot_interval_s=None,
             measure_cpu=False,
         )
+        traced = Profiler(
+            run_dir=run_dir + "/traced",
+            enabled=True,
+            snapshot_interval_s=None,
+            trace=True,
+        )
 
         def empty() -> None:
             pass
@@ -71,6 +77,13 @@ def main() -> None:
             with accounting.phase("p"):
                 pass
 
+        def phase_traced() -> None:
+            with traced.phase("p"):
+                pass
+
+        def signal_only() -> None:
+            traced.signal("batch", 1)
+
         print(f"\n=== accounting overhead ({ITERATIONS:,} iterations) ===")  # noqa: T201
         baseline = measure("baseline: empty function call", empty)
         measure("phase(), enabled=False", phase_disabled)
@@ -80,11 +93,15 @@ def main() -> None:
         measure("phase(io=True)", phase_with_io, iterations=ITERATIONS // 20)
         measure("count()", count_only)
         measure("phase(sample=0.01), skipped entry", phase_sampled)
+        # The timeline's cost, and the reason it is off by default. The untraced rows above
+        # are what a default profiler pays; this is what turning it on adds.
+        measure("phase(), trace=True", phase_traced)
+        measure("signal()", signal_only)
         accounting.uninstall_profiler()
         measure("accounting.phase(), nothing installed", phase_ambient_uninstalled)
         print(f"\n(baseline call overhead of {baseline:.0f} ns is included in every row)")  # noqa: T201
 
-        for profiler in (with_cpu, no_cpu):
+        for profiler in (with_cpu, no_cpu, traced):
             profiler.close()
 
 

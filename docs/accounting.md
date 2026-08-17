@@ -128,3 +128,40 @@ per-line memory are left to `torch.profiler`, VizTracer, memray and nsys. The GP
 reports utilisation — per device, and split into your run's share and everyone else's — which
 tells you *whether* the GPU is the constraint, never *which kernel* is. `backend="torch"` gets
 you that breakdown for a window.
+
+## The trace timeline
+
+Everything above records *aggregates* — how much, how many, how long on average. When the
+question is *when*, and *who was waiting for whom*, record a timeline instead:
+
+```python
+profiler = Profiler(run_dir="profile", role="actor", trace=True)
+```
+
+```
+lineprofiler trace profile/ -o trace.html
+```
+
+Off by default: the phase tree is bounded by design, and a timeline is not. When on, spans go
+to a fixed-capacity ring (`trace_capacity`, 200k by default) that keeps the newest and reports
+what it dropped.
+
+For arrows between processes, mark the two ends of a dependency:
+
+```python
+queue.put(batch)
+profiler.signal("batch", batch.id)
+
+with profiler.phase("queue_get"):
+    batch = queue.get()
+profiler.wait_on("batch", batch.id)
+```
+
+Both are no-ops when tracing is off, so they are safe to leave in permanently.
+
+With no `phase()` calls at all, `LINEPROFILER_TRACE=auto` derives spans from function calls in
+your project (3.12+). It cannot measure CPU time — the page marks those spans *unknown* rather
+than claiming they never waited — so treat it as a way to find where the phases belong.
+
+See [html-reports.md](html-reports.md) for what the page shows and
+[accounting-recipes.md](accounting-recipes.md) for reading it.
