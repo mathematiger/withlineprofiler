@@ -22,14 +22,21 @@ Drawing decisions worth knowing:
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from pathlib import Path
 
 from lineprofiler.accounting.analysis import analyse_processes
+from lineprofiler.accounting.findings import (
+    Finding,
+    PhaseTotal,
+    phase_totals,
+    rank_findings,
+)
 from lineprofiler.accounting.provenance import source_of
 from lineprofiler.accounting.report import format_ns
 from lineprofiler.accounting.snapshot import MergedRun
-from lineprofiler.accounting.trace import FLAG_AUTO
+from lineprofiler.accounting.trace import FLAG_AUTO, Origin
 from lineprofiler.accounting.tracealign import (
     AlignedTrace,
     PlacedSpan,
@@ -56,6 +63,10 @@ the span visible; the count of folded spans is reported in the caveats, never hi
 _MAX_SEQUENCE_ROWS = 40
 """Calls listed per lane in the sequence table. The chart holds the rest; the table is there
 to be read in order, and a few hundred rows of it would not be."""
+
+_MAX_SUMMARY_ROWS = 25
+"""Phases listed in the summary. Enough to cover what a run is made of; past it the table
+stops being a ranking and becomes a dump, and the embedded data block still carries them all."""
 
 
 def render_trace_html(
@@ -84,15 +95,23 @@ def render_trace_html(
     _warn_if_large(aligned, max_spans, say)
     chain = critical_path(aligned)
     say(f"critical path: {len(chain)} spans")
+    findings = rank_findings(aligned)
+    totals = phase_totals(aligned)
+    say(f"{len(findings)} finding(s) across {len(totals)} distinct phases")
     payload = _payload(aligned, chain, run, max_spans)
     omitted = payload["omitted"]
     if isinstance(omitted, int) and omitted:
         say(f"omitted {omitted:,} spans below the drawing cap")
+    # Conclusions first, evidence after. Someone opening this wants to know what is wrong
+    # before they are asked to read a chart; the timeline is where they go to confirm it,
+    # which is the opposite of the order the page used to impose on them.
     body = "\n".join([
         _header(aligned, title, run),
-        _lane_summary(aligned),
+        _findings_block(findings),
+        _phase_summary(totals, aligned),
         _canvas_block(),
         _critical_path_block(chain, aligned),
+        _lane_summary(aligned),
         _sequence_block(aligned),
         _caveats(aligned, omitted if isinstance(omitted, int) else 0),
     ])
@@ -272,23 +291,183 @@ def _sequence_row(span: PlacedSpan, origin: int) -> str:
     )
 
 
+def _findings_block(findings: list[Finding]) -> str:
+    """What is wrong with this run, ranked, at the top of the page.
+
+    The page used to open with a lane table and a canvas, which is evidence rather than a
+    conclusion: it required the reader to already know what a healthy run looks like. This
+    states the answer and lets the rest of the page justify it.
+
+    Each finding that names something on the timeline gets a button rather than a sentence
+    telling the reader to go and find it, so the connection between the claim and the picture
+    survives the reader not knowing the vocabulary yet.
+    """
+    if not findings:
+        return (
+            "<h2>Findings</h2>\n"
+            '<p class="note">No lane was idle for a large share of the run, no phase spent '
+            "most of its time blocked, and no single lane dominated. There is no obvious "
+            "bottleneck to name — the timeline below is still worth reading for the shape of "
+            "the run.</p>"
+        )
+    items = "".join(_finding_item(index, finding) for index, finding in enumerate(findings))
+    return (
+        "<h2>Findings</h2>\n"
+        '<p class="note">Ranked by how much of the traced span each one accounts for. '
+        "“Show on timeline” filters the chart below to what the finding is about.</p>\n"
+        f'<ol class="findings">{items}</ol>'
+    )
+
+
+def _finding_item(index: int, finding: Finding) -> str:
+    """One ranked finding: the claim, the evidence, and a way to see it."""
+    action = ""
+    if finding.is_actionable:
+        # data-* rather than an inline handler: the page has a Content-Security-Policy-shaped
+        # constraint of its own (no network, one file), and inline handlers would also mean
+        # building markup out of a phase name, which is the XSS this page is careful about.
+        action = (
+            f'<button type="button" class="tl-jump" data-anchor="{escape(finding.anchor)}">'
+            "show on timeline</button>"
+        )
+    return (
+        f'<li class="finding" data-kind="{escape(finding.kind)}">'
+        f'<div class="claim">{escape(finding.headline)}</div>'
+        f'<div class="why">{escape(finding.detail)}</div>'
+        f'<div class="act">{action}</div>'
+        "</li>"
+    )
+
+
+def _phase_summary(totals: list[PhaseTotal], aligned: AlignedTrace) -> str:
+    """Vampir's Function Summary: which phases the run is actually made of.
+
+    The timeline answers *when*; this answers *how much*, which is the question a reader
+    starts with and the one a timeline answers worst — a phase costing 40% of the run scattered
+    over ten thousand short calls is invisible on a chart and top of this table.
+
+    The bar is drawn in the same blend the chart uses, so a glance down the column separates
+    "expensive because it works" from "expensive because it waits" without reading a number.
+    """
+    if not totals:
+        return ""
+    widest = max(total.wall_ns for total in totals) or 1
+    # Shortened against what the listed rows share, so the column shows `envs/simulator.py`
+    # rather than the machine-specific prefix every row repeats.
+    root = _common_root(
+        [total.origin.file for total in totals if total.origin is not None],
+    )
+    rows = "".join(
+        _phase_row(total, widest, aligned, root) for total in totals[:_MAX_SUMMARY_ROWS]
+    )
+    omitted = len(totals) - _MAX_SUMMARY_ROWS
+    more = (
+        f'<p class="note">{omitted:,} further phase(s) are not listed; the embedded data '
+        "block carries them all.</p>"
+        if omitted > 0
+        else ""
+    )
+    return (
+        "<h2>Phase summary</h2>\n"
+        '<p class="note">Every phase by total wall time across all lanes. “self” excludes '
+        "time spent inside nested phases, so a wrapper does not out-rank the callee that "
+        "spent the time. Bar colour is the share of the phase spent blocked.</p>\n"
+        '<div class="scroll"><table><thead><tr><th>phase</th><th>calls</th><th>lanes</th>'
+        "<th>wall</th><th>self</th><th>blocked</th><th>share of run</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table></div>{more}"
+    )
+
+
+def _phase_row(
+    total: PhaseTotal,
+    widest: int,
+    aligned: AlignedTrace,
+    root: str = "",
+) -> str:
+    """One phase's totals, with a bar whose length is wall time and colour is its wait."""
+    share = 100.0 * total.wall_ns / aligned.duration_ns if aligned.duration_ns else 0.0
+    width = 100.0 * total.wall_ns / widest
+    blocked = "n/a" if total.wait_pct < 0 else f"{total.wait_pct:.0f}%"
+    colour = _wait_colour(total.wait_pct)
+    where = (
+        f'<div class="src">{escape(_relative_to(total.origin.file, root))}'
+        f":{total.origin.line}</div>"
+        if total.origin is not None
+        else ""
+    )
+    return (
+        f'<tr><td class="mono">{escape(total.path)}{where}</td>'
+        f"<td>{total.calls:,}</td><td>{total.lanes}</td>"
+        f"<td>{escape(format_ns(total.wall_ns))}</td>"
+        f"<td>{escape(format_ns(total.self_ns))}</td>"
+        f"<td>{blocked}</td>"
+        f'<td class="barcell"><span class="bar" style="width:{width:.1f}%;'
+        f'background:{colour}"></span><span class="barnum">{share:.1f}%</span></td></tr>'
+    )
+
+
+def _wait_colour(wait_pct: float) -> str:
+    """The chart's blend as a CSS colour: reddish is working, blue is blocked.
+
+    Duplicated from the script deliberately — the table is server-rendered and the canvas is
+    not, and a reader comparing the two must never see them disagree. The constants are the
+    same ones :func:`_SCRIPT`'s ``waitColour`` uses.
+    """
+    if wait_pct < 0:
+        return "var(--muted)"
+    fraction = max(0.0, min(1.0, wait_pct / 100.0))
+    red = round(0xB2 + (0x2F - 0xB2) * fraction)
+    green = round(0x3C + (0x6F - 0x3C) * fraction)
+    blue = round(0x17 + (0x9F - 0x17) * fraction)
+    return f"rgb({red},{green},{blue})"
+
+
 def _canvas_block() -> str:
     """The timeline itself, drawn by the inlined script into a canvas."""
+    # The legend is markup rather than something the script paints, so it is readable before
+    # the canvas has drawn and survives the reader printing the page. What each control does
+    # is on the control, not in a paragraph underneath it that gets skipped.
+    legend = (
+        '<div class="tl-legend">'
+        '<span class="key"><i class="sw" style="background:rgb(178,60,23)"></i>'
+        "on CPU</span>"
+        '<span class="key"><i class="sw" style="background:rgb(47,111,159)"></i>'
+        "blocked</span>"
+        '<span class="key"><i class="sw grad"></i>the blend between them</span>'
+        '<span class="key"><i class="sw hatch"></i>CPU not measured</span>'
+        '<span class="key"><i class="sw crit"></i>critical path</span>'
+        '<span class="key"><i class="sw arrow"></i>signal → the wait it released</span>'
+        "</div>"
+    )
     return (
         "<h2>Timeline</h2>\n"
+        '<p class="note">One row per worker thread, all on the same clock. Each bar is one '
+        "call; its width is wall time and its colour is how much of that time was spent "
+        "blocked rather than running. A gap is a lane with nothing open at all.</p>\n"
+        f"{legend}\n"
         '<div class="tl-controls">'
         '<button type="button" id="tl-reset">reset zoom</button>'
-        '<button type="button" id="tl-critical">show critical path</button>'
-        '<button type="button" id="tl-brush" aria-pressed="false">select a range</button>'
+        '<button type="button" id="tl-critical" aria-pressed="false">'
+        "only the critical path</button>"
+        '<button type="button" id="tl-brush" aria-pressed="false">'
+        "measure a range</button>"
         '<span class="note" id="tl-range"></span>'
         "</div>\n"
         '<div id="tl-wrap"><canvas id="tl-canvas"></canvas>'
         '<div id="tl-tip" hidden></div></div>\n'
-        '<p class="note" id="tl-selection"></p>\n'
-        '<p class="note">Drag to pan, scroll to zoom, hover for detail, click a span to '
-        "trace what it was waiting for. Width is wall time; colour is the share of it spent "
-        'waiting rather than running. Use “select a range” to ask what every other lane was '
-        "doing during a wait — the difference between a stall and a queue.</p>"
+        '<div class="note" id="tl-selection"></div>\n'
+        '<div class="note" id="tl-focus"></div>\n'
+        '<p class="note"><strong>Drag</strong> to pan · <strong>scroll</strong> to zoom · '
+        "<strong>hover</strong> for the exact figures · <strong>click a span</strong> to pin "
+        "it: everything not causally upstream of it dims, and the panel names who released "
+        "it · <strong>click it again</strong> to unpin. <strong>Click a lane's label</strong> "
+        "to fold it to a single row — its spans stay drawn, they just stop claiming a row "
+        "each. “Measure a range” answers what every lane was doing over a window you drag — "
+        "the difference between a stall and a queue.</p>\n"
+        '<p class="note">With the chart focused: <span class="mono">← →</span> pan · '
+        '<span class="mono">+ −</span> zoom · <span class="mono">n p</span> step along the '
+        'critical path · <span class="mono">0</span> reset · <span class="mono">Esc</span> '
+        "unpin.</p>"
     )
 
 
@@ -300,6 +479,7 @@ def _critical_path_block(chain: list[PlacedSpan], aligned: AlignedTrace) -> str:
     """
     if not chain:
         return ""
+    root = _common_root([span.origin.file for span in chain if span.origin is not None])
     rows = []
     for index, span in enumerate(chain):
         following = chain[index - 1] if index else None
@@ -308,9 +488,15 @@ def _critical_path_block(chain: list[PlacedSpan], aligned: AlignedTrace) -> str:
             idle = following.t0_ns - span.t1_ns
             if idle > 0:
                 gap = f"{format_ns(idle)} idle after"
+        where = (
+            f'<div class="src">{escape(_relative_to(span.origin.file, root))}'
+            f":{span.origin.line}</div>"
+            if span.origin is not None
+            else ""
+        )
         rows.append(
             f"<tr><td>{escape(span.worker)}</td>"
-            f"<td>{escape('/'.join(span.path))}</td>"
+            f"<td>{escape('/'.join(span.path))}{where}</td>"
             f"<td>{escape(format_ns(span.duration_ns))}</td>"
             f"<td>{'n/a' if span.wait_pct < 0 else f'{span.wait_pct:.0f}%'}</td>"
             f"<td>{escape(gap)}</td></tr>",
@@ -373,6 +559,12 @@ def _caveats(aligned: AlignedTrace, omitted: int = 0) -> str:
             f"the last row rather than their own, so at that depth a bar may be overlapped by "
             "a deeper one. Their times are unaffected.",
         )
+    if any(span.origin is not None for span in aligned.spans):
+        items.append(
+            "Source locations name where a function is defined — its def line — not the line "
+            "inside it that blocked. A span covers a whole call, so the line that spent the "
+            "time is not recorded and is not claimed here.",
+        )
     unmeasured = sum(1 for span in aligned.spans if not span.cpu_measured)
     if unmeasured:
         items.append(
@@ -400,6 +592,7 @@ def _payload(
     drawn, omitted = _spans_to_draw(aligned.spans, max_spans)
     lane_index = {lane: index for index, lane in enumerate(aligned.lanes)}
     critical = {id(span) for span in chain}
+    origins, origin_index = _origin_table(drawn)
 
     return {
         "run_id": str(run.metadata.get("run_id", "unknown")),
@@ -425,9 +618,11 @@ def _payload(
                 "y": min(span.depth, _MAX_DEPTH_DRAWN),
                 "a": 1 if span.flags & FLAG_AUTO else 0,
                 "c": 1 if id(span) in critical else 0,
+                "o": origin_index.get(span.origin, -1),
             }
             for span in drawn
         ],
+        "origins": origins,
         "arrows": [
             {
                 "s": arrow.src_worker,
@@ -440,6 +635,71 @@ def _payload(
         ],
         "gpu": _gpu_series(run, aligned),
     }
+
+
+def _origin_table(
+    spans: list[PlacedSpan],
+) -> tuple[list[JsonValue], dict[Origin | None, int]]:
+    """Intern the distinct source locations the drawn spans refer to.
+
+    A table plus an index per span, not a location per span: the same function appears in
+    thousands of spans, and repeating its path in each would dominate the page. Spans with no
+    origin — every named phase — map to ``-1`` and render without a location rather than with
+    an invented one.
+
+    Paths are shortened against their common root so the tooltip shows ``envs/env.py`` rather
+    than a hundred characters of absolute path that pushes the useful part off the edge. The
+    root is reported alongside, so a shortened path is still resolvable to a real file.
+    """
+    distinct = [span.origin for span in spans if span.origin is not None]
+    unique: list[Origin] = list(dict.fromkeys(distinct))
+    if not unique:
+        return [], {}
+
+    root = _common_root([item.file for item in unique])
+    index: dict[Origin | None, int] = {item: position for position, item in enumerate(unique)}
+    table: list[JsonValue] = [
+        {
+            "f": _relative_to(item.file, root),
+            "n": item.function,
+            "l": item.line,
+            "full": item.file,
+        }
+        for item in unique
+    ]
+    return table, index
+
+
+def _common_root(files: list[str]) -> str:
+    """The deepest directory every file shares, or ``""`` when they share none.
+
+    Always the common *directory*, never a file: several functions of one module give
+    ``commonpath`` a list whose entries are all the same path, and it returns that file — so
+    every location would shorten to ``.`` and the module name would vanish from the page.
+
+    Guarded rather than trusted: ``commonpath`` raises on a mix of absolute and relative
+    paths, which a run spanning a real module and a ``<string>`` entry point produces.
+    Falling back to no shortening shows longer paths, never wrong ones.
+    """
+    if not files:
+        return ""
+    try:
+        common = os.path.commonpath(files)
+    except ValueError:
+        return ""
+    if common in files:
+        return os.path.dirname(common)
+    return common
+
+
+def _relative_to(file: str, root: str) -> str:
+    """``file`` shown against ``root``, falling back to the full path when it is not under it."""
+    if not root:
+        return file
+    try:
+        return os.path.relpath(file, root)
+    except ValueError:
+        return file
 
 
 def _spans_to_draw(
@@ -500,6 +760,56 @@ def _device_samples(run: MergedRun, index: int) -> list[tuple[float, float]]:
 
 
 _STYLE = """
+.findings { list-style: none; counter-reset: finding; margin: 0; padding: 0; }
+.finding {
+  counter-increment: finding; position: relative; background: var(--panel);
+  border: 1px solid var(--rule); border-left: 3px solid var(--accent); border-radius: 6px;
+  padding: .7rem .9rem .7rem 2.6rem; margin: 0 0 .5rem;
+}
+.finding::before {
+  content: counter(finding); position: absolute; left: .9rem; top: .7rem;
+  font-variant-numeric: tabular-nums; font-weight: 600; color: var(--accent);
+}
+.finding .claim { font-weight: 600; }
+.finding .why { color: var(--muted); font-size: .87rem; margin-top: .2rem; }
+.finding .act:not(:empty) { margin-top: .45rem; }
+.finding[data-kind="idle-lane"] { border-left-color: var(--cool); }
+.finding[data-kind="idle-lane"]::before { color: var(--cool); }
+.tl-jump {
+  font: inherit; font-size: .78rem; padding: .2rem .55rem; cursor: pointer;
+  background: var(--bg); color: var(--fg); border: 1px solid var(--rule); border-radius: 5px;
+}
+.tl-jump:hover { border-color: var(--accent); color: var(--accent); }
+.barcell { min-width: 9rem; }
+.bar {
+  display: inline-block; height: .62rem; border-radius: 2px; vertical-align: middle;
+  min-width: 2px;
+}
+.barnum { color: var(--muted); font-size: .78rem; margin-left: .4rem; }
+.tl-legend {
+  display: flex; flex-wrap: wrap; gap: .5rem 1.1rem; margin: 0 0 .7rem;
+  font-size: .8rem; color: var(--muted);
+}
+.tl-legend .key { display: inline-flex; align-items: center; gap: .35rem; }
+.tl-legend .sw {
+  display: inline-block; width: .95rem; height: .62rem; border-radius: 2px;
+}
+.tl-legend .grad {
+  background: linear-gradient(90deg, rgb(178,60,23), rgb(47,111,159)); width: 2.4rem;
+}
+.tl-legend .hatch {
+  background: repeating-linear-gradient(
+    45deg, var(--muted) 0 1px, transparent 1px 4px
+  );
+  border: 1px solid var(--rule);
+}
+.tl-legend .crit { background: transparent; border: 2px solid var(--accent); }
+.tl-legend .arrow { background: var(--cool); height: 2px; border-radius: 0; }
+#tl-focus:not(:empty) {
+  background: var(--panel); border: 1px solid var(--rule); border-radius: 6px;
+  padding: .5rem .7rem; margin-top: .5rem;
+}
+#tl-focus .lead { color: var(--fg); font-weight: 600; }
 .tl-controls { display: flex; gap: .6rem; align-items: center; margin: 0 0 .6rem; }
 .tl-controls button {
   font: inherit; font-size: .8rem; padding: .25rem .6rem; cursor: pointer;
@@ -519,6 +829,16 @@ _STYLE = """
 }
 #tl-tip .p { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 #tl-tip .crit { color: var(--accent); font-weight: 600; }
+#tl-tip .src, #tl-focus .src {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: .75rem; color: var(--muted); word-break: break-all;
+}
+/* The same location line inside a table cell: secondary to the phase name above it, so it
+   reads as an annotation on that row rather than as another column. */
+td .src {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: .72rem; color: var(--muted); font-weight: 400; margin-top: .1rem;
+}
 """
 
 # Vanilla, inlined, no build step and no dependency. Kept deliberately small: pan, zoom,
@@ -531,6 +851,7 @@ _SCRIPT = r"""
   if (!raw) { return; }
   var data = JSON.parse(raw.textContent.replace(/<\\\//g, '</'));
   var spans = data.spans || [], lanes = data.lanes || [], arrows = data.arrows || [];
+  var origins = data.origins || [];
   var gpu = data.gpu || [];
   if (!spans.length) { return; }
 
@@ -541,18 +862,35 @@ _SCRIPT = r"""
   var ROW_H = 15, LANE_PAD = 8, PAD_L = 132, PAD_T = 26, GPU_H = 34;
   var total = data.duration_us || 1;
   var view = { t0: 0, t1: total };
-  var onlyCritical = false, hover = null, focus = null;
+  var onlyCritical = false, hover = null, focus = null, chain = null;
   var brushing = false, brushFrom = null, brushTo = null;
   var selectionLabel = document.getElementById('tl-selection');
+  var focusPanel = document.getElementById('tl-focus');
 
   // Each lane is as tall as it is deep: one row per nesting level, so a callee is drawn
-  // under its caller instead of over it. Computed once — every y on the page reads it.
+  // under its caller instead of over it. Every y on the page reads these tables.
+  //
+  // Recomputed rather than computed once, because a lane can now be collapsed: with sixteen
+  // actors the chart is taller than any screen and the reader cannot see the learner and an
+  // actor at the same time, which is exactly the comparison they opened it to make. A
+  // collapsed lane keeps its slot and its spans — they fold onto one row — so collapsing
+  // never hides activity, it only stops giving it a row of its own.
   var laneTop = [], laneH = [], lanesBottom = PAD_T;
-  for (var li = 0; li < lanes.length; li++) {
-    var rows = lanes[li].rows || 1;
-    laneTop[li] = lanesBottom;
-    laneH[li] = rows * ROW_H + LANE_PAD;
-    lanesBottom += laneH[li];
+  var collapsed = {};
+  function layout() {
+    lanesBottom = PAD_T;
+    for (var li = 0; li < lanes.length; li++) {
+      var rows = collapsed[li] ? 1 : (lanes[li].rows || 1);
+      laneTop[li] = lanesBottom;
+      laneH[li] = rows * ROW_H + LANE_PAD;
+      lanesBottom += laneH[li];
+    }
+  }
+  layout();
+
+  // Which row a span lands on: its own depth normally, row 0 when its lane is folded.
+  function rowOf(sp) {
+    return collapsed[sp.l] ? 0 : (sp.y || 0);
   }
 
   function css(name) {
@@ -592,6 +930,15 @@ _SCRIPT = r"""
     if (cls) { node.className = cls; }
     node.textContent = text;
     return node;
+  }
+
+  // Spans index into the origin table rather than carrying a path each: the same function
+  // appears in thousands of them. -1, and any index the table does not hold, means no
+  // location was recorded — a named phase has no code object behind it.
+  function originOf(sp) {
+    var at = sp.o;
+    if (at === undefined || at < 0 || at >= origins.length) { return null; }
+    return origins[at];
   }
 
   function fmt(us) {
@@ -698,7 +1045,10 @@ _SCRIPT = r"""
   function drawLaneLabel(i, width, fg, muted, rule) {
     var y = laneTop[i];
     ctx.fillStyle = fg;
-    var label = lanes[i].id;
+    // The disclosure marker doubles as the affordance: a lane that can be folded looks
+    // foldable, and one already folded says so without the reader having to count rows.
+    var marker = (lanes[i].rows || 1) > 1 ? (collapsed[i] ? '▸ ' : '▾ ') : '  ';
+    var label = marker + lanes[i].id;
     if (label.length > 20) { label = label.slice(0, 19) + '…'; }
     ctx.fillText(label, 6, y + 9);
     ctx.fillStyle = muted;
@@ -711,11 +1061,15 @@ _SCRIPT = r"""
 
   function drawSpan(sp, width) {
     if (onlyCritical && !sp.c) { return; }
+    // Dimmed, never hidden: a reader tracing a chain still needs to see what else was running
+    // to judge whether the gap around it was a queue or an empty machine.
+    var offChain = chain && !chain[spanKey(sp)];
+    if (offChain) { ctx.globalAlpha = 0.15; }
     var x0 = xOf(sp.t, width), x1 = xOf(sp.t + sp.d, width);
     if (x1 < PAD_L || x0 > width) { return; }
     x0 = Math.max(x0, PAD_L);
     var w = Math.max(x1 - x0, 1);
-    var y = laneTop[sp.l] + (sp.y || 0) * ROW_H + 3, h = ROW_H - 3;
+    var y = laneTop[sp.l] + rowOf(sp) * ROW_H + 3, h = ROW_H - 3;
     var colour = waitColour(sp.w);
     if (colour === null) {
       // Unmeasured CPU: hatched, so it can never be mistaken for a span that never waited.
@@ -739,13 +1093,14 @@ _SCRIPT = r"""
       ctx.strokeStyle = css('--fg'); ctx.lineWidth = 2;
       ctx.strokeRect(x0, y, w, h); ctx.lineWidth = 1;
     }
-    if (w > 34) {
+    if (w > 34 && !offChain) {
       var name = sp.n.split('/').pop();
       if (name.length * 6 < w - 6) {
         ctx.fillStyle = '#ffffff';
         ctx.fillText(name, x0 + 4, y + h / 2);
       }
     }
+    ctx.globalAlpha = 1;
   }
 
   function laneOf(worker) {
@@ -822,7 +1177,7 @@ _SCRIPT = r"""
     var t = tOf(px, width);
     for (var i = 0; i < spans.length; i++) {
       var sp = spans[i];
-      if (sp.l !== lane || (sp.y || 0) !== row) { continue; }
+      if (sp.l !== lane || rowOf(sp) !== row) { continue; }
       if (sp.t <= t && sp.t + sp.d >= t) { return sp; }
     }
     return null;
@@ -844,6 +1199,13 @@ _SCRIPT = r"""
     tip.appendChild(named('div', '', lanes[sp.l].id + ' · ' + lanes[sp.l].role));
     tip.appendChild(named('div', '', 'duration ' + fmt(sp.d)));
     tip.appendChild(named('div', '', 'waiting ' + waitText));
+    var org = originOf(sp);
+    if (org) {
+      // The function's definition site, not the line that blocked: a span covers a whole
+      // call, so naming one line inside it would claim more than was measured.
+      tip.appendChild(named('div', 'src', org.n + '()'));
+      tip.appendChild(named('div', 'src', org.f + ':' + org.l));
+    }
     if (sp.c) { tip.appendChild(named('div', 'crit', 'on the critical path')); }
     tip.hidden = false;
     var x = event.clientX - box.left + 14, y = event.clientY - box.top + 14;
@@ -851,7 +1213,152 @@ _SCRIPT = r"""
     tip.style.left = x + 'px'; tip.style.top = y + 'px';
   });
   el.addEventListener('mouseleave', function () { tip.hidden = true; hover = null; });
-  el.addEventListener('click', function () { focus = (focus === hover) ? null : hover; draw(); });
+  el.addEventListener('click', function (event) {
+    // The label gutter and the chart answer different clicks. Folding a lane from its own
+    // label is where a reader looks for it; putting it in the toolbar would mean naming the
+    // lane in a menu, which is the thing they were already pointing at.
+    var box = el.getBoundingClientRect();
+    if (event.clientX - box.left < PAD_L) {
+      var lane = laneAtY(event.clientY - box.top);
+      if (lane >= 0 && (lanes[lane].rows || 1) > 1) {
+        collapsed[lane] = !collapsed[lane];
+        layout();
+        resize();
+      }
+      return;
+    }
+    focus = (focus === hover) ? null : hover;
+    describeFocus();
+    draw();
+  });
+
+  // What a click is *for*. The outline alone told the reader their click had registered and
+  // nothing else; the question they clicked to ask was "why was this span waiting", and the
+  // trace already knows — the arrows name the producer, and the other lanes say what was
+  // running. Answering it here is what makes the timeline traceable rather than decorative.
+  function describeFocus() {
+    focusPanel.textContent = '';
+    chain = focus ? causalChain(focus) : null;
+    if (!focus) { return; }
+    var lane = lanes[focus.l] || { id: '?', role: '' };
+    focusPanel.appendChild(named('div', 'lead', focus.n + ' on ' + lane.id));
+
+    var line = fmt(focus.d) + ' wall';
+    if (focus.w >= 0) {
+      line += ', ' + focus.w.toFixed(0) + '% of it blocked';
+    } else {
+      line += ', CPU time not measured so its wait is unknown';
+    }
+    focusPanel.appendChild(named('div', '', line));
+
+    // The full path here rather than the shortened one: this panel is what a reader copies
+    // into an editor, and a path relative to a root they have to infer is not that.
+    var org = originOf(focus);
+    if (org) {
+      focusPanel.appendChild(named('div', 'src',
+        'defined at ' + (org.full || org.f) + ':' + org.l + ' in ' + org.n + '()'));
+    }
+
+    var release = releasingArrow(focus);
+    if (release) {
+      focusPanel.appendChild(named('div', '',
+        'released by ' + release.s + ' via ' + release.ch + ', ' +
+        fmt(Math.max(0, release.t1 - release.t0)) + ' before this span ended'));
+    } else if (focus.w > 50) {
+      focusPanel.appendChild(named('div', '',
+        'no signal/wait_on pair covers this wait, so who released it was not recorded'));
+    }
+
+    var busy = concurrentLanes(focus);
+    if (busy.length) {
+      focusPanel.appendChild(named('div', '', 'while it ran: ' + busy.join(', ')));
+    } else {
+      focusPanel.appendChild(named('div', '',
+        'no other lane had a phase open while it ran — a stall, not a queue'));
+    }
+    focusPanel.appendChild(named('div', '', 'click the span again to unpin.'));
+  }
+
+  // Every span causally upstream of the focused one, walked back through the arrows: the
+  // producer that released it, whatever released *that*, and so on. This is what "trace what
+  // it was waiting for" was always supposed to mean — a pinned span with a dimmed background
+  // shows the chain that led to it rather than just the span itself.
+  //
+  // Bounded by a visited set, because a cycle in recorded links is not hypothetical: two
+  // workers that each wait on the other produce one, and an unbounded walk would hang the
+  // page rather than draw a wrong picture.
+  function causalChain(sp) {
+    if (!sp) { return null; }
+    var members = {};
+    var queue = [sp];
+    var guard = 0;
+    members[spanKey(sp)] = true;
+    while (queue.length && guard++ < 4000) {
+      var current = queue.shift();
+      var release = releasingArrow(current);
+      if (!release) { continue; }
+      // The producer's span is whatever was open on its lane when it signalled.
+      for (var i = 0; i < spans.length; i++) {
+        var other = spans[i];
+        var lane = lanes[other.l];
+        if (!lane || lane.id.split('#')[0] !== release.s) { continue; }
+        if (other.t > release.t0 || other.t + other.d < release.t0) { continue; }
+        var key = spanKey(other);
+        if (members[key]) { continue; }
+        members[key] = true;
+        queue.push(other);
+      }
+    }
+    return members;
+  }
+
+  function spanKey(sp) {
+    return sp.l + ':' + sp.t + ':' + sp.n;
+  }
+
+  // The arrow that landed on this span's lane during its life, newest first: that is the
+  // signal the waiter was released by.
+  function releasingArrow(sp) {
+    var lane = lanes[sp.l];
+    if (!lane) { return null; }
+    var worker = lane.id.split('#')[0];
+    var best = null;
+    for (var i = 0; i < arrows.length; i++) {
+      var a = arrows[i];
+      if (a.d !== worker) { continue; }
+      if (a.t1 < sp.t || a.t1 > sp.t + sp.d) { continue; }
+      if (!best || a.t1 > best.t1) { best = a; }
+    }
+    return best;
+  }
+
+  // Which other lanes had a phase open while this span ran, as a share of its duration. The
+  // stall-versus-queue question for one span, answered without the reader dragging a range.
+  function concurrentLanes(sp) {
+    var from = sp.t, to = sp.t + sp.d;
+    if (to <= from) { return []; }
+    var byLane = {};
+    for (var i = 0; i < spans.length; i++) {
+      var other = spans[i];
+      if (other.l === sp.l) { continue; }
+      var lo = Math.max(other.t, from), hi = Math.min(other.t + other.d, to);
+      if (hi <= lo) { continue; }
+      var key = lanes[other.l] ? lanes[other.l].id : String(other.l);
+      if (!byLane[key]) { byLane[key] = []; }
+      byLane[key].push([lo, hi]);
+    }
+    var parts = [];
+    for (var name in byLane) {
+      if (!Object.prototype.hasOwnProperty.call(byLane, name)) { continue; }
+      parts.push([name, 100 * covered(byLane[name]) / (to - from)]);
+    }
+    parts.sort(function (a, b) { return b[1] - a[1]; });
+    var shown = [];
+    for (var k = 0; k < parts.length && k < 4; k++) {
+      shown.push(parts[k][0] + ' ' + parts[k][1].toFixed(0) + '%');
+    }
+    return shown;
+  }
 
   var dragging = false, dragX = 0, dragT = 0;
   el.addEventListener('mousedown', function (event) {
@@ -902,8 +1409,40 @@ _SCRIPT = r"""
   }, { passive: false });
 
   document.getElementById('tl-reset').addEventListener('click', function () {
-    view.t0 = 0; view.t1 = total; focus = null; draw();
+    view.t0 = 0; view.t1 = total; focus = null;
+    describeFocus();
+    draw();
   });
+
+  // The findings section names a lane or a phase; these buttons carry that name down to the
+  // chart. Zooming to the widest matching span rather than merely highlighting it, because a
+  // finding about a phase buried at 4% of the way through a five-minute run is not visible
+  // at full zoom, and a reader told to "look at queue_get" with no way to get there is being
+  // given a homework assignment rather than an answer.
+  function jumpTo(anchor) {
+    var best = null;
+    for (var i = 0; i < spans.length; i++) {
+      var sp = spans[i];
+      var lane = lanes[sp.l] ? lanes[sp.l].id : '';
+      if (sp.n !== anchor && lane !== anchor) { continue; }
+      if (!best || sp.d > best.d) { best = sp; }
+    }
+    if (!best) { return; }
+    var pad = Math.max(best.d * 0.5, total * 0.01);
+    view.t0 = best.t - pad;
+    view.t1 = best.t + best.d + pad;
+    focus = best;
+    describeFocus();
+    draw();
+    wrap.scrollIntoView({ block: 'center' });
+  }
+
+  var jumps = document.getElementsByClassName('tl-jump');
+  for (var j = 0; j < jumps.length; j++) {
+    jumps[j].addEventListener('click', function (event) {
+      jumpTo(event.currentTarget.getAttribute('data-anchor'));
+    });
+  }
   var criticalButton = document.getElementById('tl-critical');
   criticalButton.addEventListener('click', function () {
     onlyCritical = !onlyCritical;
@@ -917,6 +1456,67 @@ _SCRIPT = r"""
     if (!brushing) { brushFrom = null; brushTo = null; selectionLabel.textContent = ''; }
     draw();
   });
+
+  // Keyboard navigation. A canvas is not reachable by keyboard at all without this, so the
+  // whole chart was mouse-only — and stepping the critical path one span at a time is the
+  // fastest way to read it even with a mouse, because each step re-centres and re-pins.
+  //
+  // Bound to the canvas rather than the document, and only after it is focused, so arrow keys
+  // still scroll the page while the reader is anywhere else on it.
+  el.tabIndex = 0;
+  el.addEventListener('keydown', function (event) {
+    var span = view.t1 - view.t0;
+    var handled = true;
+    if (event.key === 'ArrowLeft') {
+      view.t0 -= span * 0.15; view.t1 -= span * 0.15;
+    } else if (event.key === 'ArrowRight') {
+      view.t0 += span * 0.15; view.t1 += span * 0.15;
+    } else if (event.key === '+' || event.key === '=') {
+      zoomBy(0.8);
+    } else if (event.key === '-' || event.key === '_') {
+      zoomBy(1.25);
+    } else if (event.key === 'n' || event.key === 'p') {
+      stepCritical(event.key === 'n' ? 1 : -1);
+    } else if (event.key === 'Escape') {
+      focus = null; chain = null; describeFocus();
+    } else if (event.key === '0') {
+      view.t0 = 0; view.t1 = total;
+    } else {
+      handled = false;
+    }
+    if (handled) { event.preventDefault(); draw(); }
+  });
+
+  function zoomBy(factor) {
+    var middle = (view.t0 + view.t1) / 2;
+    var span = (view.t1 - view.t0) * factor;
+    if (span > total * 4 || span < 0.05) { return; }
+    view.t0 = middle - span / 2;
+    view.t1 = middle + span / 2;
+  }
+
+  // Walking the critical path in recorded order, centring each span. The chain is the ordered
+  // answer to "what set this run's length", and reading it off the chart otherwise means
+  // hunting for outlined bars across lanes that may be far apart vertically.
+  function stepCritical(direction) {
+    var path = [];
+    for (var i = 0; i < spans.length; i++) {
+      if (spans[i].c) { path.push(spans[i]); }
+    }
+    if (!path.length) { return; }
+    path.sort(function (a, b) { return a.t - b.t; });
+    var index = -1;
+    for (var k = 0; k < path.length; k++) {
+      if (path[k] === focus) { index = k; break; }
+    }
+    index = (index + direction + path.length) % path.length;
+    var target = path[index];
+    focus = target;
+    var pad = Math.max(target.d * 0.6, total * 0.005);
+    view.t0 = target.t - pad;
+    view.t1 = target.t + target.d + pad;
+    describeFocus();
+  }
 
   window.addEventListener('resize', resize);
   resize();

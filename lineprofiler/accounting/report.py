@@ -12,10 +12,18 @@ from dataclasses import dataclass
 from typing import Any
 
 from lineprofiler.accounting.analysis import (
+    CpuUsage,
     SampleAnalysis,
     analyse_processes,
     format_bytes,
     sparkline,
+)
+from lineprofiler.accounting.findings import Finding, rank_findings
+from lineprofiler.accounting.hardware import (
+    format_capacity,
+)
+from lineprofiler.accounting.hardware import (
+    total_vram as hardware_total_vram,
 )
 from lineprofiler.accounting.phasetree import PhasePath, PhaseStats, PhaseTree
 from lineprofiler.accounting.provenance import source_of
@@ -53,7 +61,11 @@ def render(run: MergedRun) -> str:
     analysis = analyse_processes(run.samples_by_process())
     aligned = _aligned_or_none(run)
     occupancy = role_occupancy(aligned) if aligned is not None else {}
-    blocks = [_header(run)]
+    blocks = [
+        _header(run),
+        _findings_block(rank_findings(aligned) if aligned is not None else []),
+        _resources_block(analysis, run),
+    ]
     for role in run.roles:
         blocks.append(_role_block(run, role, occupancy.get(role), aligned))
     blocks.append(_lifecycle_block(aligned))
@@ -120,10 +132,70 @@ def report_as_dict(run: MergedRun) -> dict[str, Any]:
             "stale": [worker.label for worker in _stale_workers(run)],
         },
     }
+    # Findings are part of the document rather than a rendering of it: a CI gate asking
+    # "did this run regress into a queue" needs the verdict, not the prose that explains it.
+    aligned = _aligned_or_none(run)
+    if aligned is not None:
+        findings = rank_findings(aligned)
+        if findings:
+            document["findings"] = [_finding_as_dict(finding) for finding in findings]
+
     samples = run.samples_by_process()
-    if samples:
-        document["resources"] = _resources_as_dict(analyse_processes(samples))
+    analysis = analyse_processes(samples) if samples else None
+    if analysis is not None:
+        document["resources"] = _resources_as_dict(analysis)
+    # A separate key from ``resources``, which is already published and holds the io/memory/gpu
+    # breakdown. This one answers "what did it run on and how does that scale", and appears
+    # only when something is actually known.
+    machine = _machine_as_dict(analysis, run)
+    if machine:
+        document["machine"] = machine
     return document
+
+
+def _finding_as_dict(finding: Finding) -> dict[str, Any]:
+    """One ranked finding as data, carrying the figure a gate would threshold on.
+
+    ``cost_pct`` is share of the traced span and is the same denominator for every kind, which
+    is what lets a gate compare an idle lane against a blocked phase at all.
+    """
+    return {
+        "kind": finding.kind,
+        "headline": finding.headline,
+        "detail": finding.detail,
+        "cost_pct": round(finding.cost_pct, 2),
+        "anchor": finding.anchor,
+        "lanes": list(finding.lanes),
+    }
+
+
+def _machine_as_dict(analysis: SampleAnalysis | None, run: MergedRun) -> dict[str, Any]:
+    """Consumption and capacity as data, with the per-process denominator stated alongside.
+
+    ``capacity_by_host`` stays keyed rather than flattened so a script can see a heterogeneous
+    run for what it is, the same reason the text report prints one footnote line per host.
+    """
+    machine: dict[str, Any] = {}
+    processes = max(len(run.workers), 1)
+    if analysis is not None and (analysis.cpu.measured or analysis.memory.peak_rss):
+        machine["used"] = {
+            "processes": processes,
+            "cpu_cores_peak": analysis.cpu.peak if analysis.cpu.measured else None,
+            "cpu_cores_mean": analysis.cpu.mean if analysis.cpu.measured else None,
+            "cpu_cores_max_process": analysis.cpu.max_process if analysis.cpu.measured else None,
+            "rss_peak": analysis.memory.peak_rss,
+            "rss_max_process": analysis.peak_rss_max_process,
+            "vram_peak": analysis.peak_cuda_alloc,
+            "per_process": {
+                "cpu_cores": analysis.cpu.peak / processes if analysis.cpu.measured else None,
+                "rss": analysis.memory.peak_rss / processes,
+                "vram": analysis.peak_cuda_alloc / processes,
+            },
+        }
+    by_host = run.hardware_by_host
+    if by_host:
+        machine["capacity_by_host"] = by_host
+    return machine
 
 
 def _phases_as_list(tree: PhaseTree) -> list[dict[str, Any]]:
@@ -246,6 +318,155 @@ def _hosts_line(run: MergedRun) -> str:
         return f"Hosts {', '.join(hosts)} ({len(hosts)} nodes){suffix}"
     single = hosts[0] if hosts else str(run.metadata.get("host", "?"))
     return f"Host {single}{suffix}"
+
+
+def _resources_block(analysis: SampleAnalysis, run: MergedRun) -> str:
+    """What the run consumed, what the machines had, and how both scale per worker.
+
+    Placed first because it is the frame every later number is read against. A phase costing
+    "675 ms over 2 processes" means something different on a 128-core node than on a laptop,
+    and two reports from two servers cannot be compared at all without it.
+
+    Test specifically:
+        - a run with no samples and no hardware renders nothing rather than a header of zeros
+        - a run whose samples carry no CPU reading omits the CPU rows and says why
+        - worker files written before hardware was recorded omit the available column
+        - two hosts with different capacity produce one footnote line each
+    """
+    capacity = pooled_capacity(run)
+    rows = _resource_rows(analysis, run, capacity)
+    # Capacity alone still earns the section: a run recorded with sampling off knows nothing
+    # about its consumption and everything about the machine, and naming that machine is what
+    # makes its timings comparable against another server's.
+    if not rows and not capacity:
+        return ""
+    lines = ["", "RESOURCES", _RULE]
+    if rows:
+        lines.append(f"{'':<20}{'used':>12}{'available':>14}{'per proc':>14}")
+        lines.extend(rows)
+    return "\n".join([*lines, *_resource_notes(analysis, run, measured=bool(rows))])
+
+
+def _resource_rows(
+    analysis: SampleAnalysis,
+    run: MergedRun,
+    capacity: dict[str, Any],
+) -> list[str]:
+    """One row per resource that has something to report, in CPU / RAM / VRAM order."""
+    processes = max(len(run.workers), 1)
+    rows: list[str] = []
+    if analysis.cpu.measured:
+        rows.extend(_cpu_rows(analysis.cpu, capacity, processes))
+    if analysis.memory.peak_rss:
+        rows.append(_resource_row(
+            "RAM  peak RSS",
+            format_bytes(analysis.memory.peak_rss),
+            format_bytes(capacity["ram_total"]) if capacity.get("ram_total") else "",
+            format_bytes(analysis.memory.peak_rss / processes),
+        ))
+    if analysis.peak_cuda_alloc:
+        vram = hardware_total_vram(capacity.get("gpus", []))
+        rows.append(_resource_row(
+            "VRAM peak alloc",
+            format_bytes(analysis.peak_cuda_alloc),
+            format_bytes(vram) if vram else "",
+            format_bytes(analysis.peak_cuda_alloc / processes),
+        ))
+    gpus = capacity.get("gpus") or []
+    if gpus:
+        rows.append(f"{'GPU  devices':<20}{'':>12}{len(gpus):>14}")
+    return rows
+
+
+def _cpu_rows(cpu: CpuUsage, capacity: dict[str, Any], processes: int) -> list[str]:
+    """Peak and mean core-equivalents. Peak carries the capacity, since that is the ceiling."""
+    # The affinity figure when the job was constrained, the box's cores otherwise: on a shared
+    # node the machine's total overstates the headroom this run actually had.
+    available = capacity.get("cpu_affinity") or capacity.get("cpu_cores")
+    return [
+        _resource_row(
+            "CPU  peak",
+            f"{cpu.peak:.1f} cores",
+            f"{available} cores" if available else "",
+            f"{cpu.peak / processes:.2f}",
+        ),
+        _resource_row(
+            "CPU  mean",
+            f"{cpu.mean:.1f} cores",
+            _percent_of(cpu.mean, available),
+            f"{cpu.mean / processes:.2f}",
+        ),
+    ]
+
+
+def _resource_row(label: str, used: str, available: str, per_process: str) -> str:
+    """One aligned row. An empty ``available`` leaves the column blank rather than zeroed."""
+    return f"{label:<20}{used:>12}{available:>14}{per_process:>14}"
+
+
+def _percent_of(used: float, available: float | None) -> str:
+    """``used`` as a share of ``available``, or ``""`` when there is nothing to divide by.
+
+    Absent capacity must suppress the figure entirely. Dividing by a missing field, or
+    substituting a default for it, invents a utilisation the run never demonstrated.
+    """
+    if not available:
+        return ""
+    return f"({used / available * 100:.0f}% of box)"
+
+
+def pooled_capacity(run: MergedRun) -> dict[str, Any]:
+    """Sum every participating host's capacity into one machine-shaped dict.
+
+    Summed across the hosts that actually ran workers, never one node's figures multiplied by
+    the node count: a run spanning a fat node and a thin one has neither node's capacity, and
+    guessing which to scale would misstate the headroom in whichever direction it guessed.
+    """
+    pooled: dict[str, Any] = {}
+    gpus: list[dict[str, Any]] = []
+    for hardware in run.hardware_by_host.values():
+        for key in ("cpu_cores", "cpu_threads", "cpu_affinity", "ram_total"):
+            value = hardware.get(key)
+            if value:
+                pooled[key] = pooled.get(key, 0) + int(value)
+        gpus.extend(hardware.get("gpus") or [])
+    if gpus:
+        pooled["gpus"] = gpus
+    return pooled
+
+
+def _resource_notes(analysis: SampleAnalysis, run: MergedRun, measured: bool = True) -> list[str]:
+    """The denominators, the machines, and any resource that went unmeasured.
+
+    ``measured`` is False when the section has no consumption rows at all, which suppresses
+    the per-process denominator: there is nothing above it for that denominator to divide.
+    """
+    notes: list[str] = []
+    by_host = run.hardware_by_host
+    for host, hardware in list(by_host.items())[:4]:
+        summary = format_capacity(hardware)
+        if summary:
+            notes.append(f"  {host}: {summary}")
+    if len(by_host) > 4:
+        notes.append(f"  +{len(by_host) - 4} further hosts")
+    if not by_host:
+        notes.append("  (machine capacity was not recorded for this run)")
+
+    processes = max(len(run.workers), 1)
+    if measured:
+        roles = ", ".join(f"{role} x{len(run.workers_of(role))}" for role in run.roles)
+        suffix = f" ({roles})" if roles else ""
+        notes.append(f"  per-proc figures are over {processes} process(es){suffix}")
+    if analysis.memory.peak_rss and analysis.peak_rss_max_process:
+        notes.append(
+            f"  heaviest process held {format_bytes(analysis.peak_rss_max_process)} RSS"
+            f" against a {format_bytes(analysis.memory.peak_rss / processes)} mean",
+        )
+    # Only worth saying when the run sampled at all: a run with sampling switched off is not
+    # missing a CPU capability, it declined to measure anything.
+    if measured and not analysis.cpu.measured:
+        notes.append("  (no CPU readings in this run's samples; install psutil to record them)")
+    return [""] + notes if notes else []
 
 
 def _aligned_or_none(run: MergedRun) -> AlignedTrace | None:
@@ -457,15 +678,25 @@ def _dominant_rows(tree: PhaseTree, limit: int = 6) -> list[str]:
     estimates, and every other number in this report is measured. A row whose phase declared
     ``async_work=True`` is prefixed with ``†``: its wall time is submission time, not the cost
     of the work it started. A phase that is both carries both marks.
+
+    ``entries`` is how many times the phase was entered — ``PhaseStats.calls``, which every
+    phase increments on the way out whether or not anyone asked for it. Printing it makes a
+    ``count()`` whose amount is always 1 redundant, which was the common shape of one: before
+    this column a counter was the only way to get the number onto the page at all. What a
+    counter still earns is an amount that *varies*, which nothing here can infer.
     """
     ranked = sorted(tree.items(), key=lambda item: -item[1].self_ns)
-    rows = [f"{'DOMINANT PHASES':<28}{'self':>12}{'wait':>8}{'p50':>10}{'p99':>10}"]
+    rows = [
+        f"{'DOMINANT PHASES':<25}{'entries':>7}{'self':>12}"
+        f"{'wait':>8}{'p50':>10}{'p99':>10}",
+    ]
     for path, stats in ranked[:limit]:
         if not path or stats.self_ns <= 0:
             continue
         mark = _marks_of(stats)
         rows.append(
-            f"{mark}{_label(path):<{28 - len(mark)}}{format_ns(stats.self_ns):>12}"
+            f"{mark}{_label(path, 25 - len(mark)):<{25 - len(mark)}}{stats.calls:>7,}"
+            f"{format_ns(stats.self_ns):>12}"
             f"{wait_share(stats):>7.0f}%"
             f"{format_ns(stats.hist.quantile(0.5)):>10}"
             f"{format_ns(stats.hist.quantile(0.99)):>10}",
@@ -608,6 +839,46 @@ def _counter_spread(name: str, stats: PhaseStats | None) -> str:
     if low == high:
         return f"  always {low:,}"
     return f"  {low:,}..{high:,}"
+
+
+def _findings_block(findings: list[Finding]) -> str:
+    """What is wrong with this run, ranked, before any of the numbers behind it.
+
+    The same derivation the HTML timeline uses, so the terminal and the page can never
+    disagree about what the bottleneck was — the reason this lives in ``findings.py`` rather
+    than in either renderer.
+
+    Silent on a run with no trace: findings come from spans, and a phase tree alone cannot say
+    who was waiting for whom. That is a real limit rather than an omission, and inventing a
+    weaker finding from totals would put a sentence at the top of the report that the rest of
+    it could not support.
+    """
+    if not findings:
+        return ""
+    lines = ["", "FINDINGS", _RULE]
+    for index, finding in enumerate(findings, start=1):
+        lines.append(f"{index}. {finding.headline}")
+        # Wrapped rather than truncated: the detail carries the queue-versus-stall verdict,
+        # which is the half a reader cannot reconstruct from the headline.
+        lines.extend(f"   {line}" for line in _wrapped(finding.detail, _WIDTH - 3))
+    return "\n".join(lines)
+
+
+def _wrapped(text: str, width: int) -> list[str]:
+    """Break ``text`` on spaces to fit ``width``, so the block keeps the report's column."""
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if len(candidate) > width and current:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
 
 
 def _lifecycle_block(aligned: AlignedTrace | None) -> str:
@@ -1020,8 +1291,21 @@ def _degraded_rows(run: MergedRun) -> list[str]:
     return rows
 
 
-def _label(path: PhasePath) -> str:
-    """Render a phase path compactly: the leaf, with its parent when that disambiguates."""
-    if len(path) == 1:
-        return path[0]
-    return format_label(f"{path[-2]}/{path[-1]}", 27)
+def _label(path: PhasePath, field: int = 25) -> str:
+    """Render a phase path compactly: the leaf, with its parent when that disambiguates.
+
+    ``field`` is the column width the caller will pad into, and the label is truncated one
+    column narrower so the padding always leaves a gap before the next heading. The caller
+    passes a field already reduced by the width of any ``~``/``†`` marks it prefixes: those
+    marks eat into the same columns, and truncating to a fixed width regardless of them
+    pushed a two-mark row one column wider than every other.
+
+    At the default the limit is 24, which is what an ordinary ``parent/leaf`` pair costs:
+    ``iteration/backpropagate``, ``select/score_children`` and ``learner/optimizer_step`` all
+    fit. No width fits every name — ``trainer/gradient_accumulation`` is 29 — but this is where
+    the returns stop: a truncated label is the one column a reader cannot reconstruct from the
+    others, and the names that still exceed it are long enough that their leaf is the only part
+    worth printing anyway.
+    """
+    text = path[0] if len(path) == 1 else f"{path[-2]}/{path[-1]}"
+    return format_label(text, field - 1)

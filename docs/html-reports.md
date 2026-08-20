@@ -80,6 +80,7 @@ Two choices worth knowing:
 | `lineprofiler trace <dir> -o trace.html` | the timeline page |
 | `lineprofiler trace <dir> --max-spans N` | cap what is drawn, keeping the longest spans |
 | `lineprofiler trace <dir> -q` | suppress the stderr progress lines |
+| `lineprofiler trace <dir> --fail-over N` | exit non-zero if any finding costs more than N% of the run |
 
 `--output`/`-o` writes to a path instead of stdout. It does not create parent directories: on
 a command line a path that does not exist is usually a typo, and failing loudly beats
@@ -97,7 +98,32 @@ structurally cannot: *why was this worker idle at that moment, and who was it wa
 A phase tree can say `queue_get` was 80% wait; only a timeline can show that the wait began
 the instant the learner finished and ended when actor 3 finally published its batch.
 
-The page carries:
+The page is ordered as conclusions first, evidence after — you should know what is wrong
+before you are asked to read a chart:
+
+- **Findings**, ranked by how much of the run each one cost. This is the page's answer:
+  "`iteration/queue_get` spent 100% of its time blocked, costing 54% of the run — released by
+  `actor` on a recorded signal/wait_on pair, so this is a queue, not a hang." Each finding
+  that names something on the chart carries a **show on timeline** button that zooms to it, so
+  the claim and the picture stay connected.
+
+  The queue-versus-stall verdict prefers *recorded* evidence to inference: a matched
+  `signal`/`wait_on` pair names the producer outright, and only in its absence does the page
+  fall back to asking how busy everyone else was during the wait. That fallback is hedged in
+  the wording, because a producer working in short bursts across a long wait scores low
+  against it while genuinely producing throughout.
+
+  A parent phase that does nothing but call a blocking child is *not* reported separately: it
+  inherits all of its child's wait, and saying it twice pushes the real second-place finding
+  off the list. A run with nothing wrong says so rather than inventing a finding.
+
+- **A phase summary** — Vampir's Function Summary, in this package's vocabulary. Every phase
+  by total wall time across all lanes, with a `self` column excluding time inside nested
+  phases, so a wrapper never out-ranks the callee that actually spent the time. The bar is
+  drawn in the same blend as the chart, so scanning the column separates "expensive because it
+  works" from "expensive because it waits" without reading a number. This is the fastest route
+  to *what should I fix*: a phase costing 40% of the run scattered over ten thousand short
+  calls is invisible on a timeline and top of this table.
 
 - **One lane per worker thread, on a shared clock.** Idle time is drawn as absence, so a
   starved worker reads as a row full of gaps.
@@ -118,6 +144,48 @@ The page carries:
   *is* the waiting.
 - **GPU utilisation lanes** from the 1 Hz sampler, so an empty CPU lane can be checked against
   a busy or idle device.
+
+### Reading the timeline
+
+A legend sits above the chart rather than in a footnote under it, because a reader who has to
+scroll past the chart to learn what its colours mean will read the chart wrong first. It names
+all five conventions: on-CPU red, blocked blue, the blend between them, hatched grey for spans
+whose CPU time was never measured, and the outline for the critical path.
+
+What the controls do is written on the controls. What a **click** does is stated before you
+click: it pins the span and fills a panel underneath with who released it (from the arrows),
+how much of it was blocked, and what every other lane was doing while it ran — the
+stall-versus-queue question answered for one span without dragging a range. Clicking it again
+unpins.
+
+| gesture | what it does |
+|---|---|
+| drag | pan |
+| scroll | zoom about the cursor |
+| hover | exact figures for one span |
+| click a span | pin it; everything not causally upstream dims, and the panel names who released it |
+| click a lane label | fold that lane to one row — its spans stay drawn, they stop claiming a row each |
+| measure a range | what every lane was doing over a window you drag |
+
+With the chart focused, it also drives from the keyboard — a canvas has no keyboard
+affordance at all unless one is given to it:
+
+| key | what it does |
+|---|---|
+| `←` `→` | pan |
+| `+` `−` | zoom |
+| `n` `p` | step forward/back along the critical path, re-centring and pinning each span |
+| `0` | reset the zoom |
+| `Esc` | unpin |
+
+Stepping the critical path with `n` is the fastest way to read it even with a mouse: the
+chain is the ordered answer to *what set this run's length*, and hunting for outlined bars
+across lanes that may be far apart vertically is not.
+
+Folding matters once a run has more than a handful of workers. With sixteen actors the chart
+is taller than any screen, so the learner and an actor cannot be seen at once — which is
+usually the exact comparison the page was opened to make. A folded lane keeps its slot and
+its spans; it never hides activity.
 
 ### This page ships JavaScript
 

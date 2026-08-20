@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from lineprofiler.accounting import Backend, Profiler, merge_run, render
+from lineprofiler.accounting import hardware as hardware_module
 from lineprofiler.accounting import sampler as sampler_module
 from lineprofiler.accounting.analysis import (
     analyse,
@@ -25,7 +26,13 @@ from lineprofiler.accounting.backend import BackendWindow
 from lineprofiler.accounting.cli import main as cli_main
 from lineprofiler.accounting.compare import compare, comparison_as_dict, render_comparison
 from lineprofiler.accounting.phasetree import PhaseStats
-from lineprofiler.accounting.report import _gpu_block
+from lineprofiler.accounting.report import (
+    _dominant_rows,
+    _gpu_block,
+    _percent_of,
+    pooled_capacity,
+    report_as_dict,
+)
 from lineprofiler.accounting.sampler import ResourceSampler, Sample, _compact, read_samples
 from lineprofiler.accounting.snapshot import imbalance_of, new_run_id
 from lineprofiler.accounting.trace import FLAG_ASYNC_UNSYNCED
@@ -102,6 +109,56 @@ def test_report_shows_a_block_per_role(tmp_path: Path) -> None:
     assert "DOMINANT PHASES" in text
 
 
+def test_report_shows_entry_counts_without_any_counter(tmp_path: Path) -> None:
+    """The entries column comes from ``PhaseStats.calls``, which every phase records itself.
+
+    This is what makes a ``count()`` that only counts entries deletable: the number it was
+    added to expose is on the row already, for free and without the call.
+    """
+    profiler = Profiler(
+        run_dir=tmp_path, role="actor", enabled=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    for _ in range(7):
+        with profiler.phase("step"):
+            time.sleep(0.001)
+    profiler.close()
+
+    rows = render(merge_run(tmp_path)).split("\n")
+    header = next(row for row in rows if row.startswith("DOMINANT PHASES"))
+    step = next(row for row in rows if row.startswith("step"))
+
+    assert "entries" in header
+    assert len(step) == len(header)
+    assert step.split()[:2] == ["step", "7"]
+    assert not any(row.lstrip().startswith("+ ") for row in rows)
+
+
+def test_marked_rows_keep_the_column_width_of_an_unmarked_one() -> None:
+    """A ``~``/``†`` prefix eats into the label field, so the label must truncate to match.
+
+    Truncating to a fixed width regardless of the marks printed a two-mark row one column
+    wider than its neighbours, which is only visible once a label is long enough to be cut.
+    """
+    def stats(stride: int = 0, async_entries: int = 0) -> PhaseStats:
+        one = PhaseStats(
+            calls=100, wall_ns=10_000_000, cpu_ns=10_000_000,
+            sample_stride=stride, async_entries=async_entries,
+        )
+        one.hist.observe(100_000)
+        return one
+
+    tree: dict[tuple[str, ...], PhaseStats] = {
+        ("iteration", "a_long_enough_phase_name"): stats(),
+        ("iteration", "b_long_enough_phase_name"): stats(stride=10),
+        ("iteration", "c_long_enough_phase_name"): stats(async_entries=100),
+        ("iteration", "d_long_enough_phase_name"): stats(stride=10, async_entries=100),
+    }
+    header, *rows = _dominant_rows(tree)[: len(tree) + 1]
+
+    assert all(len(row) == len(header) for row in rows), rows
+
+
 def test_imbalance_of_known_totals() -> None:
     class _Worker:
         def __init__(self, wall_ns: int) -> None:
@@ -155,7 +212,7 @@ def test_sampler_reports_which_capabilities_are_available(tmp_path: Path) -> Non
     profiler.close()
 
     assert isinstance(capabilities.describe(), str)
-    assert set(capabilities.as_dict()) == {"memory", "io", "cuda", "gpu_util"}
+    assert set(capabilities.as_dict()) == {"memory", "io", "cpu", "cuda", "gpu_util"}
 
 
 def test_written_bytes_are_reported_within_a_band(tmp_path: Path) -> None:
@@ -1268,3 +1325,271 @@ def test_a_phase_with_no_gpu_reading_is_not_given_a_row() -> None:
     samples = [Sample(t=float(i), phase="cpu_only", rss=1000) for i in range(3)]
 
     assert analyse_processes([samples]).gpu_by_phase == {}
+
+
+# --- CPU sampling and the resource inventory -------------------------------------------
+
+
+def test_cpu_readings_become_core_equivalents() -> None:
+    """psutil reports percent-of-one-core; the report speaks in cores."""
+    samples = [Sample(t=float(i), phase="train", cpu_percent=percent)
+               for i, percent in enumerate((100.0, 300.0, 200.0))]
+
+    cpu = analyse_processes([samples]).cpu
+
+    assert cpu.measured
+    assert cpu.peak == pytest.approx(3.0)
+    assert cpu.mean == pytest.approx(2.0)
+
+
+def test_unmeasured_cpu_rows_are_skipped_rather_than_read_as_idle() -> None:
+    """The -1.0 sentinel must not drag the mean down; absent is not zero."""
+    measured = [Sample(t=float(i), phase="train", cpu_percent=200.0) for i in range(3)]
+    with_gaps = [*measured, Sample(t=9.0, phase="train"), Sample(t=10.0, phase="train")]
+
+    assert analyse_processes([with_gaps]).cpu.mean == pytest.approx(
+        analyse_processes([measured]).cpu.mean,
+    )
+
+
+def test_a_run_with_no_cpu_readings_is_flagged_unmeasured() -> None:
+    """Zero cores and no measurement must be distinguishable."""
+    samples = [Sample(t=float(i), phase="train", rss=1000) for i in range(3)]
+
+    cpu = analyse_processes([samples]).cpu
+
+    assert not cpu.measured
+    assert cpu.peak == 0.0
+
+
+def test_an_idle_process_is_measured_at_zero_not_dropped() -> None:
+    """0.0 is a real reading. Only -1.0 means the counter was never read."""
+    samples = [Sample(t=float(i), phase="wait", cpu_percent=0.0) for i in range(3)]
+
+    assert analyse_processes([samples]).cpu.measured
+
+
+def test_cpu_is_pooled_per_process_and_keeps_the_heaviest() -> None:
+    """Peaks sum across processes; max_process names the worst single one."""
+    busy = [Sample(t=float(i), phase="train", cpu_percent=400.0) for i in range(3)]
+    light = [Sample(t=float(i), phase="train", cpu_percent=100.0) for i in range(3)]
+
+    cpu = analyse_processes([busy, light]).cpu
+
+    assert cpu.peak == pytest.approx(5.0)
+    assert cpu.max_process == pytest.approx(4.0)
+
+
+def test_the_zero_cpu_sample_survives_the_compact_round_trip() -> None:
+    """An idle reading must reach the file; only the sentinel is dropped."""
+    assert _compact(Sample(t=1.0, phase="p", cpu_percent=0.0))["cpu_percent"] == 0.0
+    assert "cpu_percent" not in _compact(Sample(t=1.0, phase="p"))
+
+
+def test_peak_rss_records_the_heaviest_single_process() -> None:
+    """The run total sums; this is what says whether one worker carries it."""
+    fat = [Sample(t=float(i), phase="train", rss=900) for i in range(3)]
+    thin = [Sample(t=float(i), phase="train", rss=100) for i in range(3)]
+
+    analysis = analyse_processes([fat, thin])
+
+    assert analysis.memory.peak_rss == 1000
+    assert analysis.peak_rss_max_process == 900
+
+
+def test_hardware_degrades_to_empty_without_psutil_or_nvml(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An inventory that cannot be read is absent, never a machine with no cores."""
+    monkeypatch.setattr(hardware_module, "psutil_module", lambda: None)
+    monkeypatch.setattr(hardware_module, "nvml_module", lambda: None)
+    monkeypatch.setattr(os, "sched_getaffinity", None, raising=False)
+    hardware_module.reset_cache()
+
+    assert hardware_module.describe() == {}
+    hardware_module.reset_cache()
+
+
+def test_hardware_reports_cpu_when_only_psutil_is_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One missing capability costs one field, not the whole inventory."""
+    fake = SimpleNamespace(
+        cpu_count=lambda logical=True: 256 if logical else 128,
+        virtual_memory=lambda: SimpleNamespace(total=64 * 1024**3),
+    )
+    monkeypatch.setattr(hardware_module, "psutil_module", lambda: fake)
+    monkeypatch.setattr(hardware_module, "nvml_module", lambda: None)
+    hardware_module.reset_cache()
+
+    described = hardware_module.describe()
+    hardware_module.reset_cache()
+
+    assert described["cpu_cores"] == 128
+    assert described["cpu_threads"] == 256
+    assert described["ram_total"] == 64 * 1024**3
+    assert "gpus" not in described
+
+
+def test_a_device_name_arriving_as_bytes_is_decoded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Older nvidia-ml-py returns bytes; the page must not render b'...'."""
+    nvml = SimpleNamespace(
+        nvmlDeviceGetCount=lambda: 1,
+        nvmlDeviceGetHandleByIndex=lambda index: index,
+        nvmlDeviceGetName=lambda handle: b"NVIDIA A100-SXM4-80GB",
+        nvmlDeviceGetMemoryInfo=lambda handle: SimpleNamespace(total=80 * 1024**3),
+    )
+    monkeypatch.setattr(hardware_module, "psutil_module", lambda: None)
+    monkeypatch.setattr(hardware_module, "nvml_module", lambda: nvml)
+    hardware_module.reset_cache()
+
+    gpus = hardware_module.describe()["gpus"]
+    hardware_module.reset_cache()
+
+    assert gpus == [{"index": 0, "name": "NVIDIA A100-SXM4-80GB", "vram_total": 80 * 1024**3}]
+
+
+def test_each_device_keeps_its_own_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A closure over the loop variable used to give every device the last one's name."""
+    names = {0: "A100", 1: "L40S"}
+    nvml = SimpleNamespace(
+        nvmlDeviceGetCount=lambda: 2,
+        nvmlDeviceGetHandleByIndex=lambda index: index,
+        nvmlDeviceGetName=lambda handle: names[handle],
+        nvmlDeviceGetMemoryInfo=lambda handle: SimpleNamespace(total=1024),
+    )
+    monkeypatch.setattr(hardware_module, "psutil_module", lambda: None)
+    monkeypatch.setattr(hardware_module, "nvml_module", lambda: nvml)
+    hardware_module.reset_cache()
+
+    gpus = hardware_module.describe()["gpus"]
+    hardware_module.reset_cache()
+
+    assert [gpu["name"] for gpu in gpus] == ["A100", "L40S"]
+
+
+def test_a_device_that_cannot_be_addressed_does_not_lose_the_others(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handle_by_index(index: int) -> int:
+        if index == 0:
+            raise RuntimeError("device unavailable")
+        return index
+
+    nvml = SimpleNamespace(
+        nvmlDeviceGetCount=lambda: 2,
+        nvmlDeviceGetHandleByIndex=handle_by_index,
+        nvmlDeviceGetName=lambda handle: "L40S",
+        nvmlDeviceGetMemoryInfo=lambda handle: SimpleNamespace(total=1024),
+    )
+    monkeypatch.setattr(hardware_module, "psutil_module", lambda: None)
+    monkeypatch.setattr(hardware_module, "nvml_module", lambda: nvml)
+    hardware_module.reset_cache()
+
+    gpus = hardware_module.describe()["gpus"]
+    hardware_module.reset_cache()
+
+    assert [gpu["index"] for gpu in gpus] == [1]
+
+
+def test_the_affinity_figure_is_named_only_when_it_differs() -> None:
+    """On an unconstrained box the two are equal; printing both invites a false distinction."""
+    constrained = hardware_module.format_capacity({"cpu_cores": 128, "cpu_affinity": 60})
+    whole = hardware_module.format_capacity({"cpu_cores": 128, "cpu_affinity": 128})
+
+    assert "60 available to this job" in constrained
+    assert whole == "128 cores"
+
+
+def test_mixed_device_models_are_listed_separately() -> None:
+    gpus = [{"name": "A100"}, {"name": "A100"}, {"name": "L40S"}]
+
+    assert hardware_module.format_gpu_models(gpus) == "2x A100, 1x L40S"
+
+
+def _run_with_hardware(tmp_path: Path, per_host: list[tuple[str, dict[str, object]]]) -> object:
+    """A merged run whose workers carry exactly the given per-host capacity.
+
+    The hardware is overwritten rather than added to: these tests run on a real machine, whose
+    own inventory would otherwise leak in and make the assertions depend on the test host.
+    """
+    run_id = new_run_id()
+    for _ in range(max(len(per_host), 1)):
+        _run_worker(tmp_path, "actor", {"work": 0.01}, run_id=run_id)
+    run = merge_run(tmp_path)
+    for worker in run.workers:
+        worker.hardware = {}
+    for worker, (host, hardware) in zip(run.workers, per_host, strict=False):
+        worker.placement = {**worker.placement, "host": host}
+        worker.hardware = hardware
+    return run
+
+
+def test_a_run_knowing_neither_capacity_nor_usage_omits_the_section(tmp_path: Path) -> None:
+    """Nothing to say is said with silence, not with a header full of blanks."""
+    run = _run_with_hardware(tmp_path, [])
+
+    assert "RESOURCES" not in render(run)  # type: ignore[arg-type]
+
+
+def test_capacity_alone_still_names_the_machine(tmp_path: Path) -> None:
+    """Sampling off means no consumption rows, but the machine is still worth stating: it is
+    what makes this run's timings comparable against another server's."""
+    run = _run_with_hardware(tmp_path, [("node01", {"cpu_cores": 64})])
+
+    text = render(run)  # type: ignore[arg-type]
+
+    assert "RESOURCES" in text
+    assert "node01: 64 cores" in text
+    # No consumption was measured, so no denominator is offered for one.
+    assert "per-proc figures" not in text
+
+
+def test_the_report_names_each_host_and_its_capacity(tmp_path: Path) -> None:
+    run = _run_with_hardware(
+        tmp_path,
+        [("node01", {"cpu_cores": 128, "cpu_affinity": 60, "ram_total": 2 * 1024**4})],
+    )
+
+    text = render(run)  # type: ignore[arg-type]
+
+    assert "node01: 128 cores (60 available to this job)" in text
+
+
+def test_two_hosts_get_a_line_each_rather_than_one_merged_figure(tmp_path: Path) -> None:
+    """A fat node and a thin one have no single capacity; averaging would describe neither."""
+    run = _run_with_hardware(
+        tmp_path, [("big", {"cpu_cores": 128}), ("small", {"cpu_cores": 16})],
+    )
+
+    text = render(run)  # type: ignore[arg-type]
+
+    assert "big: 128 cores" in text
+    assert "small: 16 cores" in text
+    # Pooled for the available column, which is the run's real ceiling across both nodes.
+    assert pooled_capacity(run)["cpu_cores"] == 144  # type: ignore[arg-type]
+
+
+def test_a_percentage_is_suppressed_when_capacity_is_missing() -> None:
+    """Never divide by an absent field, and never substitute a default for one."""
+    assert _percent_of(4.0, None) == ""
+    assert _percent_of(4.0, 0) == ""
+    assert "50%" in _percent_of(4.0, 8)
+
+
+def test_the_machine_document_survives_json_dumps(tmp_path: Path) -> None:
+    run = _run_with_hardware(tmp_path, [("node01", {"cpu_cores": 64})])
+
+    document = report_as_dict(run)  # type: ignore[arg-type]
+
+    assert document["machine"]["capacity_by_host"]["node01"]["cpu_cores"] == 64
+    json.dumps(document)
+
+
+def test_a_run_that_knows_nothing_omits_the_machine_key(tmp_path: Path) -> None:
+    """An absent measurement is an absent key, not a block of zeros."""
+    run = _run_with_hardware(tmp_path, [])
+
+    assert "machine" not in report_as_dict(run)  # type: ignore[arg-type]

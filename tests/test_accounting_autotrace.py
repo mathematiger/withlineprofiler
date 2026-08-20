@@ -265,3 +265,90 @@ def test_the_profiler_wires_auto_tracing_end_to_end(project: Path, tmp_path: Pat
     names = {trace.path_of(span.phase_id)[-1] for span in trace.spans}
 
     assert {"entry", "outer", "inner"} <= names
+
+
+def test_auto_spans_carry_the_file_function_and_line_they_came_from(project: Path) -> None:
+    """The point of the tier: a span you can trace back to source without instrumenting it.
+
+    Line numbers are pinned against the fixture's own text rather than hard-coded, so the
+    test says "where the function is defined" instead of restating a constant.
+    """
+    import workload
+
+    buffer, tracer = _tracer(project)
+    tracer.start()
+    try:
+        workload.entry()
+    finally:
+        tracer.stop()
+
+    spans, _ = buffer.drain()
+    paths = buffer.paths()
+    origins = buffer.origins()
+    by_name = {
+        paths[span.phase_id][-1]: origins.get(span.phase_id)
+        for span in spans
+    }
+
+    source = (project / "workload.py").read_text(encoding="utf-8").splitlines()
+    expected_line = source.index("def inner(n):") + 1
+
+    inner = by_name["inner"]
+    assert inner is not None
+    assert inner.function == "inner"
+    assert Path(inner.file) == project / "workload.py"
+    assert inner.line == expected_line
+
+
+def test_origins_survive_the_sidecar_round_trip(project: Path, tmp_path: Path) -> None:
+    """A location held only in memory helps nobody: the page reads it back off disk."""
+    import workload
+
+    run_dir = tmp_path / "profile"
+    profiler = Profiler(
+        run_dir=run_dir, role="main", enabled=True,
+        snapshot_interval_s=None, sample_interval_s=None, trace="auto",
+    )
+    profiler._stop_auto_tracing()  # noqa: SLF001 - frees the monitoring slot
+    tracer = AutoTracer(
+        buffer=profiler._trace,  # noqa: SLF001 - the buffer under test
+        thread_id_of=profiler._trace_thread_id,  # noqa: SLF001
+        project_folder=project,
+    )
+    tracer.start()
+    profiler._auto = tracer  # noqa: SLF001 - so close() stops it
+    with profiler:
+        workload.entry()
+
+    trace = merge_run(run_dir, with_trace=True).workers[0].trace
+    located = {
+        trace.path_of(span.phase_id)[-1]: trace.origin_of(span.phase_id)
+        for span in trace.spans
+    }
+
+    assert {"entry", "outer", "inner"} <= set(located)
+    for name in ("entry", "outer", "inner"):
+        origin = located[name]
+        assert origin is not None, f"{name} lost its origin crossing the sidecar"
+        assert origin.function == name
+        assert Path(origin.file) == project / "workload.py"
+        assert origin.line > 0
+
+
+def test_a_named_phase_has_no_origin_rather_than_a_fabricated_one(tmp_path: Path) -> None:
+    """There is no code object behind a name, and inventing one would point at a wrong file.
+
+    The absence is the correct answer here, so it is asserted as an absence.
+    """
+    run_dir = tmp_path / "profile"
+    profiler = Profiler(
+        run_dir=run_dir, role="main", enabled=True,
+        snapshot_interval_s=None, sample_interval_s=None, trace=True,
+    )
+    with profiler, profiler.phase("iteration"):
+        pass
+
+    trace = merge_run(run_dir, with_trace=True).workers[0].trace
+
+    assert trace.spans
+    assert all(trace.origin_of(span.phase_id) is None for span in trace.spans)

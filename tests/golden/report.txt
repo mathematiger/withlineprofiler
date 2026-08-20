@@ -1,6 +1,16 @@
 Runtime 1m 30s   Processes 3   Roles actor x2, learner x1
 Host golden-host
 
+RESOURCES
+──────────────────────────────────────────────────────────────
+                            used     available      per proc
+RAM  peak RSS           677.1 MB                    225.7 MB
+
+  (machine capacity was not recorded for this run)
+  per-proc figures are over 3 process(es) (actor x2, learner x1)
+  heaviest process held 476.8 MB RSS against a 225.7 MB mean
+  (no CPU readings in this run's samples; install psutil to record them)
+
 ACTOR  (2 processes, imbalance 1.11)
   % of phase wall time at the first branching level, summed over 2 processes
 ──────────────────────────────────────────────────────────────
@@ -8,12 +18,12 @@ mcts                           75.0%       675.0ms (Σ2 proc)
 env_step                       24.0%       216.0ms (Σ2 proc)
 Other                           1.0%         9.0ms (Σ2 proc)
 
-DOMINANT PHASES                     self    wait       p50       p99
-iteration/mcts                   675.0ms     91%    15.7ms    18.8ms
+DOMINANT PHASES          entries        self    wait       p50       p99
+iteration/mcts                40     675.0ms     91%    15.7ms    18.8ms
     + mcts_simulations          2,560     3,792.6/s  263.7us/ea
-iteration/env_step               216.0ms     81%     5.2ms     6.3ms
+iteration/env_step            40     216.0ms     81%     5.2ms     6.3ms
     + env_steps                    40       185.2/s    5.4ms/ea
-iteration                          9.0ms     91%    21.0ms    25.1ms
+iteration                     40       9.0ms     91%    21.0ms    25.1ms
 
 ITERATIONS  (40 entries)
   mean     22.5ms   p50     21.0ms   p95     25.0ms   p99     25.1ms
@@ -25,11 +35,11 @@ train_step                     80.0%       400.0ms
 checkpoint_to_object_store     19.0%        95.0ms
 Other                           1.0%         5.0ms
 
-DOMINANT PHASES                     self    wait       p50       p99
-iteration/train_step             400.0ms      2%    39.8ms    41.9ms
+DOMINANT PHASES          entries        self    wait       p50       p99
+iteration/train_step          10     400.0ms      2%    39.8ms    41.9ms
     + train_samples             1,280     3,200.0/s  312.5us/ea
-…checkpoint_to_object_store       95.0ms     89%    48.2ms    50.3ms
-iteration                          5.0ms      4%    48.2ms    50.3ms
+…ckpoint_to_object_store       2      95.0ms     89%    48.2ms    50.3ms
+iteration                     10       5.0ms      4%    48.2ms    50.3ms
 
 ITERATIONS  (10 entries)
   mean     50.0ms   p50     48.2ms   p95     50.1ms   p99     50.3ms

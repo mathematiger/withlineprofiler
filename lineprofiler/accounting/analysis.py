@@ -71,6 +71,28 @@ class MemoryTrend:
 
 
 @dataclass(slots=True)
+class CpuUsage:
+    """Core-equivalents consumed, pooled from the per-process readings.
+
+    ``psutil`` reports CPU as a percentage of one core, so a fully busy four-thread process
+    reads 400. These are stored as cores — the percentage divided by 100 — because the figure
+    is only useful next to a core count.
+
+    ``measured`` is the absent-versus-idle guard. A run whose samples carry no CPU reading at
+    all and a run that was genuinely idle both produce zeros here, and only this flag tells
+    them apart; without it the report would state that a busy run used no CPU.
+    """
+
+    peak: float = 0.0
+    """Summed across processes at each one's own peak — the worst-case concurrent demand."""
+    mean: float = 0.0
+    """Summed across processes of each one's mean over its measured rows."""
+    max_process: float = 0.0
+    """The heaviest single process's peak. Against ``peak / processes`` this is the skew."""
+    measured: bool = False
+
+
+@dataclass(slots=True)
 class GpuDevice:
     """One device's utilisation over the run, split by who caused it.
 
@@ -132,6 +154,10 @@ class SampleAnalysis:
     io_by_phase: dict[str, IoTotals] = field(default_factory=dict)
     memory: MemoryTrend = field(default_factory=MemoryTrend)
     memory_by_phase: dict[str, MemoryTrend] = field(default_factory=dict)
+    cpu: CpuUsage = field(default_factory=CpuUsage)
+    peak_rss_max_process: int = 0
+    """The largest single process's peak RSS. ``memory.peak_rss`` sums across processes; this
+    is the one that says whether that total is evenly spread or carried by one fat worker."""
     peak_cuda_alloc: int = 0
     peak_cuda_reserved: int = 0
     gpu_util_mean: float = -1.0
@@ -245,11 +271,17 @@ def analyse_processes(
         intervals.extend(_intervals_of(ordered))
         _accumulate_memory(analysis, ordered, trends)
 
+    # Before the early return: a single-row process carries no interval and no trend, but its
+    # one CPU reading is still a measurement. Placed after the loop because CPU pools per
+    # process rather than per interval.
+    analysis.cpu = _combine_cpu(ordered_per_process)
+
     if not intervals and not trends:
         return analysis
 
     _fill_io_from_intervals(analysis, intervals)
     analysis.memory = _combine_trends(trends)
+    analysis.peak_rss_max_process = max((trend.peak_rss for trend in trends), default=0)
     _fill_gpu(analysis, ordered_per_process)
     analysis.read_series = _rate_series(intervals, "read", series_width)
     analysis.write_series = _rate_series(intervals, "write", series_width)
@@ -402,6 +434,30 @@ def _accumulate_memory(
         analysis.memory_by_phase[phase] = (
             _trend(group) if existing is None else _combine_trends([existing, _trend(group)])
         )
+
+
+def _combine_cpu(per_process: list[list[Sample]]) -> CpuUsage:
+    """Pool per-process CPU readings into whole-run core-equivalents.
+
+    Each process is reduced on its own and only the reductions are summed, for the same reason
+    ``analyse_processes`` differences bytes per process: pooling raw rows would average a busy
+    worker against an idle one and report neither.
+
+    Rows carrying the ``-1.0`` sentinel are dropped rather than read as zero. Treating "not
+    measured" as "idle" would drag every mean toward zero in proportion to how much of the run
+    went unmeasured — the exact wrong-numbers failure this codebase guards against elsewhere.
+    """
+    usage = CpuUsage()
+    for ordered in per_process:
+        cores = [sample.cpu_percent / 100.0 for sample in ordered if sample.cpu_percent >= 0.0]
+        if not cores:
+            continue
+        usage.measured = True
+        peak = max(cores)
+        usage.peak += peak
+        usage.mean += sum(cores) / len(cores)
+        usage.max_process = max(usage.max_process, peak)
+    return usage
 
 
 def _combine_trends(trends: list[MemoryTrend]) -> MemoryTrend:

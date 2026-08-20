@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 
-from lineprofiler.accounting.trace import FLAG_AUTO, ClockAnchor, Link, WorkerTrace
+from lineprofiler.accounting.trace import FLAG_AUTO, ClockAnchor, Link, Origin, WorkerTrace
 
 NS_PER_S = 1_000_000_000
 
@@ -43,6 +43,13 @@ class PlacedSpan:
     t1_ns: int
     cpu_ns: int
     flags: int
+    origin: Origin | None = None
+    """Where the code behind this span is defined, or ``None`` when it was not recorded.
+
+    Present for spans derived from function calls, absent for a phase the user named — there
+    is no code object behind a name. Callers must handle the absence rather than substitute a
+    placeholder file, which would point a reader at source that has nothing to do with it.
+    """
     depth: int = 0
     """How many spans enclose this one on its lane: 0 is a top-level call, 1 its callee.
 
@@ -206,20 +213,23 @@ def place_spans(
 ) -> list[PlacedSpan]:
     """Map one worker's spans onto the common epoch, resolving their phase paths and depth."""
     anchors = trace.anchors
-    placed = [
-        PlacedSpan(
-            worker=worker,
-            role=role,
-            thread_id=span.thread_id,
-            path=tuple(trace.path_of(span.phase_id)),
-            t0_ns=to_common_epoch(span.t0_ns, anchors),
-            t1_ns=to_common_epoch(span.t1_ns, anchors),
-            cpu_ns=span.cpu_ns,
-            flags=span.flags,
-            depth=max(0, len(trace.path_of(span.phase_id)) - 1),
+    placed = []
+    for span in trace.spans:
+        path = tuple(trace.path_of(span.phase_id))
+        placed.append(
+            PlacedSpan(
+                worker=worker,
+                role=role,
+                thread_id=span.thread_id,
+                path=path,
+                t0_ns=to_common_epoch(span.t0_ns, anchors),
+                t1_ns=to_common_epoch(span.t1_ns, anchors),
+                cpu_ns=span.cpu_ns,
+                flags=span.flags,
+                origin=trace.origin_of(span.phase_id),
+                depth=max(0, len(path) - 1),
+            ),
         )
-        for span in trace.spans
-    ]
     return _with_derived_depth(placed)
 
 

@@ -48,8 +48,8 @@ ACTOR  (16 processes, imbalance 1.22)
 mcts                           82.9%       2h 31m
 env_step                       17.1%          27m
 
-DOMINANT PHASES                     self    wait       p50       p99
-self_play/mcts                    2h 31m     18%     9.4ms    18.5ms
+DOMINANT PHASES          entries        self    wait       p50       p99
+self_play/mcts                75      2h 31m     18%     9.4ms    18.5ms
     + mcts_simulations           4,800     6,377.0/s   156.8us/ea
 
 ITERATIONS  (75 entries)
@@ -112,7 +112,7 @@ which is why this is not a reason to keep passing the object around.
 | Function | Equivalent |
 |---|---|
 | `accounting.phase(name, io=…, sync=…, async_work=…)` | `profiler.phase(...)` |
-| `accounting.count(name, n)` | `profiler.count(...)` |
+| `accounting.count(name, n)` | `profiler.count(...)` — for work units only; entry counts are already the report's `entries` column |
 | `accounting.trace_begin(channel, key)` | `profiler.trace_begin(...)` |
 | `accounting.trace_mark(channel, key, name, sample=…)` | `profiler.trace_mark(...)` |
 | `accounting.trace_end(channel, key)` | `profiler.trace_end(...)` |
@@ -123,6 +123,42 @@ which is why this is not a reason to keep passing the object around.
 warns rather than silently taking over. A forked child resolves *its own* profiler, not the
 parent's — the fork handlers re-point it along with the worker file. Explicit
 `profiler.phase(...)` keeps working unchanged; `install=True` only adds a second way in.
+
+### What it ran on
+
+Every report opens with a `RESOURCES` section: what the run consumed, what the machines had,
+and both normalised per worker process.
+
+```
+RESOURCES
+──────────────────────────────────────────────────────────────
+                            used     available      per proc
+CPU  peak             16.2 cores      60 cores          1.35
+CPU  mean              3.8 cores   (6% of box)          0.32
+RAM  peak RSS           985.9 MB        2.0 TB       82.2 MB
+GPU  devices                                 1
+
+  node2: 128 cores (60 available to this job), 2.0 TB RAM, 1x NVIDIA A100-SXM4-40GB
+  per-proc figures are over 12 process(es) (actor x12)
+  heaviest process held 84.2 MB RSS against a 82.2 MB mean
+```
+
+This is what makes two runs comparable. Profile the same workload at four workers and at
+twelve, and the per-process column answers the scaling question directly — a flat figure means
+linear scaling, a rising one means contention. The gap between the heaviest process and the
+mean says whether a total is evenly spread or carried by one fat worker.
+
+The `available` column is the affinity mask when a scheduler constrained the job and the
+machine's core count otherwise. Under Slurm or in a container these differ, and both are
+printed: the machine total alone overstates the headroom, the quota alone hides what the box
+was.
+
+CPU sampling needs `psutil`; device models and VRAM totals need `nvidia-ml-py`. Without them
+the corresponding rows are omitted and the report says so — a resource that was never measured
+is never rendered as zero. Capacity is recorded per worker, so a run spanning a fat node and a
+thin one prints one line per host rather than one merged figure that describes neither.
+
+`report_as_dict` carries the same numbers under `machine`, as `used` and `capacity_by_host`.
 
 ### What it does not do
 

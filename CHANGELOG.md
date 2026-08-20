@@ -4,6 +4,175 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semantic](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added — the report shows how many times each phase ran
+
+`DOMINANT PHASES` gained an **`entries`** column. The number was always recorded — every phase
+entry increments `PhaseStats.calls` on the way out — but the text report printed it for exactly
+one phase per role, in the `ITERATIONS (n entries)` block. Everywhere else a reader who wanted
+it had to add `count("nodes_created")` and pay 384 ns per entry to be told something the layer
+already knew.
+
+That makes a whole class of counter deletable: the ones whose amount is always 1. The rule is
+now **write a `count()` only when the amount varies** — `count("children_scored",
+len(node.children))` still earns its place, because no inspection of the code can supply
+`len()`, and its `567 ns/ea` and `always 8` rows are what a bare entry count cannot give you.
+
+Two details on the way:
+
+- **The `entries` column comes out of the label field, which is now 23 columns wide** (the row
+  grew from 68 to 70). Twenty-two characters is what an ordinary `parent/leaf` pair costs, so
+  `iteration/train_step` and `select/score_children` print in full where a tighter field cut
+  their heads off — and a truncated label is the one column a reader cannot reconstruct from
+  the others.
+- **A `~`/`†` mark no longer widens its row.** The label field is reduced by the mark width,
+  but `_label` truncated to a fixed width regardless, so a row carrying both marks printed one
+  column wider than its neighbours. Only visible on a label long enough to be truncated, which
+  is why it survived this long.
+
+### Added — auto-traced spans say which file, function and line they came from
+
+`trace="auto"` already produced a timeline from uninstrumented code, but every span was a bare
+name: the page could say `simulator/step` cost 71% of the run and not say where `step` lives.
+The reader had to go and find it, which for a qualname appearing in several modules is a
+search, not a lookup.
+
+Spans derived from function calls now carry an `Origin` — file, qualified name and the
+function's first line — surfaced in four places, ordered by how a reader meets them: the
+**phase summary** and **critical path** tables annotate each row with `envs/simulator.py:9`,
+the **hover tooltip** adds the function and location, and the **pinned detail panel** carries
+the full absolute path, which is what gets pasted into an editor.
+
+Three properties are load-bearing:
+
+- **Origins are interned beside the phase path, not stored per span.** A location is a property
+  of the code object, so a function called a million times records it once. The hot path got
+  *cheaper*, not more expensive: `_on_start` now looks the phase id up by code object instead
+  of rebuilding a path tuple per call.
+- **A named phase has no origin, and the absence is preserved.** There is no code object behind
+  a name, so those spans carry `None` and render without a location rather than with an
+  invented one. Where one phase path spans several definitions, the summary row says nothing
+  instead of naming whichever file it saw first.
+- **The page states that a location is the `def` line, not the line that blocked.** A span
+  covers a whole call; the line that actually spent the time is not recorded, and the caveat
+  block says so rather than letting a definition line be read as a measurement.
+
+### Added — the trace timeline says what is wrong, instead of only showing it
+
+The timeline page opened with a lane table and a canvas: all evidence, no conclusion. It
+required the reader to already know what a healthy run looks like, and it never said what
+clicking anything would do — clicking a span drew an outline and nothing else, while the
+module docstring claimed it would "trace what it was waiting for".
+
+Three changes, in the order a reader meets them:
+
+- **A `Findings` section leads the page**, ranking bottlenecks by the share of the run each one
+  cost and stating each in a sentence: which phase blocked, what it cost, and whether it was a
+  queue or a stall. Findings that name something drawable carry a *show on timeline* button
+  that zooms the chart to it.
+- **A `Phase summary` table** — Vampir's Function Summary — ranks every phase by total wall
+  time across all lanes, with a `self` column excluding nested phases so a wrapper cannot
+  out-rank its callee. A phase spread over ten thousand short calls is invisible on a timeline
+  and top of this table.
+- **The chart explains itself**: a legend above it names all five drawing conventions, the
+  controls say what they do, and clicking a span now pins it and reports who released it, how
+  much of it was blocked, and what every other lane was doing meanwhile.
+
+New module `lineprofiler/accounting/findings.py` holds the derivations, so the text report,
+the page and a CI gate can reach the same conclusions from the same numbers, and a finding can
+be tested without parsing HTML.
+
+Two judgements worth recording, both of which produced a *wrong* conclusion before they were
+fixed:
+
+- **A matched `signal`/`wait_on` pair outranks concurrency when classifying a wait.** The
+  learner's `queue_get` was released by an actor's signal on every iteration and was still
+  reported as a stall, because the actors' short bursts covered only a quarter of the wait's
+  union. Recorded evidence names the producer; concurrency only infers one, and the fallback
+  now says so in its own wording.
+- **A parent that only waits inside a blocking child is not reported separately.** It inherits
+  all of the child's wait, so `iteration` at 55% blocked and `iteration/queue_get` at 54% were
+  one fact wearing two hats — and the duplicate pushed the genuine second finding off the list.
+
+`_self_times` replaced a pairwise containment search that was O(spans²); at the 120k-span
+drawing cap that column alone was billions of comparisons.
+
+### Added — findings reach the terminal, CI, and the keyboard
+
+The findings above are a derivation, not a rendering, so they now surface everywhere the run
+does:
+
+- **The text report leads with them.** `lineprofiler report <dir>` prints the same ranked
+  block above `RESOURCES`. Silent on a run with no trace — findings come from spans, and a
+  phase tree alone cannot say who waited for whom.
+- **Both JSON documents carry them.** `report --format json` gains a `findings` key;
+  `trace --format json` gains `findings` and a full `phases` summary.
+- **`trace --fail-over PCT` exits non-zero** when a finding costs more than `PCT`% of the
+  traced span, turning the timeline into a regression gate. Inert until a threshold is set, and
+  the page is still written on the run it failed.
+
+The timeline itself gained the three things that made it hard to use on a real run:
+
+- **Keyboard navigation.** `← →` pan, `+ −` zoom, `n p` step along the critical path,
+  `0` reset, `Esc` unpin. The canvas is given a `tabIndex`, without which a key handler is
+  attached to an element that can never receive a key event — a feature that fails silently.
+- **Foldable lanes.** Clicking a lane's label folds it to one row. With sixteen actors the
+  chart is taller than any screen, so the learner and an actor cannot be seen at once — usually
+  the exact comparison the page was opened to make. A folded lane keeps its spans; they stop
+  claiming a row each, and nothing is hidden.
+- **Causal-chain highlighting.** Pinning a span now dims everything not causally upstream of
+  it and walks the arrows back through the producers that released it — what the module
+  docstring had promised all along while the click only drew an outline. The walk is bounded by
+  a visited set and a guard, because two workers each waiting on the other produce a genuine
+  cycle, and hanging the browser is worse than any wrong picture.
+
+## [0.8.0]
+
+### Added — every report opens with what the run used and what the machine had
+
+A `RESOURCES` section is now the first thing in the text, HTML and JSON reports. It states CPU,
+RAM and VRAM consumption as a run total, as a per-process figure, and against the capacity of
+the machines that ran it.
+
+The gap it closes is comparison. A report said `Runtime 1m 30s   Processes 16` and nothing about
+the hardware underneath, so two profiles of the same workload — one on a 128-core node, one on a
+laptop, or the same node at two worker counts — could not be told apart by reading them. Every
+timing difference was equally attributable to the code, the machine or the dataset, and the
+reader had to supply the missing half from memory.
+
+Three things are new underneath:
+
+- **CPU is now sampled.** `Sample.cpu_percent` joins the 1 Hz row, converted to core-equivalents
+  at analysis time. It follows the `gpu_util` convention exactly: `-1.0` means *not measured* and
+  `0.0` means *measured, idle*, because a run that reported no CPU and a run that used none must
+  not render identically.
+- **`hardware.py` records what the box has** — physical cores, SMT siblings, the affinity mask,
+  total RAM, and each device's model and VRAM. Modelled on `provenance.py`: resolved once,
+  degraded to `{}` on any failure, and never able to break a run. It is cached per process, so a
+  `spawn` run pays roughly 60 ms once rather than per worker, and a forked child inherits the
+  dict rather than re-entering NVML.
+- **Capacity is stored per worker, not per run.** `metadata.json` is written by whichever rank
+  wins the race, so recording it there would describe one node of a heterogeneous job and
+  silently attribute its capacity to every other. Each worker carries its own machine's
+  inventory, and the report prints one line per host.
+
+The affinity mask is reported next to the core count whenever the two differ, which is the
+ordinary case under Slurm or in a container: a node with 128 cores that gave this job 60 has
+neither figure alone as its honest denominator.
+
+Per-process figures come with the heaviest single process beside the mean. That gap is the whole
+scaling signal — flat per-process RSS across two worker counts says memory scales linearly; a max
+well above the mean says one worker will hit the ceiling first.
+
+`report_as_dict` gains a `machine` key (`used` plus `capacity_by_host`). The existing `resources`
+key is untouched — it holds the io/memory/gpu breakdown and is already published.
+
+Absent stays absent throughout. A resource with no reading omits its row, a resource with no
+capacity leaves that cell blank, a utilisation percentage is suppressed rather than divided by a
+missing field, and a run recorded before this release renders without a capacity column and says
+why.
+
 ## [0.7.0]
 
 Eight gaps found by a real investigation — "MuZero actors spend 96% of self-play blocked, on

@@ -93,6 +93,8 @@ class ProcessHandle(Protocol):
 
     def io_counters(self) -> IoCounters: ...
 
+    def cpu_percent(self) -> float: ...
+
 
 def read_io_snapshot(process: ProcessHandle | None) -> IoSnapshot:
     """Read both layers of byte counter at once, flagging a failure rather than faking a zero.
@@ -135,6 +137,11 @@ class Sample:
     self_write_bytes: int = 0
     cuda_alloc: int = 0
     cuda_reserved: int = 0
+    cpu_percent: float = -1.0
+    """Process CPU over the interval ending at ``t``, as a percentage of one core; a
+    multithreaded process exceeds 100. ``-1.0`` means not measured — never ``0.0``, which is a
+    real reading meaning the process was idle. The first row of a run carries the sentinel
+    because ``psutil`` has no previous call to difference against."""
     gpu_util: float = -1.0
     gpu_utils: dict[int, float] = field(default_factory=dict)
     gpu_proc_utils: dict[int, float] = field(default_factory=dict)
@@ -157,6 +164,7 @@ class Sample:
             self_write_bytes=data.get("self_write_bytes", 0),
             cuda_alloc=data.get("cuda_alloc", 0),
             cuda_reserved=data.get("cuda_reserved", 0),
+            cpu_percent=data.get("cpu_percent", -1.0),
             gpu_util=data.get("gpu_util", -1.0),
             gpu_utils=_device_map(data.get("gpu_utils")),
             gpu_proc_utils=_device_map(data.get("gpu_proc_utils")),
@@ -170,6 +178,7 @@ class SamplerCapabilities:
 
     memory: bool = False
     io: bool = False
+    cpu: bool = False
     cuda: bool = False
     gpu_util: bool = False
 
@@ -179,7 +188,13 @@ class SamplerCapabilities:
         return ", ".join(active) if active else "none"
 
     def as_dict(self) -> dict[str, bool]:
-        return {"memory": self.memory, "io": self.io, "cuda": self.cuda, "gpu_util": self.gpu_util}
+        return {
+            "memory": self.memory,
+            "io": self.io,
+            "cpu": self.cpu,
+            "cuda": self.cuda,
+            "gpu_util": self.gpu_util,
+        }
 
 
 class ResourceSampler:
@@ -283,6 +298,11 @@ class ResourceSampler:
             return
         if self.capabilities.memory:
             sample.rss = self._process.memory_info().rss
+        # Before the I/O branch, which returns early when its counters are unavailable. Read
+        # after it, a platform with no per-process byte counters would lose its CPU readings
+        # too, for no reason.
+        if self.capabilities.cpu:
+            sample.cpu_percent = self._process.cpu_percent()
         if self.capabilities.io:
             counters = read_io_snapshot(self._process)
             sample.io_ok = counters.available
@@ -421,6 +441,12 @@ def _detect_capabilities(process: ProcessHandle | None) -> SamplerCapabilities:
     if process is not None:
         capabilities.memory = _probe(lambda: process.memory_info().rss)
         capabilities.io = _probe(lambda: process.io_counters().read_bytes)
+        # This probe doubles as the priming call. ``cpu_percent`` reports the average since
+        # its own previous call on this object, so the first one has nothing to difference
+        # against and always returns a meaningless 0.0. Spending it here means every row the
+        # sampler goes on to write covers a real interval. Deliberate, not incidental — if
+        # this probe is ever removed, the first row starts lying about an idle process.
+        capabilities.cpu = _probe(process.cpu_percent)
     capabilities.cuda = cuda_is_available()
     capabilities.gpu_util = nvml_module() is not None
     return capabilities
@@ -451,6 +477,10 @@ def _compact(sample: Sample) -> dict[str, Any]:
         value = getattr(sample, name)
         if value:
             row[name] = value
+    # ``>= 0`` rather than truthiness: an idle process legitimately reads 0.0, and dropping
+    # that would make "measured, idle" indistinguishable from "never measured".
+    if sample.cpu_percent >= 0:
+        row["cpu_percent"] = sample.cpu_percent
     if sample.gpu_util >= 0:
         row["gpu_util"] = sample.gpu_util
     if sample.gpu_utils:

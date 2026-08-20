@@ -24,6 +24,7 @@ from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import Any
 
+from lineprofiler.accounting.hardware import describe as describe_hardware
 from lineprofiler.accounting.identity import describe as describe_placement
 from lineprofiler.accounting.phasetree import PhaseTree, merge_trees, tree_from_dict, tree_to_dict
 from lineprofiler.accounting.provenance import describe_source
@@ -34,7 +35,7 @@ from lineprofiler.accounting.sampler import (
     read_samples,
 )
 from lineprofiler.accounting.selfio import record_bytes_written
-from lineprofiler.accounting.trace import ClockAnchor, Link, Span, WorkerTrace
+from lineprofiler.accounting.trace import ClockAnchor, Link, Origin, Span, WorkerTrace
 
 FORMAT_VERSION = 1
 
@@ -76,6 +77,11 @@ class SnapshotWriter:
         self.role = role
         self.run_id = run_id or new_run_id()
         self.placement = describe_placement()
+        # Per worker rather than once per run: metadata.json is written by whichever rank wins
+        # the race, so on a heterogeneous multi-node job it would describe one node and
+        # silently attribute its capacity to every other. Cached module-side, so the repeated
+        # constant costs one dict copy per writer rather than a re-enumeration.
+        self.hardware = describe_hardware()
         # Sharded by host. One flat directory holding two files per rank is a single-MDT hot
         # spot on Lustre and a slow readdir on NFS, and every rank renames into it on every
         # flush. One subdirectory per node spreads that, and makes "which files came from the
@@ -117,6 +123,7 @@ class SnapshotWriter:
             "backend": self._backend,
             "write_failures": self.write_failures,
             "placement": self.placement,
+            "hardware": self.hardware,
             "phases": tree_to_dict(tree),
         }
         document = json.dumps(payload)
@@ -151,6 +158,7 @@ class SnapshotWriter:
         anchors: list[ClockAnchor],
         dropped: int,
         dropped_links: int,
+        origins: dict[int, Origin] | None = None,
     ) -> bool:
         """Append a batch of spans to this worker's trace sidecar.
 
@@ -165,6 +173,12 @@ class SnapshotWriter:
             return True
         payload = {
             "paths": ["/".join(path) for path in paths],
+            # Keyed by phase id as a string, because JSON object keys are strings and a
+            # sparse mapping is what this is — most runs name their phases and have none.
+            "origins": {
+                str(phase_id): origin.to_dict()
+                for phase_id, origin in (origins or {}).items()
+            },
             "anchors": [anchor.to_dict() for anchor in anchors],
             "dropped": dropped,
             "dropped_links": dropped_links,
@@ -226,6 +240,11 @@ def _absorb_batch(trace: WorkerTrace, batch: dict[str, Any]) -> None:
     paths = batch.get("paths")
     if isinstance(paths, list) and len(paths) >= len(trace.paths):
         trace.paths = [tuple(key.split("/")) if key else () for key in paths]
+    origins = batch.get("origins")
+    if isinstance(origins, dict) and len(origins) >= len(trace.origins):
+        trace.origins = {
+            int(phase_id): Origin.from_dict(item) for phase_id, item in origins.items()
+        }
     anchors = batch.get("anchors")
     if isinstance(anchors, list) and anchors:
         trace.anchors = [ClockAnchor.from_dict(item) for item in anchors]
@@ -260,6 +279,9 @@ class WorkerSnapshot:
     backend: dict[str, Any] | None = None
     run_id: str = UNKNOWN_RUN
     placement: dict[str, Any] = dataclass_field(default_factory=dict)
+    hardware: dict[str, Any] = dataclass_field(default_factory=dict)
+    """This worker's machine capacity. Empty for a file written before it was recorded, which
+    is why the report omits the capacity column rather than showing a machine with no cores."""
     write_failures: int = 0
     trace: WorkerTrace = dataclass_field(default_factory=WorkerTrace)
     """Recorded spans and links, empty unless ``merge_run(with_trace=True)`` read them."""
@@ -318,6 +340,22 @@ class MergedRun:
             if worker.placement.get("host"):
                 seen.setdefault(worker.host, None)
         return list(seen)
+
+    @property
+    def hardware_by_host(self) -> dict[str, dict[str, Any]]:
+        """Each node's capacity, keyed by host, in first-seen order.
+
+        Keyed rather than merged into one figure: a run spanning a 128-core node and a 16-core
+        one has no single "machine", and averaging them would describe neither. Hosts whose
+        workers recorded nothing are absent, so a partially-upgraded run reports the capacity
+        it knows rather than zeros for the rest.
+        """
+        found: dict[str, dict[str, Any]] = {}
+        for worker in self.workers:
+            host = worker.host
+            if worker.hardware and host not in found:
+                found[host] = worker.hardware
+        return found
 
     @property
     def imbalance(self) -> float:
@@ -479,6 +517,7 @@ def _read_worker(path: Path, with_samples: bool = True) -> WorkerSnapshot | None
             backend=payload.get("backend"),
             run_id=str(payload.get("run_id", UNKNOWN_RUN)),
             placement=payload.get("placement") or {},
+            hardware=payload.get("hardware") or {},
             write_failures=int(payload.get("write_failures", 0)),
         )
     except (KeyError, TypeError, ValueError, IndexError):

@@ -103,8 +103,8 @@ with profiler.phase("forward", async_work=True):
 The phase is measured exactly as before; what changes is that the report says so:
 
 ```
-DOMINANT PHASES                     self    wait       p50       p99
-†forward                          1m 31s      1%     6.3ms    11.5ms
+DOMINANT PHASES          entries        self    wait       p50       p99
+†forward                  13,349      1m 31s      1%     6.3ms    11.5ms
 
   † = wall time excludes un-awaited device work (async_work=True). This is
       submission time, not device compute. Re-run that phase with sync=True to
@@ -253,8 +253,8 @@ Everything derived from a sampled phase is an **estimate**, and the report says 
 prefixed `~` and a note names the rate.
 
 ```
-DOMINANT PHASES                     self    wait       p50       p99
-~uct_search                       2h 31m     18%     9.4ms    18.5ms
+DOMINANT PHASES          entries        self    wait       p50       p99
+~uct_search                6,400      2h 31m     18%     9.4ms    18.5ms
 
   ~ = estimated from a sample, not measured. Totals are scaled by the rate:
       uct_search              1 entry in 100
@@ -309,9 +309,9 @@ LEARNER  (1 process, imbalance 1.00)
 learner                        71.0%       2h 58m
 collector                      29.0%       1h 12m
 
-DOMINANT PHASES                     self    wait       p50       p99
-learner/train_step                2h 51m      4%    41.2ms    58.9ms
-collector/drain_queue             1h 09m     94%     2.1ms   210.4ms
+DOMINANT PHASES          entries        self    wait       p50       p99
+learner/train_step         4,200      2h 51m      4%    41.2ms    58.9ms
+collector/drain_queue     33,600      1h 09m     94%     2.1ms   210.4ms
 ```
 
 which is what makes the 94% answerable: it is the collector blocked on the queue, not the

@@ -575,6 +575,7 @@ class Profiler:
             spans=spans,
             links=links,
             paths=buffer.paths(),
+            origins=buffer.origins(),
             anchors=self._anchors,
             dropped=buffer.dropped,
             dropped_links=buffer.dropped_links,

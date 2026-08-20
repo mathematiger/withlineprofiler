@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 
 from lineprofiler.accounting import Profiler, merge_run, render
-from lineprofiler.accounting.analysis import NO_PHASE, analyse
+from lineprofiler.accounting.analysis import NO_PHASE, analyse, analyse_processes
 from lineprofiler.accounting.compare import PhaseDelta, _comparison_notes, _delta_row
 from lineprofiler.accounting.identity import hostname
 from lineprofiler.accounting.phasetree import PhaseStats, PhaseTree
@@ -1108,3 +1108,48 @@ def test_a_signal_still_flushes_while_an_out_of_order_close_is_pending(
         assert signal.getsignal(signal.SIGUSR1) is sentinel
     finally:
         signal.signal(signal.SIGUSR1, original)
+
+
+def test_a_worker_file_without_hardware_still_merges(tmp_path: Path) -> None:
+    """Every run recorded before the inventory existed must stay readable."""
+    workers = tmp_path / "workers"
+    workers.mkdir(parents=True)
+    (workers / "w_1_a.json").write_text(
+        json.dumps({
+            "version": 1, "pid": 1, "role": "actor",
+            "started_at": 1.0, "written_at": 2.0,
+            "phases": {"work": {"calls": 1, "wall_ns": 1000, "cpu_ns": 500,
+                                "child_wall_ns": 0, "hist": {}, "counters": {}}},
+        }),
+        encoding="utf-8",
+    )
+
+    run = merge_run(tmp_path)
+
+    assert run.workers[0].hardware == {}
+    assert run.hardware_by_host == {}
+    assert "RESOURCES" not in render(run)
+
+
+def test_a_sample_row_without_cpu_percent_reads_as_unmeasured(tmp_path: Path) -> None:
+    """The sentinel, not zero: an old row must not report a busy process as idle."""
+    workers = tmp_path / "workers"
+    workers.mkdir(parents=True)
+    (workers / "w_1_a.json").write_text(
+        json.dumps({
+            "version": 1, "pid": 1, "role": "actor",
+            "started_at": 1.0, "written_at": 2.0,
+            "phases": {"work": {"calls": 1, "wall_ns": 1000, "cpu_ns": 500,
+                                "child_wall_ns": 0, "hist": {}, "counters": {}}},
+        }),
+        encoding="utf-8",
+    )
+    (workers / "w_1_a.samples").write_text(
+        "\n".join(json.dumps({"t": float(i), "phase": "work", "rss": 1000}) for i in range(3)),
+        encoding="utf-8",
+    )
+
+    analysis = analyse_processes(merge_run(tmp_path).samples_by_process())
+
+    assert not analysis.cpu.measured
+    assert analysis.memory.peak_rss == 1000

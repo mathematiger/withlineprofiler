@@ -13,12 +13,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from lineprofiler.accounting.analysis import SampleAnalysis, analyse_processes, format_bytes
+from lineprofiler.accounting.hardware import format_gpu_models
+from lineprofiler.accounting.hardware import total_vram as hardware_total_vram
 from lineprofiler.accounting.phasetree import PhasePath, PhaseTree
 from lineprofiler.accounting.provenance import source_of
 from lineprofiler.accounting.report import (
     format_ns,
+    pooled_capacity,
     report_as_dict,
     sibling_shares,
     wait_share,
@@ -130,6 +134,7 @@ def render_html(run: MergedRun, title: str = "lineprofiler report") -> str:
     analysis = analyse_processes(run.samples_by_process())
     blocks = [
         _header(run, title),
+        _resources_block(analysis, run),
         *(_role_block(run, role) for role in run.roles),
         _io_block(analysis),
         _gpu_block(analysis),
@@ -169,6 +174,77 @@ def _header(run: MergedRun, title: str) -> str:
         f'<p class="sub mono">run {run_id}{source_html}</p>\n'
         f'<div class="tiles">{tiles}</div>'
     )
+
+
+def _resources_block(analysis: SampleAnalysis, run: MergedRun) -> str:
+    """Used-versus-available headlines, plus one inventory row per machine.
+
+    The table is the part a reader compares between two servers, and the only place the device
+    models appear. Both it and the tiles omit what was not recorded rather than showing zero.
+    """
+    tiles = _resource_tiles(analysis, run)
+    inventory = _inventory_table(run)
+    if not tiles and not inventory:
+        return ""
+    parts = ["<h2>Resources</h2>"]
+    if tiles:
+        parts.append(f'<div class="tiles">{tiles}</div>')
+    if inventory:
+        parts.append(inventory)
+    return "\n".join(parts)
+
+
+def _resource_tiles(analysis: SampleAnalysis, run: MergedRun) -> str:
+    """Consumption headlines, each paired with capacity where the run recorded it."""
+    capacity = pooled_capacity(run)
+    processes = max(len(run.workers), 1)
+    tiles: list[str] = []
+    if analysis.cpu.measured:
+        cores = capacity.get("cpu_affinity") or capacity.get("cpu_cores")
+        peak = f"{analysis.cpu.peak:.1f}"
+        tiles.append(tile("peak CPU", f"{peak} / {cores} cores" if cores else f"{peak} cores"))
+        tiles.append(tile("CPU per process", f"{analysis.cpu.peak / processes:.2f} cores"))
+    if analysis.memory.peak_rss:
+        used = format_bytes(analysis.memory.peak_rss)
+        total = capacity.get("ram_total")
+        tiles.append(tile("peak RSS", f"{used} / {format_bytes(total)}" if total else used))
+        tiles.append(tile("RSS per process", format_bytes(analysis.memory.peak_rss / processes)))
+    if analysis.peak_cuda_alloc:
+        used = format_bytes(analysis.peak_cuda_alloc)
+        vram = hardware_total_vram(capacity.get("gpus", []))
+        tiles.append(tile("peak VRAM", f"{used} / {format_bytes(vram)}" if vram else used))
+    if tiles:
+        tiles.append(tile("processes", str(processes)))
+    return "".join(tiles)
+
+
+def _inventory_table(run: MergedRun) -> str:
+    """One row per host: cores, the job's share of them, RAM and devices."""
+    by_host = run.hardware_by_host
+    if not by_host:
+        return ""
+    rows = "".join(_inventory_row(host, hardware) for host, hardware in by_host.items())
+    return (
+        '<div class="scroll"><table><thead><tr><th>host</th><th>cores</th>'
+        "<th>available</th><th>RAM</th><th>GPUs</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table></div>"
+    )
+
+
+def _inventory_row(host: str, hardware: dict[str, Any]) -> str:
+    """One machine. Every cell is escaped: device names reach this page from the driver."""
+    cores = hardware.get("cpu_cores")
+    affinity = hardware.get("cpu_affinity")
+    ram = hardware.get("ram_total")
+    gpus = hardware.get("gpus") or []
+    cells = [
+        escape(host),
+        escape(str(cores)) if cores else "—",
+        escape(str(affinity)) if affinity else "—",
+        escape(format_bytes(ram)) if ram else "—",
+        escape(format_gpu_models(gpus)) if gpus else "—",
+    ]
+    return "<tr>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>"
 
 
 def _role_block(run: MergedRun, role: str) -> str:

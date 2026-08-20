@@ -101,6 +101,38 @@ class Span:
 
 
 @dataclass(frozen=True, slots=True)
+class Origin:
+    """Where the code behind a phase path lives, as file, function and line.
+
+    Interned beside the path rather than stored per span, because it is a property of the
+    *code object*, not of the entry: a function called a million times has one definition
+    site. Storing it per span would add sixteen bytes to a forty-eight byte record and repeat
+    the same filename a million times through the sidecar, for no information gained.
+
+    ``line`` is the function's first line (``co_firstlineno``), not the line that blocked.
+    That distinction is load-bearing and is stated wherever this is rendered: a span covers a
+    whole call, so pointing at one line inside it would be a claim this layer cannot support.
+    """
+
+    file: str
+    function: str
+    line: int
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable view."""
+        return {"file": self.file, "function": self.function, "line": self.line}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Origin:
+        """Rebuild from :meth:`to_dict` output."""
+        return cls(
+            file=str(data["file"]),
+            function=str(data["function"]),
+            line=int(data["line"]),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ClockAnchor:
     """A simultaneous reading of the monotonic and wall clocks.
 
@@ -184,8 +216,9 @@ class TraceBuffer:
     """
 
     __slots__ = (
-        "_cpu", "_flags", "_link_capacity", "_links", "_paths", "_phase", "_t0", "_t1",
-        "_thread", "capacity", "dropped", "dropped_links", "path_ids", "wrapped", "write",
+        "_cpu", "_flags", "_link_capacity", "_links", "_origins", "_paths", "_phase", "_t0",
+        "_t1", "_thread", "capacity", "dropped", "dropped_links", "path_ids", "wrapped",
+        "write",
     )
 
     def __init__(self, capacity: int = DEFAULT_CAPACITY) -> None:
@@ -203,16 +236,21 @@ class TraceBuffer:
         self.dropped = 0
         self.path_ids: dict[PhasePath, int] = {}
         self._paths: list[PhasePath] = []
+        self._origins: dict[int, Origin] = {}
         self._link_capacity = max(16, capacity // _LINK_CAPACITY_DIVISOR)
         self._links: deque[Link] = deque(maxlen=self._link_capacity)
         self.dropped_links = 0
 
-    def intern(self, path: PhasePath) -> int:
+    def intern(self, path: PhasePath, origin: Origin | None = None) -> int:
         """Return a stable integer id for ``path``, creating one on first sight.
 
         Called only when a phase path is first traced, never per span: the caller holds the
         id alongside the phase's stats. Bounded by ``MAX_PHASES`` upstream, which is what
         keeps this table from growing with a generated name.
+
+        ``origin`` records where the code lives, for callers that know — function tracing
+        holds the code object, a named phase does not. It is stored on first sight only, so
+        the repeat lookups that dominate this call stay one dict get and a return.
         """
         existing = self.path_ids.get(path)
         if existing is not None:
@@ -220,6 +258,8 @@ class TraceBuffer:
         assigned = len(self._paths)
         self.path_ids[path] = assigned
         self._paths.append(path)
+        if origin is not None:
+            self._origins[assigned] = origin
         return assigned
 
     def record(
@@ -281,6 +321,14 @@ class TraceBuffer:
         """The interning table, indexed by the ids stored in spans."""
         return list(self._paths)
 
+    def origins(self) -> dict[int, Origin]:
+        """Source locations by phase id, holding only the ids that have one.
+
+        Sparse on purpose: a named phase has no code object behind it, and an absent entry
+        says exactly that — where a fabricated one would point the reader at a file.
+        """
+        return dict(self._origins)
+
     def drain(self) -> tuple[list[Span], list[Link]]:
         """Remove and return everything recorded so far, oldest first.
 
@@ -334,6 +382,7 @@ class TraceBuffer:
         self.dropped_links = 0
         self.path_ids = {}
         self._paths = []
+        self._origins = {}
         self._links = deque(maxlen=self._link_capacity)
         self.dropped_links = 0
 
@@ -346,6 +395,7 @@ class WorkerTrace:
     links: list[Link] = field(default_factory=list)
     anchors: list[ClockAnchor] = field(default_factory=list)
     paths: list[PhasePath] = field(default_factory=list)
+    origins: dict[int, Origin] = field(default_factory=dict)
     dropped: int = 0
     dropped_links: int = 0
 
@@ -359,3 +409,12 @@ class WorkerTrace:
         if 0 <= phase_id < len(self.paths):
             return self.paths[phase_id]
         return ("(unknown)",)
+
+    def origin_of(self, phase_id: int) -> Origin | None:
+        """Where the code behind a span lives, or ``None`` when it was never recorded.
+
+        Absent for every named phase and for any span read from a sidecar written before
+        origins were carried, which is why every caller must handle ``None`` rather than
+        assume a location exists.
+        """
+        return self.origins.get(phase_id)

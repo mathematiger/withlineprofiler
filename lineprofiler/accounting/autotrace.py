@@ -35,7 +35,7 @@ from pathlib import Path
 from time import perf_counter_ns
 from types import CodeType, FrameType
 
-from lineprofiler.accounting.trace import FLAG_AUTO, UNMEASURED, TraceBuffer
+from lineprofiler.accounting.trace import FLAG_AUTO, UNMEASURED, Origin, TraceBuffer
 from lineprofiler.config import find_project_root
 
 _MONITORING = getattr(sys, "monitoring", None)
@@ -86,6 +86,11 @@ class AutoTracer:
             else find_project_root(_caller_file())
         )
         self._admits_cache: dict[str, bool] = {}
+        # Keyed by the code object rather than by its path: this is what keeps `_on_start`
+        # from rebuilding a tuple per call, and it is where the interned id and the recorded
+        # origin agree. Dropped on stop(), because a restart may intern into a cleared buffer
+        # and a stale id would file spans under another function's name.
+        self._phase_ids: dict[CodeType, int] = {}
         self._stacks: dict[int, list[tuple[int, int]]] = {}
         self._started = False
 
@@ -140,6 +145,7 @@ class AutoTracer:
             monitoring.free_tool_id(_TOOL_ID)
         self._started = False
         self._stacks.clear()
+        self._phase_ids.clear()
 
     def _on_start(self, code: CodeType, offset: int) -> object:  # noqa: ARG002
         """``PY_START``: push this call's start time, or opt out of this code object."""
@@ -148,9 +154,30 @@ class AutoTracer:
         stack = self._stack()
         if len(stack) >= _MAX_DEPTH:
             return None
-        phase_id = self._buffer.intern(_path_of(code))
+        phase_id = self._phase_ids.get(code)
+        if phase_id is None:
+            phase_id = self._intern_code(code)
         stack.append((phase_id, perf_counter_ns()))
         return None
+
+    def _intern_code(self, code: CodeType) -> int:
+        """Assign ``code`` its phase id and record where it is defined.
+
+        Off the hot path by construction: reached once per code object, never per call. That
+        is what makes reading ``co_filename`` and ``co_firstlineno`` free here — they are
+        constant for the life of the object, so a function called a million times pays for
+        its location once.
+        """
+        phase_id = self._buffer.intern(
+            _path_of(code),
+            origin=Origin(
+                file=code.co_filename,
+                function=_qualname_of(code),
+                line=code.co_firstlineno,
+            ),
+        )
+        self._phase_ids[code] = phase_id
+        return phase_id
 
     def _on_return(self, code: CodeType, offset: int, arg: object) -> object:  # noqa: ARG002
         """``PY_RETURN``/``PY_UNWIND``: pop the call and record its span.

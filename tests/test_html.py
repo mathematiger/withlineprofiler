@@ -103,6 +103,34 @@ def test_a_phase_named_like_a_script_tag_cannot_escape_its_block(tmp_path: Path)
     assert _embedded_data(html), "the data block no longer parses"
 
 
+def test_a_device_name_cannot_inject_markup(tmp_path: Path) -> None:
+    """Device names reach the page from the driver, which is outside this renderer."""
+    _build_fixed_run(tmp_path)
+    run = merge_run(tmp_path)
+    run.workers[0].hardware = {
+        "cpu_cores": 8,
+        "gpus": [{"index": 0, "name": "</td><img src=x>"}],
+    }
+
+    html = render_html(run)
+
+    body = html.split('<script type="application/json"')[0]
+    assert "<img src=x>" not in body, "an unescaped device name reached the document body"
+    assert _embedded_data(html), "the data block no longer parses"
+
+
+def test_the_resources_block_reports_capacity_and_use(tmp_path: Path) -> None:
+    _build_fixed_run(tmp_path)
+    run = merge_run(tmp_path)
+    run.workers[0].hardware = {"cpu_cores": 64, "ram_total": 8 * 1024**3}
+
+    html = render_html(run)
+
+    assert "<h2>Resources</h2>" in html
+    assert "64" in html
+    assert "peak RSS" in html
+
+
 def test_source_html_escapes_the_code_it_shows(tmp_path: Path) -> None:
     """The markup lives in a *function*, not in the ``with`` body.
 
