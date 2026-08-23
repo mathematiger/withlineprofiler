@@ -123,6 +123,11 @@ def _initialise_nvml() -> ModuleType | None:
         return None
     try:
         pynvml.nvmlInit()
+        # A driver can initialise cleanly and still enumerate zero usable devices (a CI
+        # runner with the library installed but no GPU attached). That is "no GPU visible",
+        # not "GPU visible", so it must degrade the same way an import failure does.
+        if int(pynvml.nvmlDeviceGetCount()) == 0:
+            return None
     except Exception:  # noqa: BLE001 - any NVML failure means the capability is absent
         return None
     module: ModuleType = pynvml

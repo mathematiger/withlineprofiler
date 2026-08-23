@@ -6,6 +6,18 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed — `nvml_module()` no longer reports a GPU that isn't there
+
+A runner where the NVML driver library initialises cleanly but enumerates zero devices — the
+state on plain CPU CI hosts — used to make `nvml_module()` return the module anyway, since
+`_initialise_nvml` only checked whether `pynvml.nvmlInit()` raised. That flipped
+`SamplerCapabilities.gpu_util` to `True` with no device behind it, and `test_gpu_hardware.py`'s
+`requires_nvml` skip (gated on `nvml_module() is None`) stopped skipping, so its three tests ran
+against zero devices instead of being excluded: a bare `nvmlDeviceGetHandleByIndex(0)` failing,
+a `ZeroDivisionError` averaging an empty device list, and a missing `GPU 0` block in the
+rendered report. `_initialise_nvml` now also checks `nvmlDeviceGetCount() > 0` and degrades to
+`None` when it isn't, matching every other capability in this module.
+
 ### Added — the report shows how many times each phase ran
 
 `DOMINANT PHASES` gained an **`entries`** column. The number was always recorded — every phase
