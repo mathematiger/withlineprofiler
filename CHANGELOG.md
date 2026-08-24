@@ -6,6 +6,61 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-09-05
+
+### Changed (breaking) — `Profiler(run_dir=...)` now records
+
+Passing a run directory turns the profiler on. Before this, `accounting.start(run_dir="profile")` without `LINEPROFILER_PROFILE=1` in the environment ran clean, exited zero and wrote nothing — not the worker file, not even the directory — so every phase the caller had wrapped their training loop in disappeared, and the first sign of it was an empty path much later. Nobody names a run directory and means "write nothing there".
+
+The switch now resolves in this order: an explicit `enabled=`, then an explicit `run_dir=`, then `LINEPROFILER_PROFILE`, then off. `enabled=False` still wins over a run directory, so a launcher can turn a run off without editing the call site. Library code that carries `accounting.phase(...)` calls permanently is unaffected: it passes neither argument, so it still costs a no-op check until the environment says otherwise.
+
+The implication is keyed on the constructor *argument*, never on the resolved directory. An enabled profiler exports `LINEPROFILER_RUN_DIR` to its children, so reading the resolved path would let a `spawn` child switch itself on from an inherited variable — against an explicit `enabled=False` of its own.
+
+This is a behaviour change on a 0.x line, shipped as a patch release because the public surface is unchanged: no name was added, removed or renamed, only the default answer to "is this profiler on". A caller who wants the old shape passes `enabled=False` explicitly.
+
+### Added — a disabled profiler that was used says so when it closes
+
+The other half of the same silence. A profiler can still end up disabled with phases entered on it — `enabled=False` passed deliberately, or an environment variable that did not reach a `forkserver` worker — and the measurement is gone either way. `close()` now warns once, naming the directory that was never written and both remedies (`enabled=True` at the call, or `LINEPROFILER_PROFILE=1` at the launcher), because which one applies depends on whether the caller owns the code or the launcher.
+
+A disabled profiler nobody used closes silently: that is exactly what the no-op path is for. The count is one integer increment on the disabled path, which measures at 450 ns/call against the 1600 ns budget the overhead suite holds it to.
+
+### Added — an empty or missing run directory says which it is
+
+`lineprofiler report` on a directory that did not exist printed `Runtime 0ns   Processes 0   Roles none` — a well-formed report that reads as a successful measurement of a very fast program. `rglob` over a missing directory yields nothing and raises nothing, so nothing downstream could tell the two apart.
+
+`MergedRun` now carries an `empty_reason`, and every renderer states it: the text report and the HTML page say either *"No run directory — nothing was profiled at this path"* or *"No worker files — the directory exists but no profiler wrote to it. The profiler was disabled, or `close()` was never reached."*, and the JSON document grows a `caveats.empty` key. A populated run is untouched, byte for byte — the key appears only when it applies, so a caller comparing `caveats` against a fixed dict keeps working.
+
+`report` also exits **2** for a missing directory, which is what argparse already uses for a usage error, and **0** for one that exists and holds nothing: a run nobody profiled is a legitimate answer and must not fail a pipeline that reports on every run it finds. `1` stays reserved for `trace --fail-over`. The report is written either way. A directory of corrupt worker files is neither case — something was written, and `caveats.unreadable` already says so precisely.
+
+### Added — `write_report()` and `write_trace()`
+
+The path from a run directory to a file someone can open used to run through the command line only, so a training script that had just finished a run could not save its own report without shelling out to itself.
+
+```python
+from lineprofiler.accounting import write_report, write_trace
+
+write_report("profile", "reports/run-17.html", format="html")   # text | json | html
+write_trace("profile", "reports/run-17-trace.html")             # html | json
+```
+
+The formats are exactly the CLI's, and an unknown one raises rather than falling back to text — a typo that silently wrote the wrong format is discovered when someone opens the file. Both create parent directories, matching `write_html()`, and deliberately unlike the CLI, where a path that does not exist is usually a typo worth failing on. Both read the trace sidecars, so a run recorded with `trace=True` renders with the findings, occupancy and lifecycle blocks it was instrumented for.
+
+The trace JSON document moved out of `cli.py` into `findings.py` as `trace_as_dict`, beside the two derivations it serialises, so the CLI and the library emit one document rather than two hand-maintained copies that drift. A test pins them equal.
+
+### Added — `python -m lineprofiler` and `import with_line_profiler`
+
+Two names that did not work and had no reason not to.
+
+`python -m lineprofiler report profile/` now runs the CLI. The console script is not always reachable — an unactivated virtualenv, a `pip install --user` whose scripts directory is off `PATH`, a batch job invoking `python` by absolute path — while the module form works wherever the package is importable, which is where the profiler that wrote the run was. (`python -m lineprofiler.accounting.cli` already worked; only the package form did not.)
+
+`import with_line_profiler` now works too, re-exporting the same five public names plus `__version__` and `accounting`. The distribution installs as `with-line-profiler` and imports as `lineprofiler`; guessing the pip name gave an `ImportError` that named neither the cause nor the fix. `lineprofiler` remains the documented name and nothing new will live in the shim.
+
+### Fixed — a single-lane run's wait is no longer called a stall
+
+With one lane there is no concurrency to have observed, so "no other lane had a phase open during that wait" is not evidence of anything — whatever released the wait lives in a process the run never profiled. The finding said *"nothing was being produced while this blocked — a stall rather than a queue"*, which sent a reader hunting for a hang inside code that was correctly waiting its turn.
+
+A single-lane run now says that it recorded one lane, that nothing here can say what the wait was for, and points at the process on the other side of it. Where two or more lanes were recorded and none was busy, the old wording stands — the trace watched every lane it has. The precedence above this is untouched: a recorded `signal`/`wait_on` arrow still settles the question before either branch is reached, so a single-lane run with an arrow still correctly reports as a queue.
+
 ## [0.8.3] - 2026-09-02
 
 ### Fixed — the `CPU peak` figure was quantisation noise, not a measurement

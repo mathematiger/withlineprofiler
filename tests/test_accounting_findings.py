@@ -239,15 +239,37 @@ def test_an_arrow_landing_outside_a_phase_does_not_release_it() -> None:
     assert "released by" not in finding.detail
 
 
-def test_a_wait_with_nothing_else_running_is_called_a_stall() -> None:
-    """The opposite verdict, so the queue label cannot be the only thing it ever says."""
+def test_a_multi_lane_wait_with_no_concurrent_activity_is_still_a_stall() -> None:
+    """The opposite verdict, so the queue label cannot be the only thing it ever says.
+
+    Two lanes, both blocked in the same phase: the trace watched every lane it has and saw
+    none of them producing, which is what makes "a stall rather than a queue" supportable.
+    """
+    trace = _trace([
+        _span("w0", ("blocked",), 0, 1000, cpu_ms=0, role="solo"),
+        _span("w1", ("blocked",), 0, 1000, cpu_ms=0, role="solo"),
+    ])
+
+    finding = next(item for item in rank_findings(trace) if item.anchor == "blocked")
+
+    assert "stall" in finding.detail
+
+
+def test_a_single_lane_wait_is_not_called_a_stall() -> None:
+    """With one lane there is no concurrency to have observed, so the inference has no basis.
+
+    "Nothing else was running" is not evidence when nothing else was recorded: whatever
+    released this wait lives in a process the run never profiled. Calling that a stall sent a
+    reader hunting for a hang inside code that was correctly waiting its turn.
+    """
     trace = _trace([
         _span("solo", ("blocked",), 0, 1000, cpu_ms=0, role="solo"),
     ])
 
     finding = next(item for item in rank_findings(trace) if item.anchor == "blocked")
 
-    assert "stall" in finding.detail
+    assert "stall rather than a queue" not in finding.detail
+    assert "one lane" in finding.detail
 
 
 def test_idle_lanes_of_one_role_collapse_into_a_single_finding() -> None:

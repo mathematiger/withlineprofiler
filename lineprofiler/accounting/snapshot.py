@@ -327,6 +327,14 @@ class MergedRun:
     """Workers belonging to an earlier attempt in this same directory. Excluded from every
     total, and named in the report — merging them used to inflate a requeued job silently."""
 
+    empty_reason: str = ""
+    """Why this run has nothing in it: ``"missing"``, ``"no_worker_files"``, or ``""`` when it
+    is not empty. An empty run renders as a complete report of a run that took no time — a
+    plausible reading of a fast program — so every renderer needs to be able to say which of
+    the two it is looking at. Carries the reason and not the path: the path is the caller's
+    own argument, and several renderers would gain a filesystem location they must not
+    print."""
+
     @property
     def hosts(self) -> list[str]:
         """Distinct nodes this run touched, in first-seen order.
@@ -468,7 +476,30 @@ def merge_run(
         unreadable=unreadable,
         metadata=_read_metadata(run_path),
         superseded=superseded,
+        empty_reason=_empty_reason(run_path, found, unreadable),
     )
+
+
+def _empty_reason(
+    run_path: Path,
+    found: list[WorkerSnapshot],
+    unreadable: list[Path],
+) -> str:
+    """Why nothing was read: ``"missing"``, ``"no_worker_files"``, or ``""`` when something was.
+
+    ``rglob`` over a directory that does not exist yields nothing and raises nothing, which is
+    what let a mistyped path — and a run whose profiler was never enabled — report as a
+    complete measurement of a run that took no time.
+
+    Keyed on everything read, before the attempt split: a directory holding only superseded
+    files is not an empty run, it is a run whose newest attempt wrote nothing, and
+    ``superseded`` already says so precisely. Unreadable files count as written for the same
+    reason — a directory of corrupt snapshots is not one nobody wrote to, and ``unreadable``
+    is the accurate statement about it.
+    """
+    if found or unreadable:
+        return ""
+    return "no_worker_files" if run_path.exists() else "missing"
 
 
 def _split_by_attempt(

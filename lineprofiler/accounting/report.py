@@ -134,6 +134,11 @@ def report_as_dict(run: MergedRun) -> dict[str, Any]:
             "stale": [worker.label for worker in _stale_workers(run)],
         },
     }
+    # Conditional, like ``findings`` below: ``caveats`` has a fixed set of keys that callers
+    # compare against whole, and an always-present key naming a condition almost no run is in
+    # would break every one of them.
+    if run.empty_reason:
+        document["caveats"]["empty"] = run.empty_reason
     # Findings are part of the document rather than a rendering of it: a CI gate asking
     # "did this run regress into a queue" needs the verdict, not the prose that explains it.
     aligned = _aligned_or_none(run)
@@ -369,6 +374,12 @@ def _header(run: MergedRun) -> str:
     runtime = max((w.written_at - w.started_at for w in run.workers), default=0.0)
     roles = ", ".join(f"{role} x{len(run.workers_of(role))}" for role in run.roles) or "none"
     lines = [
+        # A run with no workers renders as a well-formed report of a program that took no
+        # time, which is a plausible thing to have measured — so the one case where it is not
+        # a measurement at all says so *first*, above the zeros a reader would otherwise take
+        # at face value and stop reading. A populated run prepends nothing, which is what
+        # keeps this header byte-identical for every real run.
+        *_empty_run_lines(run.empty_reason),
         f"Runtime {format_ns(runtime * 1e9)}   "
         # One worker file is one process. Counting distinct pids undercounted every
         # multi-node run: pid namespaces are per-node, so ranks on different nodes collide.
@@ -461,6 +472,27 @@ def _excluded_workers_warning(run: MergedRun) -> list[str]:
         "         If these ran together, they each generated their own run id: pass the same "
         "run_id=",
         "         to every worker, or let them inherit LINEPROFILER_RUN_ID from the parent.",
+    ]
+
+
+def _empty_run_lines(reason: str) -> list[str]:
+    """Say that there is no run here, and — where it is knowable — what to do about it.
+
+    The two cases need different words because they need different fixes: a path that does not
+    exist is usually a typo, while one that exists and holds nothing is usually a profiler
+    that was never switched on, which is the failure these lines exist for. The remedy is
+    repeated from the warning ``close()`` raises, because the person reading a report is
+    routinely not the person who ran the job.
+    """
+    if not reason:
+        return []
+    if reason == "missing":
+        return ["No run directory — nothing was profiled at this path.", ""]
+    return [
+        "No worker files — the directory exists but no profiler wrote to it.",
+        "The profiler was disabled, or close() was never reached. Pass",
+        "enabled=True to Profiler(), or export LINEPROFILER_PROFILE=1.",
+        "",
     ]
 
 

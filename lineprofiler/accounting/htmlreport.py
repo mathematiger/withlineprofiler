@@ -173,8 +173,29 @@ def _header(run: MergedRun, title: str) -> str:
     return (
         f"<h1>{escape(title)}</h1>\n"
         f'<p class="sub mono">run {run_id}{source_html}</p>\n'
+        f"{_empty_run_banner(run.empty_reason)}"
         f'<div class="tiles">{tiles}</div>'
     )
+
+
+def _empty_run_banner(reason: str) -> str:
+    """Say there is no run here, above the tiles rather than in the caveats at the foot.
+
+    ``runtime 0ns`` and ``processes 0`` are the first things on this page and read as a
+    measurement of a very fast run. A reader who takes them at face value never scrolls as far
+    as the caveats, so the one statement that changes what every tile means goes above them.
+    """
+    if not reason:
+        return ""
+    if reason == "missing":
+        text = "No run directory — nothing was profiled at this path."
+    else:
+        text = (
+            "No worker files — the directory exists but no profiler wrote to it. The "
+            "profiler was disabled, or close() was never reached. Pass enabled=True to "
+            "Profiler(), or export LINEPROFILER_PROFILE=1."
+        )
+    return f'<p class="sub"><strong>{escape(text)}</strong></p>\n'
 
 
 def _resources_block(analysis: SampleAnalysis, run: MergedRun) -> str:
@@ -488,6 +509,14 @@ def _caveats_block(run: MergedRun) -> str:
     A run that lost a worker must not read as a whole result here either.
     """
     items = []
+    # First because it subsumes the rest: if nothing was written, nothing else about this
+    # page is a measurement either.
+    # Terse here on purpose: the full statement, with its remedy, is the banner above the
+    # tiles, and repeating it verbatim at the foot of a one-screen page reads as a bug.
+    if run.empty_reason == "missing":
+        items.append("No run directory — nothing was profiled at this path")
+    elif run.empty_reason:
+        items.append("No worker files — no profiler wrote to this directory")
     if run.unreadable:
         items.append(f"{len(run.unreadable)} worker file(s) could not be read")
     if run.superseded:

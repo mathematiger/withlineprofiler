@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from lineprofiler.accounting import Backend, Profiler, merge_run, render
+from lineprofiler.accounting import Backend, Profiler, merge_run, render, write_trace
 from lineprofiler.accounting import capabilities as capabilities_module
 from lineprofiler.accounting import hardware as hardware_module
 from lineprofiler.accounting import sampler as sampler_module
@@ -537,6 +537,35 @@ def test_cli_report_json_is_a_usable_assertion_target(
     assert document["caveats"] == {"unreadable": [], "superseded": [], "stale": []}
 
 
+def test_cli_report_on_a_missing_directory_exits_two(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A path that does not exist is a usage error, which is what argparse exits 2 for."""
+    assert cli_main(["report", str(tmp_path / "typo")]) == 2
+    assert "No run directory" in capsys.readouterr().out
+
+
+def test_cli_report_on_an_empty_directory_exits_zero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A run nobody profiled is a legitimate answer and must not fail a reporting pipeline."""
+    (tmp_path / "profile").mkdir()
+
+    assert cli_main(["report", str(tmp_path / "profile")]) == 0
+    assert "No worker files" in capsys.readouterr().out
+
+
+def test_cli_report_json_names_the_empty_run_in_its_caveats(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A program reading the document must not mistake an empty run for a fast one either."""
+    (tmp_path / "profile").mkdir()
+
+    assert cli_main(["report", str(tmp_path / "profile"), "--json"]) == 0
+
+    assert json.loads(capsys.readouterr().out)["caveats"]["empty"] == "no_worker_files"
+
+
 def test_cli_report_json_honours_no_samples(
     tmp_path: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -546,6 +575,28 @@ def test_cli_report_json_honours_no_samples(
     assert cli_main(["report", str(tmp_path), "--json", "--no-samples"]) == 0
 
     assert "resources" not in json.loads(capsys.readouterr().out)
+
+
+def test_the_trace_json_from_the_cli_and_the_library_are_the_same_document(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Both render ``trace_as_dict``. Two hand-built copies of a 45-line literal would drift,
+    and a gate disagreeing with the file beside it is the worst version of that."""
+    run_dir = tmp_path / "run"
+    profiler = Profiler(
+        run_dir=run_dir, role="learner", enabled=True,
+        snapshot_interval_s=None, sample_interval_s=None, trace=True,
+    )
+    with profiler, profiler.phase("iteration"):
+        time.sleep(0.01)
+
+    assert cli_main(["trace", str(run_dir), "--format", "json", "--quiet"]) == 0
+    from_cli = capsys.readouterr().out.strip()
+
+    destination = tmp_path / "out" / "trace.json"
+    write_trace(run_dir, destination, format="json")
+
+    assert destination.read_text(encoding="utf-8") == from_cli
 
 
 # ── exact per-phase I/O ─────────────────────────────────────────────────────

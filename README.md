@@ -11,6 +11,8 @@ Two independent profiling tools in one distribution: line-by-line tracing for a 
 pip install with-line-profiler
 ```
 
+The distribution is `with-line-profiler` and the package it installs is `lineprofiler` — that is the name to import, and the one the rest of this page uses. `import with_line_profiler` works too, and re-exports exactly the same objects, so guessing the pip name is not an error.
+
 ```python
 # example.py
 from lineprofiler import LineProfiler
@@ -68,6 +70,8 @@ stop()
 lineprofiler report profile/                        # the run, as a table
 lineprofiler report profile/ --format html -o r.html # ...or as a page you can share
 ```
+
+Every command also works as `python -m lineprofiler ...`, which is the form to reach for when the console script is not on `PATH` — an unactivated virtualenv, a `pip install --user`, a batch job running `python` by absolute path. From inside the script that produced the run, `accounting.write_report("profile", "report.html", format="html")` writes the same thing without shelling out.
 
 ### Why was that worker idle?
 

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from dataclasses import dataclass, field
+from typing import Any
 
 from lineprofiler.accounting.trace import FLAG_DEVICE_SYNC, Origin
 from lineprofiler.accounting.tracealign import (
@@ -219,6 +220,10 @@ def _explain_wait(
     backward pass report as a queue: the thread releases the GIL while the device runs, so
     ``wall - cpu`` describes GPU compute, and the sentence "this is a queue, not a hang" sent
     a reader looking for contention that did not exist.
+
+    Rule 2 also needs something to compare against: on a single-lane run there is no other
+    lane that could have been busy, so "nobody else was working" says nothing about this wait
+    and must not be read as a stall.
     """
     if on_device:
         return (
@@ -240,6 +245,16 @@ def _explain_wait(
 
     activity = concurrent_activity(trace, blocked)
     if not activity:
+        if len(trace.lanes) < 2:
+            # "Nothing else was running" is not evidence when there was nothing else to run.
+            # The producer of whatever this waited for is in another process, which this run
+            # did not record, so the honest answer is that the trace cannot say.
+            return (
+                "This run recorded one lane, so there was no other lane that could have been "
+                "producing: nothing here can say what this was waiting for. Whatever released "
+                "it is on the other side of the wait — profile that process too, or record a "
+                "signal_ready/wait_on pair across the boundary, to find out."
+            )
         return (
             "No other lane had a phase open during that wait, so nothing was being produced "
             "while this blocked — a stall rather than a queue."
@@ -521,6 +536,63 @@ def phase_totals(trace: AlignedTrace) -> list[PhaseTotal]:
     ]
     totals.sort(key=lambda total: -total.wall_ns)
     return totals
+
+
+def trace_as_dict(aligned: AlignedTrace) -> dict[str, Any]:
+    """The timeline as JSON-serialisable data: the same conclusions the page leads with.
+
+    Lives here, beside the two derivations it serialises, so the CLI's ``trace --format json``
+    and the library's :func:`~lineprofiler.accounting.write_trace` emit one document rather
+    than two that drift. A gate re-deriving "was this a queue or a stall" from spans and
+    arrows would be reimplementing this module against the same data.
+
+    Test specifically:
+        - the CLI and the library helper produce byte-identical documents for one run
+    """
+    return {
+        "duration_ns": aligned.duration_ns,
+        "lanes": aligned.lanes,
+        "spans": len(aligned.spans),
+        "arrows": [
+            {
+                "channel": arrow.channel,
+                "key": arrow.key,
+                "from": arrow.src_worker,
+                "to": arrow.dst_worker,
+                "delay_ns": arrow.delay_ns,
+            }
+            for arrow in aligned.arrows
+        ],
+        "unmatched_waits": aligned.unmatched_waits,
+        "dropped_spans": aligned.dropped_spans,
+        # Worker to the number of clock anchors rejected as steps. Present so a gate reading
+        # this file learns the axis was repaired; without it the JSON is the one output that
+        # repairs silently, and it is the one a machine acts on.
+        "clock_steps": aligned.clock_steps,
+        "findings": [
+            {
+                "kind": finding.kind,
+                "headline": finding.headline,
+                "detail": finding.detail,
+                "cost_pct": round(finding.cost_pct, 2),
+                "anchor": finding.anchor,
+                "lanes": list(finding.lanes),
+            }
+            for finding in rank_findings(aligned)
+        ],
+        "phases": [
+            {
+                "path": total.path,
+                "calls": total.calls,
+                "lanes": total.lanes,
+                "wall_ns": total.wall_ns,
+                "self_ns": total.self_ns,
+                "wait_ns": total.wait_ns,
+                "wait_pct": round(total.wait_pct, 1),
+            }
+            for total in phase_totals(aligned)
+        ],
+    }
 
 
 def _phase_total(

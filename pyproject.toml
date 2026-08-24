@@ -1,7 +1,7 @@
 [project]
 name = "with_line_profiler"
-version = "0.8.3"
-description = "Line-by-line profiling, plus a low-overhead accounting layer for long multi-process RL training runs"
+version = "0.8.4"
+description = "Line-by-line profiling, plus a low-overhead accounting layer for long multi-process RL training runs. Installed as with-line-profiler, imported as lineprofiler."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -60,7 +60,12 @@ Issues = "https://github.com/mathematiger/withlineprofiler/issues"
 Changelog = "https://github.com/mathematiger/withlineprofiler/blob/main/CHANGELOG.md"
 
 [tool.poetry]
-packages = [{ include = "lineprofiler" }]
+packages = [
+    { include = "lineprofiler" },
+    # The pip name as an importable module, so `import with_line_profiler` works too. It
+    # re-exports lineprofiler and holds nothing of its own.
+    { include = "with_line_profiler.py", format = ["sdist", "wheel"] },
+]
 include = [
     { path = "lineprofiler/py.typed", format = ["sdist", "wheel"] },
     # Tests ship in the sdist so a downstream packager (Spack, EasyBuild, a distro) can

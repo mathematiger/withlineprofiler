@@ -29,8 +29,8 @@ jobs:
           python-version: "3.12"
           cache: poetry
       - run: poetry install --with dev,test --extras resources
-      - run: poetry run ruff check lineprofiler tests
-      - run: poetry run mypy lineprofiler tests
+      - run: poetry run ruff check lineprofiler tests with_line_profiler.py
+      - run: poetry run mypy lineprofiler tests with_line_profiler.py
 
   test:
     name: pytest (py${{ matrix.python }})

@@ -15,15 +15,26 @@ from pathlib import Path
 
 from lineprofiler.accounting.compare import comparison_as_dict, render_comparison
 from lineprofiler.accounting.report import render, report_as_dict
-from lineprofiler.accounting.snapshot import merge_run
+from lineprofiler.accounting.snapshot import MergedRun, merge_run
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Parse arguments and emit the requested output. Returns a process exit code."""
+    """Parse arguments and emit the requested output. Returns a process exit code.
+
+    ``0`` is success, ``1`` means ``trace --fail-over`` found something over its threshold,
+    and ``2`` means the run directory does not exist — a usage error, which is what argparse
+    already uses ``2`` for.
+    """
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command == "report":
-        _emit(_render_report(args), args.output)
+        # Traces are read when they exist: the report's occupancy, concurrency and request
+        # lifecycle blocks all derive from them, and defaulting them away meant a run recorded
+        # with trace=True rendered without the three blocks it was instrumented for. Costs
+        # nothing on the common run, which has no sidecars to read.
+        run = merge_run(args.run_dir, with_samples=not args.no_samples, with_trace=True)
+        _emit(_render_report(run, args.format), args.output)
+        return _report_exit_code(run)
     elif args.command == "compare":
         _emit(_render_compare(args), args.output)
     elif args.command == "trace":
@@ -140,19 +151,27 @@ def _add_output_arguments(
     )
 
 
-def _render_report(args: argparse.Namespace) -> str:
-    # Traces are read when they exist: the report's occupancy, concurrency and request
-    # lifecycle blocks all derive from them, and defaulting them away meant a run recorded
-    # with trace=True rendered without the three blocks it was instrumented for. Costs
-    # nothing on the common run, which has no sidecars to read.
-    run = merge_run(args.run_dir, with_samples=not args.no_samples, with_trace=True)
-    if args.format == "json":
+def _render_report(run: MergedRun, output_format: str) -> str:
+    if output_format == "json":
         return json.dumps(report_as_dict(run), indent=2)
-    if args.format == "html":
+    if output_format == "html":
         from lineprofiler.accounting.htmlreport import render_html
 
         return render_html(run)
     return render(run)
+
+
+def _report_exit_code(run: MergedRun) -> int:
+    """``2`` when the run directory does not exist, ``0`` otherwise.
+
+    Two failures look alike from a shell and are not: a path that does not exist is a usage
+    error — the same thing argparse already exits ``2`` for — while a directory that exists
+    and holds no worker files is a legitimate answer about a run nobody profiled, and must not
+    fail a pipeline that merely reports on every run it finds. ``1`` stays reserved for
+    ``trace --fail-over``, which is a finding about the run rather than a problem with the
+    command. The report is written either way; only the code differs.
+    """
+    return 2 if run.empty_reason == "missing" else 0
 
 
 def _render_trace(args: argparse.Namespace) -> str:
@@ -167,61 +186,14 @@ def _render_trace(args: argparse.Namespace) -> str:
     run = merge_run(args.run_dir, with_samples=True, with_trace=True)
     progress(f"loaded {len(run.workers)} workers")
     if args.format == "json":
-        from lineprofiler.accounting.findings import phase_totals, rank_findings
+        # The same document the library's write_trace emits: the ranking the page leads with
+        # is derived once, in findings.py, so a gate and a saved file cannot disagree.
+        from lineprofiler.accounting.findings import trace_as_dict
         from lineprofiler.accounting.tracealign import align_run
 
         aligned = align_run(run)
         progress(f"aligned {len(aligned.spans):,} spans")
-        return json.dumps(
-            {
-                "duration_ns": aligned.duration_ns,
-                "lanes": aligned.lanes,
-                "spans": len(aligned.spans),
-                "arrows": [
-                    {
-                        "channel": arrow.channel,
-                        "key": arrow.key,
-                        "from": arrow.src_worker,
-                        "to": arrow.dst_worker,
-                        "delay_ns": arrow.delay_ns,
-                    }
-                    for arrow in aligned.arrows
-                ],
-                "unmatched_waits": aligned.unmatched_waits,
-                "dropped_spans": aligned.dropped_spans,
-                # Worker to the number of clock anchors rejected as steps. Present so a gate
-                # reading this file learns the axis was repaired; without it the JSON is the
-                # one output that repairs silently, and it is the one a machine acts on.
-                "clock_steps": aligned.clock_steps,
-                # The same ranking the page leads with. A gate that has to re-derive "was
-                # this a queue or a stall" from spans and arrows would be reimplementing
-                # findings.py against the same data, and the two would drift.
-                "findings": [
-                    {
-                        "kind": finding.kind,
-                        "headline": finding.headline,
-                        "detail": finding.detail,
-                        "cost_pct": round(finding.cost_pct, 2),
-                        "anchor": finding.anchor,
-                        "lanes": list(finding.lanes),
-                    }
-                    for finding in rank_findings(aligned)
-                ],
-                "phases": [
-                    {
-                        "path": total.path,
-                        "calls": total.calls,
-                        "lanes": total.lanes,
-                        "wall_ns": total.wall_ns,
-                        "self_ns": total.self_ns,
-                        "wait_ns": total.wait_ns,
-                        "wait_pct": round(total.wait_pct, 1),
-                    }
-                    for total in phase_totals(aligned)
-                ],
-            },
-            indent=2,
-        )
+        return json.dumps(trace_as_dict(aligned), indent=2)
     from lineprofiler.accounting.htmltrace import render_trace_html
 
     return render_trace_html(run, max_spans=args.max_spans, progress=progress)

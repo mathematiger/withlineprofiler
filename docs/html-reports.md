@@ -87,6 +87,21 @@ a command line a path that does not exist is usually a typo, and failing loudly 
 scattering directories. The library call `write_html()` does create them, since a caller
 writing to `reports/run-17.html` from code means it.
 
+Every command also works as `python -m lineprofiler ...`, for when the console script is not on `PATH`.
+
+### From code
+
+The same two documents can be written by the script that produced the run, without shelling out to the CLI:
+
+```python
+from lineprofiler.accounting import write_report, write_trace
+
+write_report("profile", "reports/run-17.html", format="html")   # text | json | html
+write_trace("profile", "reports/run-17-trace.html")             # html | json
+```
+
+The formats are exactly the CLI's, and an unrecognised one raises rather than quietly falling back. Both create parent directories, as `write_html()` does. Both read the trace sidecars: the findings, the occupancy and the request-lifecycle blocks are all derived from spans, so a run recorded with `trace=True` renders with everything it was instrumented for. `write_trace(..., format="json")` emits the same document `lineprofiler trace --format json` prints — one derivation, so a gate and the file beside it cannot disagree.
+
 ## The trace timeline
 
 ```

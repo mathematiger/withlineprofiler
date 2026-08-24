@@ -212,6 +212,8 @@ class Profiler:
     Args:
         run_dir: Directory for output. Created if absent. Defaults to the directory a
             parent process propagated via ``LINEPROFILER_RUN_DIR``, then to ``"profile"``.
+            Passing it explicitly also turns the profiler on, unless ``enabled`` says
+            otherwise — see ``enabled``.
         role: What this process does — ``"learner"``, ``"actor"``, ``"inference"``, or
             whatever your architecture calls its workers. The report groups phases by role,
             because in a pipeline where sixteen actors run alongside one learner, a single
@@ -224,8 +226,11 @@ class Profiler:
             the environment — a ``forkserver`` daemon freezes its environment at start, so
             variables exported after that never reach children it forks.
         enabled: Master switch. When ``False`` every method is a no-op with no clock reads,
-            no allocation and no thread. Defaults to the truthiness of the
-            ``LINEPROFILER_PROFILE`` environment variable.
+            no allocation and no thread. Resolved in this order: this argument, then an
+            explicitly passed ``run_dir`` (which means ``True``), then the truthiness of the
+            ``LINEPROFILER_PROFILE`` environment variable, then ``False``. ``enabled=False``
+            beats an explicit ``run_dir``, so a launcher can turn a run off without editing
+            the call.
         snapshot_interval_s: Seconds between aggregate flushes. ``None`` disables the
             background flush thread, leaving only the exit and signal flushes.
         sample_interval_s: Seconds between resource samples (memory, I/O, GPU). ``None``
@@ -315,7 +320,7 @@ class Profiler:
         source: dict[str, object] | None = None,
         cuda_sync: bool | None = None,
     ) -> None:
-        self.enabled: bool = _resolve_enabled(enabled)
+        self.enabled: bool = _resolve_enabled(enabled, run_dir is not None)
         self.measure_cpu: bool = measure_cpu
         self.strict_names: bool = strict_names
         self.thread_names: bool = thread_names
@@ -357,6 +362,9 @@ class Profiler:
         # for _sync, _nvtx and _record_function, so an untraced phase pays one pointer
         # compare. Assigned before the `enabled` guard so the attribute always exists.
         self._trace: TraceBuffer | None = None
+        # Also assigned before the guard, and for the same reason: a disabled profiler still
+        # counts the phases entered on it so close() can say they recorded nothing.
+        self._disabled_phases = 0
         self._trace_mode: str = _resolve_trace(trace)
         self._trace_capacity = trace_capacity
         self._trace_functions = trace_functions
@@ -493,6 +501,10 @@ class Profiler:
             - a phase entered both ways counts only the unsynchronised entries
         """
         if not self.enabled:
+            # Counted, not recorded: one attribute load, add and store, no allocation. It is
+            # what lets close() say how much measurement was lost. The count cannot live on
+            # _NULL_SCOPE, which is a singleton shared by every profiler in the process.
+            self._disabled_phases += 1
             return _NULL_SCOPE
         if sample != 1.0:
             return self._sampled_phase(name, io, sync, sample, async_work)
@@ -704,9 +716,17 @@ class Profiler:
             - a fork after this writes nothing and starts no thread
             - environment variables this instance propagated are unset; ones it found already
               set are left alone
+            - a disabled profiler that had phases entered on it warns; one that had none
+              closes silently, and closing twice warns once
         """
         uninstall_profiler(self)
-        if self._closed or not self.enabled:
+        if self._closed:
+            return
+        if not self.enabled:
+            # Set before warning so the warning fires once however many times close() is
+            # called, keeping close() idempotent.
+            self._closed = True
+            _warn_if_used_while_disabled(self.run_dir, self._disabled_phases)
             return
         self._closed = True
         if self._flush_timer is not None:
@@ -1630,10 +1650,10 @@ def start(run_dir: str | Path | None = None, role: str | None = None, **kwargs: 
         ...
         stop()                  # bottom of the script
 
-    Equivalent to ``Profiler(run_dir=run_dir, role=role, install=True, **kwargs)``. Respects
-    the same ``LINEPROFILER_PROFILE``/``LINEPROFILER_ROLE``/``LINEPROFILER_RUN_DIR`` defaults
-    as the constructor, so a disabled profiler is a near-free no-op and these two calls are
-    safe to leave in place permanently.
+    Equivalent to ``Profiler(run_dir=run_dir, role=role, install=True, **kwargs)``, and so it
+    inherits the constructor's resolution order: an explicit ``run_dir`` turns the profiler
+    on, and without one it follows ``LINEPROFILER_PROFILE``. Called with neither, it is a
+    near-free no-op, which is what makes these two calls safe to leave in place permanently.
     """
     return Profiler(run_dir=run_dir, role=role, install=True, **kwargs)  # type: ignore[arg-type]
 
@@ -1772,10 +1792,25 @@ def _in_running_event_loop() -> bool:
     return True
 
 
-def _resolve_enabled(enabled: bool | None) -> bool:
-    """Resolve the master switch, reading the environment only when not given explicitly."""
+def _resolve_enabled(enabled: bool | None, run_dir_given: bool) -> bool:
+    """Resolve the master switch: explicit ``enabled``, then ``run_dir``, then the environment.
+
+    Naming a run directory is a statement of intent — nobody passes ``run_dir="profile"`` and
+    means "write nothing there" — and the version before this one recorded nothing, exited
+    zero and did not even create the directory, so a caller's phases vanished with no way to
+    tell that from a run too fast to measure.
+
+    ``run_dir_given`` is the *constructor argument*, never the resolved
+    :attr:`Profiler.run_dir`. Keying on the resolved path would read the directory that
+    :func:`_propagate_to_children` exported through ``LINEPROFILER_RUN_DIR``, so a ``spawn``
+    child of a profiled parent would enable itself from an inherited variable — including
+    against an explicit ``enabled=False`` of its own. Explicit ``enabled`` always wins, in
+    both directions.
+    """
     if enabled is not None:
         return enabled
+    if run_dir_given:
+        return True
     return _truthy(os.environ.get(ENV_ENABLE, ""))
 
 
@@ -1879,6 +1914,29 @@ def _propagate_to_children(run_dir: Path, run_id: str, trace_mode: str = "off") 
     for key in newly_set:
         os.environ[key] = to_set[key]
     return newly_set
+
+
+def _warn_if_used_while_disabled(run_dir: Path, phases: int) -> None:
+    """Warn when a profiler that recorded nothing was nevertheless used.
+
+    The failure this exists for is silent: a disabled profiler runs clean, exits zero and
+    writes no file — not even the directory — so the phases a caller wrapped their training
+    loop in simply vanish, and the first sign of it is an empty run directory much later.
+
+    Both remedies are named because which one applies depends on who controls what: a caller
+    who owns the call site passes ``enabled=True``, while one whose code is started by a
+    launcher exports the variable instead. Silent when no phase was entered, since a profiler
+    left switched off and unused is exactly what the no-op path is for.
+    """
+    if not phases:
+        return
+    warnings.warn(
+        f"this accounting Profiler was disabled, so the {phases} phase(s) entered on it "
+        f"recorded nothing and {run_dir} was never written. Pass enabled=True to Profiler(), "
+        "or export LINEPROFILER_PROFILE=1 before starting the run.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
 
 
 def _warn_if_already_live(run_dir: Path) -> None:

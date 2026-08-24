@@ -18,7 +18,7 @@ from lineprofiler import accounting
 from lineprofiler.accounting import DurationHistogram, PhaseStats, Profiler, merge_run
 from lineprofiler.accounting.histogram import BUCKET_COUNT, bucket_index, bucket_lower_ns
 from lineprofiler.accounting.phasetree import PhaseTree, merge_trees
-from lineprofiler.accounting.report import render
+from lineprofiler.accounting.report import render, report_as_dict
 
 # ── histogram ───────────────────────────────────────────────────────────────
 
@@ -304,7 +304,8 @@ def test_disabled_profiler_creates_no_files_and_no_threads(tmp_path: Path) -> No
     with profiler.phase("noop"):
         profiler.count("ignored", 5)
     profiler.snapshot()
-    profiler.close()
+    with pytest.warns(RuntimeWarning):  # the phase above recorded nothing, and close() says so
+        profiler.close()
 
     assert not run_dir.exists()
     assert threading.active_count() == before
@@ -318,6 +319,44 @@ def test_a_disabled_profiler_opens_no_process_handle(tmp_path: Path) -> None:
 
     assert profiler._process is None  # noqa: SLF001
     assert profiler.io_counters().is_empty(), "and it still answers rather than raising"
+
+
+def test_a_disabled_profiler_that_was_used_warns_on_close(tmp_path: Path) -> None:
+    """The measurement is gone either way; the point is that the caller hears about it."""
+    run_dir = tmp_path / "profile"
+    profiler = Profiler(run_dir=run_dir, enabled=False)
+    with profiler.phase("iteration"):
+        pass
+
+    with pytest.warns(RuntimeWarning) as caught:
+        profiler.close()
+
+    message = str(caught[0].message)
+    assert str(run_dir) in message, "the caller must be told which directory stayed empty"
+    assert "enabled=True" in message
+    assert "LINEPROFILER_PROFILE=1" in message
+
+
+def test_a_disabled_profiler_that_was_never_used_closes_silently(
+    tmp_path: Path, recwarn: pytest.WarningsRecorder,
+) -> None:
+    """Left switched off and untouched is exactly what the no-op path is for."""
+    Profiler(run_dir=tmp_path, enabled=False).close()
+
+    assert [w for w in recwarn if issubclass(w.category, RuntimeWarning)] == []
+
+
+def test_closing_a_disabled_profiler_twice_warns_once(
+    tmp_path: Path, recwarn: pytest.WarningsRecorder,
+) -> None:
+    profiler = Profiler(run_dir=tmp_path, enabled=False)
+    with profiler.phase("iteration"):
+        pass
+
+    profiler.close()
+    profiler.close()
+
+    assert len([w for w in recwarn if issubclass(w.category, RuntimeWarning)]) == 1
 
 
 def test_environment_variable_is_read_once(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -445,6 +484,55 @@ def test_report_of_an_empty_run_does_not_raise(tmp_path: Path) -> None:
     assert "Processes 0" in render(merge_run(tmp_path))
 
 
+def test_a_missing_run_directory_says_so_rather_than_reporting_zeros(tmp_path: Path) -> None:
+    """``rglob`` on a directory that is not there yields nothing and raises nothing, so a
+    typo'd path used to render as a complete measurement of a run that took no time."""
+    run = merge_run(tmp_path / "not-a-run")
+
+    assert run.empty_reason == "missing"
+    assert "No run directory" in render(run)
+
+
+def test_an_empty_run_directory_says_the_profiler_wrote_nothing(tmp_path: Path) -> None:
+    """The other half of the same confusion, and the one a disabled profiler produces."""
+    (tmp_path / "workers").mkdir(parents=True)
+
+    run = merge_run(tmp_path)
+
+    assert run.empty_reason == "no_worker_files"
+    text = render(run)
+    assert "No worker files" in text
+    assert "close() was never reached" in text, "both causes, since only the caller can tell"
+
+
+def test_a_populated_run_says_nothing_about_being_empty(tmp_path: Path) -> None:
+    """The guard on the golden files: a real run's header must not move by one byte."""
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+    with profiler, profiler.phase("step"):
+        pass
+
+    run = merge_run(tmp_path)
+
+    assert run.empty_reason == ""
+    assert "empty" not in report_as_dict(run)["caveats"]
+    assert "No worker files" not in render(run)
+
+
+def test_unreadable_worker_files_are_not_called_an_empty_run(tmp_path: Path) -> None:
+    """Something was written; ``unreadable`` states that precisely. Claiming nobody wrote to
+    the directory would contradict the caveat sitting beside it."""
+    workers = tmp_path / "workers"
+    workers.mkdir(parents=True)
+    (workers / "w_broken.json").write_text("{not json", encoding="utf-8")
+
+    run = merge_run(tmp_path)
+
+    assert run.unreadable
+    assert run.empty_reason == ""
+
+
 # ── crash resilience ────────────────────────────────────────────────────────
 
 
@@ -544,8 +632,75 @@ def test_an_explicitly_disabled_profiler_still_installs_as_a_no_op(tmp_path: Pat
             accounting.count("ignored", 1)
         assert profiler.merged_tree() == {}
     finally:
-        profiler.close()
+        with pytest.warns(RuntimeWarning):  # a phase was entered and recorded nothing
+            profiler.close()
         accounting.uninstall_profiler()
+
+
+# ── writing a report from code ───────────────────────────────────────────────
+
+
+def _traced_run(run_dir: Path) -> None:
+    """One short traced run, so the written pages have both phases and spans to draw."""
+    profiler = Profiler(
+        run_dir=run_dir, role="learner", enabled=True,
+        snapshot_interval_s=None, sample_interval_s=None, trace=True,
+    )
+    with profiler, profiler.phase("iteration"):
+        time.sleep(0.01)
+
+
+def test_write_report_writes_each_format_to_a_nested_path(tmp_path: Path) -> None:
+    """The library convention: a caller writing to ``reports/run-17.html`` from code means it,
+    so the directory is created rather than the call failing."""
+    _traced_run(tmp_path / "run")
+
+    for suffix, output_format in (("txt", "text"), ("json", "json"), ("html", "html")):
+        destination = tmp_path / "out" / output_format / f"report.{suffix}"
+        accounting.write_report(tmp_path / "run", destination, format=output_format)
+        assert "iteration" in destination.read_text(encoding="utf-8")
+
+    document = json.loads((tmp_path / "out" / "json" / "report.json").read_text())
+    assert document["run"]["roles"] == ["learner"]
+
+
+def test_write_report_reads_the_trace_so_the_findings_appear(tmp_path: Path) -> None:
+    """It merges ``with_trace=True`` for the same reason the CLI does: the findings, the
+    occupancy and the lifecycle blocks are all derived from spans."""
+    _traced_run(tmp_path / "run")
+
+    destination = tmp_path / "report.json"
+    accounting.write_report(tmp_path / "run", destination, format="json")
+
+    assert "iteration" in json.loads(destination.read_text())["roles"][0]["phases"][0]["phase"]
+
+
+def test_write_report_rejects_an_unknown_format(tmp_path: Path) -> None:
+    """Raised rather than defaulted: a typo that silently wrote text where html was asked for
+    is discovered when someone opens the file."""
+    _traced_run(tmp_path / "run")
+
+    with pytest.raises(ValueError, match="format"):
+        accounting.write_report(tmp_path / "run", tmp_path / "out.txt", format="markdown")
+
+
+def test_write_trace_writes_html_and_json(tmp_path: Path) -> None:
+    _traced_run(tmp_path / "run")
+
+    page = tmp_path / "out" / "trace.html"
+    accounting.write_trace(tmp_path / "run", page)
+    assert page.read_text(encoding="utf-8").startswith("<!doctype html>")
+
+    document = tmp_path / "out" / "trace.json"
+    accounting.write_trace(tmp_path / "run", document, format="json")
+    assert json.loads(document.read_text())["spans"] > 0
+
+
+def test_write_trace_rejects_an_unknown_format(tmp_path: Path) -> None:
+    _traced_run(tmp_path / "run")
+
+    with pytest.raises(ValueError, match="format"):
+        accounting.write_trace(tmp_path / "run", tmp_path / "out.html", format="text")
 
 
 # ── start() / stop() sugar ───────────────────────────────────────────────────
@@ -574,15 +729,60 @@ def test_stop_with_nothing_installed_is_a_no_op() -> None:
     assert accounting.installed_profiler() is None
 
 
-def test_start_defaults_to_disabled_without_the_env_var(
+def test_an_explicit_run_dir_enables_the_profiler(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Naming a directory is a statement of intent. Asserting on the worker file rather than
+    on the flag, because the flag is not what the caller was promised — the file is."""
     monkeypatch.delenv("LINEPROFILER_PROFILE", raising=False)
-    profiler = accounting.start(run_dir=tmp_path, role="actor")
+    profiler = accounting.start(
+        run_dir=tmp_path, role="actor", snapshot_interval_s=None, sample_interval_s=None,
+    )
+    try:
+        assert profiler.enabled is True
+        with accounting.phase("iteration"):
+            accounting.count("simulations", 8)
+    finally:
+        accounting.stop()
+
+    run = merge_run(tmp_path)
+    assert len(run.workers) == 1
+    assert run.tree[("iteration",)].counters == {"simulations": 8}
+
+
+def test_start_without_a_run_dir_stays_disabled_without_the_env_var(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("LINEPROFILER_PROFILE", raising=False)
+    monkeypatch.delenv("LINEPROFILER_RUN_DIR", raising=False)
+    profiler = accounting.start(role="actor")
     try:
         assert profiler.enabled is False
     finally:
         accounting.stop()
+
+
+def test_explicit_enabled_false_beats_an_explicit_run_dir(tmp_path: Path) -> None:
+    profiler = Profiler(run_dir=tmp_path, enabled=False)
+    assert profiler.enabled is False
+    profiler.close()
+
+
+def test_an_inherited_run_dir_does_not_enable_a_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The implication is keyed on the constructor argument, never on the resolved path.
+
+    ``_propagate_to_children`` exports ``LINEPROFILER_RUN_DIR`` alongside the switch, so a
+    profiler that read the resolved directory would enable itself in a ``spawn`` child of a
+    profiled parent from the inherited variable alone.
+    """
+    monkeypatch.delenv("LINEPROFILER_PROFILE", raising=False)
+    monkeypatch.setenv("LINEPROFILER_RUN_DIR", str(tmp_path))
+
+    profiler = Profiler()
+    assert profiler.enabled is False
+    profiler.close()
 
 
 # ── live export ─────────────────────────────────────────────────────────────

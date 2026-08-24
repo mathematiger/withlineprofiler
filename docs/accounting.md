@@ -29,12 +29,16 @@ with profiler.phase("checkpoint", io=True):            # exact byte attribution
     save(model)
 ```
 
+Naming a `run_dir` turns the profiler on: nobody passes one and means "write nothing there". Without one, the switch is `LINEPROFILER_PROFILE=1` in the environment, which is what lets library code carry `accounting.phase(...)` calls permanently at no cost. An explicit `enabled=` beats both, in either direction, so a launcher can turn a run off without editing the call — and a profiler that ends up disabled with phases entered on it says so on `close()` rather than leaving an empty directory to be discovered later.
+
 ```
 lineprofiler report profile/
 lineprofiler report profile/ --no-samples     # phases only; skips the resource blocks
 lineprofiler report profile/ --json           # the same run as data, for CI gates and diffs
 lineprofiler compare profile_a/ profile_b/ [--json]
 ```
+
+Every command also works as `python -m lineprofiler report profile/`, which needs only the package to be importable — no console script on `PATH`. From inside the script that produced the run, `write_report("profile", "report.html", format="html")` writes the same report to a file directly; `write_trace` does the same for the timeline. Both take the CLI's formats.
 
 The report is grouped by role, because sixteen actors always dominate a single global
 percentage whether or not they are the bottleneck:
