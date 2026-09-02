@@ -153,6 +153,10 @@ machine's core count otherwise. Under Slurm or in a container these differ, and 
 printed: the machine total alone overstates the headroom, the quota alone hides what the box
 was.
 
+**Two VRAM rows, because there are two instruments.** `VRAM peak alloc` is the torch caching allocator's view: your tensors, and nothing else. `VRAM peak held` is what the device reports for this run's pids — the column `nvidia-smi` shows — and it additionally counts the CUDA primary context every process with a device pays for, a few hundred MB each that the allocator never sees. On a run with several workers the second dominates: 304.8 MB of allocator against 2.7 GB actually held. Ask the allocator row how big your tensors are; ask the held row whether another worker fits on the card. The held row needs `nvidia-ml-py` and is omitted — not zeroed — where the driver will not attribute memory per process, which some MIG and vGPU configurations do not.
+
+When a role holds VRAM with no allocator activity at all, the report names it: that is a CUDA context in a process doing no GPU work, and the usual cause is `phase(sync=True)` in a worker that holds no model. `Profiler(cuda_sync=False)` is the fix, and current versions avoid creating the context in the first place.
+
 CPU sampling needs `psutil`; device models and VRAM totals need `nvidia-ml-py`. Without them
 the corresponding rows are omitted and the report says so — a resource that was never measured
 is never rendered as zero. Capacity is recorded per worker, so a run spanning a fat node and a
@@ -167,6 +171,10 @@ per-line memory are left to `torch.profiler`, VizTracer, memray and nsys. The GP
 reports utilisation — per device, and split into your run's share and everyone else's — which
 tells you *whether* the GPU is the constraint, never *which kernel* is. `backend="torch"` gets
 you that breakdown for a window.
+
+**It does not attribute per asyncio task.** Phase statistics are per *thread*, which is what lets the hot path take no locks — and asyncio tasks share a thread. So a phase held across an `await` while another task enters the same phase is recorded as nested inside itself: every level claims the full duration, the outermost row reports one entry for however many requests were served, and past 32 levels the phases fold and record nothing at all. The numbers are wrong rather than missing, so both the profiler and the report say so — a `RuntimeWarning` when it happens, and a line in the report header for whoever opens the file later.
+
+This matters most for an inference server, which is the common asyncio shape in an RL pipeline. Two ways to get correct numbers: put the phase around a region that does not `await` (the encode, the forward, the scatter — each measured on its own), or run one task per thread. To measure the *waiting* itself, use `signal_ready()`/`wait_on()` or the request lifecycle (`trace_begin`/`trace_mark`/`trace_end`), which are built for exactly this and record timestamps rather than a stack.
 
 ## The trace timeline
 

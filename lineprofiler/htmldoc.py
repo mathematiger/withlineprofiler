@@ -121,13 +121,48 @@ def embed_json(data: JsonValue) -> str:
 
 
 def escape(text: str) -> str:
-    """Escape text for use in element content or a quoted attribute."""
-    return (
+    """Escape text for use in element content or a quoted attribute.
+
+    Control characters are replaced as well as the four markup characters, because they are a
+    different failure with the same cause. ``&<>"`` change the markup; a newline or a NUL does
+    not — both are legal in an HTML document — and both still wreck the table they land in. A
+    phase name is user data and can hold either, so a name of ``a\\nb\\rc\\x00d`` reached a
+    ``<td>`` intact and split one cell across lines. Replacing rather than dropping keeps two
+    names that differ only by a control character distinguishable on the page.
+    """
+    escaped = (
         text.replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
         .replace('"', "&quot;")
     )
+    return "".join(
+        "\ufffd" if (ch < " " or "\x7f" <= ch <= "\x9f" or ch in "\u2028\u2029") else ch
+        for ch in escaped
+    )
+
+
+MAX_LABEL_DRAWN = 90
+"""How much of a phase name any page draws before it is cut.
+
+Wide enough that no ordinary path reaches it, so the common row is untouched. A name built
+from data — a file path, a URL, a serialised config — has no bound at all, and an unbounded
+label stretches its table until every column beside it is off-screen, once per table.
+"""
+
+
+def clip_label(text: str) -> str:
+    """Bound a user-supplied label to what a page can draw, marking the cut.
+
+    The tail is kept for the same reason ``report.format_label`` keeps it — the leaf is what a
+    reader is looking for — and the ellipsis is what makes that safe, since an unmarked
+    truncation prints a name that does not exist. Returns plain text, not markup: callers
+    escape it like any other label, and the complete name remains in the embedded JSON, which
+    is where a reader goes for exact values anyway.
+    """
+    if len(text) <= MAX_LABEL_DRAWN:
+        return text
+    return "…" + text[-(MAX_LABEL_DRAWN - 1):]
 
 
 def tile(key: str, value: str) -> str:

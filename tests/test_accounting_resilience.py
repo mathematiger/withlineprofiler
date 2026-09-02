@@ -37,7 +37,10 @@ from lineprofiler.accounting.report import (
     _io_attribution_note,
     _io_phase_rows,
     _label,
+    _self_nesting_warning,
+    _share_rows,
     format_label,
+    format_ns,
 )
 from lineprofiler.accounting.sampler import IoSnapshot, Sample, read_io_snapshot
 from lineprofiler.accounting.snapshot import SnapshotWriter, new_run_id
@@ -264,6 +267,44 @@ def test_a_second_attempt_supersedes_the_first(tmp_path: Path) -> None:
     assert len(run.workers) == 1
     assert len(run.superseded) == 1
     assert "earlier attempt" in render(run)
+
+
+def test_losing_most_of_the_workers_is_said_beside_the_process_count(tmp_path: Path) -> None:
+    """The excluded majority must be declared where the count is, not only at the foot.
+
+    Four workers that each built their own ``Profiler`` get one attempt id each, so a healthy
+    job reads as four competing attempts and the report describes one of them under a header
+    saying "Processes 1". CAVEATS does say so, but it prints below the findings and every
+    total — all of which were computed without those workers. The warning belongs against the
+    number it contradicts, and it names the cause because the cause has a one-line fix.
+    """
+    for index in range(3):
+        _one_attempt(tmp_path, f"w{index}", 2)
+        time.sleep(1.05)  # run ids carry a one-second timestamp resolution
+    _one_attempt(tmp_path, "w3", 2)
+
+    report = render(merge_run(tmp_path))
+    header = report.split("FINDINGS")[0]
+
+    assert "WARNING" in header, "the warning must precede the conclusions it undermines"
+    assert "3 of 4 worker file(s) are excluded" in header
+    assert "run_id=" in header, "the fix must be named, not just the symptom"
+
+
+def test_a_single_superseded_attempt_does_not_raise_the_warning(tmp_path: Path) -> None:
+    """An ordinary rerun into the same directory is what the mechanism is *for*.
+
+    One superseded attempt against one kept worker is the designed behaviour, not a lost
+    majority, and warning about it in the header would train the reader to ignore the line.
+    """
+    _one_attempt(tmp_path, "train", 3)
+    time.sleep(1.05)
+    _one_attempt(tmp_path, "train", 5)
+
+    report = render(merge_run(tmp_path))
+
+    assert "WARNING" not in report.split("FINDINGS")[0]
+    assert "earlier attempt" in report, "CAVEATS still declares it"
 
 
 def test_workers_of_one_attempt_are_not_split(tmp_path: Path) -> None:
@@ -1153,3 +1194,300 @@ def test_a_sample_row_without_cpu_percent_reads_as_unmeasured(tmp_path: Path) ->
 
     assert not analysis.cpu.measured
     assert analysis.memory.peak_rss == 1000
+
+
+# ── a name built from data must not break the report's column contract ──────
+
+
+def _tree_with(name: str, wall_ns: int = 1000) -> PhaseTree:
+    """A two-phase tree whose first branching level holds ``name`` beside a short sibling."""
+    tree: PhaseTree = {}
+    for phase, wall in ((name, wall_ns), ("short", wall_ns)):
+        stats = PhaseStats()
+        stats.calls = 1
+        stats.wall_ns = wall
+        tree[(phase,)] = stats
+    return tree
+
+
+def test_an_overlong_phase_name_is_truncated_in_the_pipeline_breakdown() -> None:
+    """The one row that padded without truncating printed a 10,000-column line.
+
+    Every other label in this report goes through ``format_label``, which keeps the tail and
+    marks the cut. The pipeline breakdown used a bare ``{name:<28}``, which pads a short name
+    and lets a long one run to whatever length the caller chose. A phase named from data --
+    a path, a URL, a serialised config -- then broke the fixed-width contract the rest of the
+    report keeps, and the row's own numbers scrolled off the far right where nobody reads them.
+    """
+    rows = _share_rows(_tree_with("x" * 10_000))
+
+    assert max(len(row) for row in rows) < 120
+    assert any(row.startswith("…") for row in rows), "the cut must be marked, not silent"
+    assert any("x" in row for row in rows), "the informative tail must survive"
+
+
+def test_a_truncated_phase_name_keeps_its_row_numbers_aligned() -> None:
+    """Truncation exists to protect the columns beside it, so check those, not just the width.
+
+    A label that swallows its own gap runs into the percentage next to it and prints a number
+    joined to a name. The share column is what a reader scans down; it has to stay a column.
+    """
+    long_row, short_row = _share_rows(_tree_with("y" * 200))
+
+    assert long_row.index("%") == short_row.index("%")
+
+
+def test_a_huge_counter_rate_does_not_print_thirty_digits_of_false_precision() -> None:
+    """The count itself is never truncated — a truncated number is a wrong number, and the
+    surrounding row is built to push right rather than overwrite. The *derived* rate is a
+    different thing: ``1,180,591,620,717,411,303,424,000,000.0/s`` claims a per-second figure
+    to the tenth from a phase that ran once for a microsecond. ``format_ns`` already sets this
+    report's convention of three significant digits; the rate column is the one place that
+    ignored it.
+    """
+    stats = PhaseStats()
+    stats.calls = 1
+    stats.wall_ns = 1_000
+    stats.counters = {"big": 2**70}
+    stats.counter_min = {"big": 2**70}
+    stats.counter_max = {"big": 2**70}
+
+    row = _counter_rows(stats.counters, stats.wall_ns, stats)[0]
+
+    assert "1,180,591,620,717,411,303,424" in row, "the measured count stays exact"
+    assert "424,000,000.0/s" not in row, "the derived rate must not claim that precision"
+    assert "1.18e+27/s" in row
+
+
+def test_an_ordinary_counter_rate_keeps_its_familiar_form() -> None:
+    """The compact form is for the magnitudes that broke the column, not for everyday rows."""
+    stats = PhaseStats()
+    stats.calls = 1
+    stats.wall_ns = 1_000
+    stats.counters = {"records": 42}
+
+    assert "42,000,000.0/s" in _counter_rows(stats.counters, stats.wall_ns, stats)[0]
+
+
+def test_control_characters_in_a_phase_name_cannot_break_a_row_apart() -> None:
+    """A newline in a name turned one table row into four, and a NUL reached the page.
+
+    Phase names come from user code, and a name assembled from data can carry anything a
+    string can hold. Escaping protects the *markup*; it does nothing about a character that
+    is legal in HTML and in a terminal and still destroys the layout. ``a\\nb\\rc\\x00d``
+    rendered as four lines in the text report, three of which carried no numbers at all, and
+    reached a ``<td>`` verbatim in the timeline page.
+    """
+    rows = _share_rows(_tree_with("a\nb\rc\x00d"))
+
+    assert len(rows) == 2, "one phase, one row"
+    for row in rows:
+        assert "\n" not in row and "\r" not in row and "\x00" not in row
+    assert any("a" in row and "d" in row for row in rows), "the name is still legible"
+
+
+# ── a value that parses but cannot be true must not cost the run ────────────
+
+
+def _worker_file(run_dir: Path, **overrides: object) -> None:
+    """One structurally valid worker file, with fields overridable to nonsense."""
+    workers = run_dir / "workers" / "node0"
+    workers.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, object] = {
+        "version": 1, "pid": 1, "role": "actor", "run_id": "r1",
+        "started_at": 1000.0, "written_at": 1010.0,
+        "phases": {"work": {"calls": 10, "wall_ns": 5_000_000, "cpu_ns": 4_000_000,
+                            "child_wall_ns": 0, "hist": {}, "counters": {}}},
+    }
+    payload.update(overrides)
+    (workers / "w_r1_1_a.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_a_non_finite_timestamp_does_not_abort_the_whole_report(tmp_path: Path) -> None:
+    """The defect: one unusable file raised out of ``render`` and cost every other worker.
+
+    ``_read_worker`` guards everything after the parse precisely so that a bad file is a lost
+    worker rather than a lost run — but ``float("inf")`` satisfies every one of those guards,
+    because it *is* a float. It then reached ``format_ns``, whose ``int()`` raised, from the
+    first line of the header. This is reachable rather than hypothetical: ``json.dumps``
+    writes ``Infinity`` and ``NaN`` by default and ``json.loads`` reads them back, so the
+    profiler's own writer round-trips a non-finite clock reading silently.
+    """
+    _worker_file(tmp_path, written_at=float("inf"))
+
+    text = render(merge_run(tmp_path))
+
+    assert "Runtime" in text, "the report still renders"
+    assert "inf" not in text.lower().split("roles")[0]
+
+
+def test_format_ns_reports_an_unusable_number_rather_than_raising() -> None:
+    """Every renderer funnels durations through here, so it is the one place to make safe."""
+    assert format_ns(float("nan")) == "n/a"
+    assert format_ns(float("inf")) == "n/a"
+    assert format_ns(float("-inf")) == "n/a"
+    assert format_ns(1_500) == "1.5us", "ordinary values are untouched"
+
+
+def test_a_runtime_that_ran_backwards_is_not_printed_as_a_negative_duration(
+    tmp_path: Path,
+) -> None:
+    """A clock that went backwards is a broken reading, not a run of negative length.
+
+    ``written_at`` before ``started_at`` happens when a wall clock is stepped mid-run — an
+    NTP correction on a long HPC job — and printed as ``Runtime -1000000000000ns``, which is
+    not a duration anyone can act on. The header must say the figure is unusable instead of
+    stating one that cannot be true.
+    """
+    _worker_file(tmp_path, started_at=2000.0, written_at=1000.0)
+
+    header = render(merge_run(tmp_path)).split("\n")[0]
+
+    assert "-" not in header.split("Processes")[0]
+
+
+def test_an_unusable_runtime_says_why_beside_the_figure(tmp_path: Path) -> None:
+    """``n/a`` says a number is missing; it does not say the clock is the reason.
+
+    A reader who sees it cannot tell a broken timestamp from a run too short to measure, and
+    the distinction decides whether the *rest* of the page can be trusted — the phase totals
+    below it are fine, and nothing on the page says so. This follows the same rule that put
+    ``_excluded_workers_warning`` in the header: a caveat belongs with the number it
+    qualifies, not in a block below the conclusions drawn from it.
+    """
+    _worker_file(tmp_path, written_at=float("inf"))
+
+    text = render(merge_run(tmp_path))
+    header = text.split("\n\n")[0]
+
+    assert "Runtime n/a" in header
+    assert "clock" in header.lower()
+    assert "phase totals" in header.lower(), "say what is still trustworthy"
+
+
+def test_a_healthy_run_carries_no_clock_warning(tmp_path: Path) -> None:
+    """The warning must not become noise on the runs that are fine."""
+    _worker_file(tmp_path)
+
+    assert "clock" not in render(merge_run(tmp_path)).lower()
+
+
+# ── concurrency that is not nesting must not be recorded as nesting ─────────
+
+
+def test_concurrent_asyncio_tasks_are_not_silently_recorded_as_nesting(
+    tmp_path: Path,
+) -> None:
+    """Phase stacks are per *thread*; asyncio tasks share one, so concurrency reads as depth.
+
+    Eight coroutines each opening ``handle_request`` around an ``await`` produce the path
+    ``handle_request/handle_request/…`` eight levels deep, every level claiming the full
+    duration, and the top-level row reporting ``entries 1`` for eight served requests. Nothing
+    in the output says the tree is an artefact — it is a plausible, wrong answer to the
+    question an inference server is profiled to ask, which is the failure class this layer
+    exists to prevent. At 64 concurrent tasks it reaches ``MAX_DEPTH`` and folds, so requests
+    stop being recorded at all.
+
+    The profiler cannot attribute per task without a per-task stack, which the hot path cannot
+    afford. What it must not do is stay silent.
+    """
+    asyncio = pytest.importorskip("asyncio")
+    profiler = Profiler(
+        run_dir=tmp_path, role="server", enabled=True, install=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+
+    async def handle() -> None:
+        with profiler.phase("handle_request"):
+            await asyncio.sleep(0)
+
+    async def main() -> None:
+        await asyncio.gather(*(handle() for _ in range(4)))
+
+    with pytest.warns(RuntimeWarning, match="asyncio"):
+        asyncio.run(main())
+    profiler.close()
+
+
+def test_the_asyncio_warning_names_the_phase_and_fires_once(tmp_path: Path) -> None:
+    """One warning per profiler: a server opens the same phase per request forever."""
+    asyncio = pytest.importorskip("asyncio")
+    profiler = Profiler(
+        run_dir=tmp_path, role="server", enabled=True, install=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+
+    async def main() -> None:
+        async def handle() -> None:
+            with profiler.phase("handle_request"):
+                await asyncio.sleep(0)
+        for _ in range(3):
+            await asyncio.gather(*(handle() for _ in range(3)))
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        asyncio.run(main())
+    profiler.close()
+
+    asyncio_warnings = [w for w in caught if "asyncio" in str(w.message)]
+    assert len(asyncio_warnings) == 1, [str(w.message) for w in asyncio_warnings]
+    assert "handle_request" in str(asyncio_warnings[0].message)
+
+
+def test_a_threaded_run_does_not_get_the_asyncio_warning(tmp_path: Path) -> None:
+    """Threads get their own stack, so nesting there is real. The warning must not fire."""
+    profiler = Profiler(
+        run_dir=tmp_path, role="worker", enabled=True, install=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+
+    def work() -> None:
+        with profiler.phase("outer"), profiler.phase("inner"):
+            pass
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        threads = [threading.Thread(target=work) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    profiler.close()
+
+    assert not [w for w in caught if "asyncio" in str(w.message)]
+
+
+def test_the_report_says_a_self_nested_phase_tree_may_be_task_concurrency() -> None:
+    """The runtime warning reaches the author; the report reaches whoever opens the file.
+
+    A profile is an artifact that gets attached to a ticket and read by someone who did not
+    run it, and by then the ``RuntimeWarning`` is long gone from a terminal they never saw. A
+    tree of ``handle_request/handle_request/…`` is the one shape that cannot be read at face
+    value, so the page has to say so where the reader meets it.
+    """
+    tree: PhaseTree = {}
+    path: tuple[str, ...] = ()
+    for _ in range(3):
+        path = (*path, "handle_request")
+        stats = PhaseStats()
+        stats.calls = 1
+        stats.wall_ns = 100_000_000
+        tree[path] = stats
+
+    note = _self_nesting_warning(tree)
+
+    assert note, "a phase nested inside itself must be called out"
+    assert "handle_request" in "\n".join(note)
+    assert "asyncio" in "\n".join(note).lower()
+
+
+def test_an_ordinary_nested_tree_gets_no_such_warning() -> None:
+    """Distinct nested phases are the normal case and must stay quiet."""
+    tree: PhaseTree = {}
+    for path in ((("iteration",)), ("iteration", "select"), ("iteration", "rollout")):
+        stats = PhaseStats()
+        stats.calls = 1
+        stats.wall_ns = 1_000
+        tree[path] = stats
+
+    assert _self_nesting_warning(tree) == []

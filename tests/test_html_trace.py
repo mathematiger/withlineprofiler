@@ -23,7 +23,12 @@ import pytest
 
 from lineprofiler.accounting import Profiler
 from lineprofiler.accounting.cli import main
-from lineprofiler.accounting.htmltrace import render_trace_html, write_trace_html
+from lineprofiler.accounting.findings import Finding
+from lineprofiler.accounting.htmltrace import (
+    _findings_block,
+    render_trace_html,
+    write_trace_html,
+)
 from lineprofiler.accounting.snapshot import merge_run
 
 _VOID = {
@@ -196,6 +201,112 @@ def test_the_page_names_the_clock_accuracy(tmp_path: Path) -> None:
     _traced_run(tmp_path)
 
     assert "exact" in _render(tmp_path)
+
+
+def _step_the_wall_clock(run_dir: Path, by_ns: int) -> None:
+    """Move every clock anchor after the first by ``by_ns``, as an NTP step would.
+
+    Rewriting the artifact rather than patching ``time`` keeps the test deterministic: the
+    step is exactly ``by_ns`` and does not depend on how long the run took. The first anchor
+    is left alone because that is the shape of the real failure — the run starts on a good
+    clock and the correction lands part-way through it, so the spans sit in the bracket the
+    step corrupts.
+    """
+    for sidecar in run_dir.rglob("*.trace"):
+        lines = []
+        for line in sidecar.read_text(encoding="utf-8").splitlines():
+            batch = json.loads(line)
+            for anchor in (batch.get("anchors") or [])[1:]:
+                anchor["real_ns"] += by_ns
+            lines.append(json.dumps(batch))
+        sidecar.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_a_stepped_wall_clock_is_stated_beside_the_figures_it_qualifies(
+    tmp_path: Path,
+) -> None:
+    """Fitting through an NTP step reversed the axis and drew every later span as 0ns.
+
+    The repair is silent by nature — the page looks ordinary again — so the disclosure has to
+    reach the header. In the caveats alone it sits below findings drawn from the very axis it
+    is qualifying.
+    """
+    _traced_run(tmp_path, iterations=8)
+    _step_the_wall_clock(tmp_path, by_ns=-3_600 * 1_000_000_000)
+
+    html = _render(tmp_path)
+
+    assert "wall clock stepped mid-run" in html
+    assert html.index("wall clock stepped mid-run") < html.index("Findings")
+    # The caveats list the two facts side by side, so the one-host claim must give way:
+    # "the shared time axis is exact" one line under "the clock stepped" reads as a bug.
+    assert "the shared time axis is exact" not in html
+
+
+def test_a_stepped_wall_clock_does_not_destroy_the_durations_it_precedes(
+    tmp_path: Path,
+) -> None:
+    """The axis is repaired, not merely annotated: the spans keep the width they measured."""
+    _traced_run(tmp_path, iterations=8)
+    unstepped = _embedded(_render(tmp_path))
+    _step_the_wall_clock(tmp_path, by_ns=-3_600 * 1_000_000_000)
+
+    stepped = _embedded(_render(tmp_path))
+
+    # Approximate, not identical: dropping the stepped anchor also drops the drift correction
+    # it would have carried, which moves the shares by a tenth of a point. The claim is that
+    # the figures survive — before the fix this lane read 0.0% busy over a 394-second axis.
+    assert stepped["duration_us"] == pytest.approx(unstepped["duration_us"], rel=0.01)
+    assert [lane["busy"] for lane in stepped["lanes"]] == pytest.approx(
+        [lane["busy"] for lane in unstepped["lanes"]], abs=0.5,
+    )
+
+
+def _with_gpu_samples(run_dir: Path, devices: dict[int, float]) -> None:
+    """Give one worker device readings, which no CPU-only test machine can produce.
+
+    Written into the sample sidecar rather than mocked at the sampler, so the whole read →
+    analyse → render path runs exactly as it does for a real device.
+    """
+    worker = next(
+        path for path in run_dir.rglob("*.json") if path.name != "metadata.json"
+    )
+    rows = [
+        {
+            "t": float(index),
+            "phase": "iteration",
+            "gpu_utils": {str(device): value for device, value in devices.items()},
+            "io_ok": True,
+        }
+        for index in range(3)
+    ]
+    worker.with_suffix(".samples").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8",
+    )
+
+
+def test_the_device_strip_says_it_cannot_be_attributed_to_a_phase(tmp_path: Path) -> None:
+    """A 1 Hz whole-device line drawn under lanes of precise spans invites a wrong reading.
+
+    Nothing ties a utilisation reading to the call that launched the kernel, so a reader who
+    takes the strip for span-resolution data concludes that a busy device beside a busy lane
+    means the one caused the other. The strip has to disclaim that where it is drawn.
+    """
+    _traced_run(tmp_path)
+    _with_gpu_samples(tmp_path, {0: 70.0, 1: 4.0})
+
+    html = _render(tmp_path)
+
+    assert "GPU strips" in html, "two devices, so the note is plural"
+    assert "1 Hz sampler" in html, "the resolution must be stated"
+    assert "never to attribute device time to a phase" in html
+
+
+def test_a_run_with_no_device_makes_no_claim_about_one(tmp_path: Path) -> None:
+    """The note describes a strip the script draws; with no series there is no strip."""
+    _traced_run(tmp_path)
+
+    assert "GPU strip" not in _render(tmp_path)
 
 
 def test_a_phase_named_like_a_script_tag_cannot_escape_its_block(tmp_path: Path) -> None:
@@ -709,3 +820,64 @@ def test_the_causal_walk_cannot_hang_on_a_cycle(tmp_path: Path) -> None:
 
     assert "guard" in walk
     assert "members[" in walk
+
+
+def test_an_overlong_phase_name_is_not_emitted_whole_into_a_table_cell(tmp_path: Path) -> None:
+    """A name built from data must not stretch a table past the page or bloat the file.
+
+    The text report bounds its labels because an over-long one breaks a fixed-width row. The
+    page has the same problem in a different shape: the cell wraps to the width of the name
+    and pushes every column beside it off-screen, and the same string is repeated once per
+    table. The full name stays in the embedded JSON, which is what a reader extracts numbers
+    from, and on the cell's ``title`` so hovering still recovers it — only the *drawn* text is
+    bounded.
+    """
+    name = "x" * 10_000
+    profiler = Profiler(
+        run_dir=tmp_path, role="probe", enabled=True, trace=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    with profiler:
+        with profiler.phase(name):
+            pass
+        with profiler.phase("short"):
+            pass
+
+    html = _render(tmp_path)
+    body = html.split('<script type="application/json"', 1)[0]
+
+    assert name not in body, "the drawn markup must not carry the whole name"
+    assert name in html, "the payload must still hold it in full"
+    assert "…" in body, "the cut is marked, not silent"
+
+
+def _finding(kind: str, lanes: tuple[str, ...]) -> Finding:
+    """One ranked finding, built by hand so the block can be rendered without a run."""
+    return Finding(
+        kind=kind, headline="h", detail="d", cost_pct=10.0, anchor="", lanes=lanes,
+    )
+
+
+def test_findings_that_compare_lanes_across_hosts_say_so_where_they_are_read() -> None:
+    """A cross-host claim must carry its clock caveat, not leave it 7,800 characters below.
+
+    ``only one of 2 lanes was active for 52% of the run`` is entirely a statement about the
+    relative timing of two processes, and when those sit on different hosts the axis holding
+    them is only as good as NTP. The full note is in ``Caveats`` at the foot of the page — the
+    same place the superseded-worker disclosure used to sit while the header said
+    ``Processes 1``, which is the defect this repeats. A reader who stops at the ranked
+    conclusions, which is what the block is designed to let them do, never reaches it.
+    """
+    findings = [_finding("serial", ()), _finding("idle-lane", ("rank 0 (node1)#0",))]
+
+    block = _findings_block(findings, hosts={"node1", "node3"})
+
+    assert "2 hosts" in block or "two hosts" in block
+    assert "clock" in block.lower()
+
+
+def test_a_single_host_run_gets_no_clock_note_in_the_findings() -> None:
+    """Most runs are one host; the note must not become furniture they learn to skip."""
+    block = _findings_block([_finding("serial", ())], hosts={"node1"})
+
+    assert "clock" not in block.lower()

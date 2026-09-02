@@ -73,9 +73,17 @@ with profiler.phase("forward", sync=True):
     logits = model(batch)
 ```
 
-`sync=True` drains the queue at *both* ends of the phase. Entry matters as much as exit:
-synchronising only on exit bills this phase for whatever an earlier one left queued. It is a
-no-op when torch is absent or no CUDA device is visible.
+`sync=True` drains the queue at *both* ends of the phase. Entry matters as much as exit: synchronising only on exit bills this phase for whatever an earlier one left queued. It is a no-op when torch is absent or no CUDA device is visible.
+
+It is also a no-op in a process that has not initialised CUDA, and that one is load-bearing rather than an optimisation. `torch.cuda.synchronize()` is what creates a process's CUDA primary context — measured at **414 MiB of VRAM on an A100**, where neither `import torch` nor `torch.cuda.is_available()` costs anything — so on a GPU box, one `sync=True` phase in a worker that holds no model used to buy it a context it never used. In a pipeline whose actors talk to an inference server over a queue, that is 414 MiB per actor: 1.7 GB at four actors, ~13 GB of a 40 GB card at thirty-two. Since a process with no context has submitted no device work, the drain is skipped there and nothing is lost. The check is a flag read per synchronised phase, and a process that initialises CUDA later starts synchronising from that point.
+
+Two escape hatches, both on the constructor. `Profiler(cuda_sync=False)` switches synchronisation off outright for a role you already know is CPU-only — it composes with the per-role construction you are probably already doing:
+
+```python
+profiler = Profiler(role="actor", cuda_sync=False)   # this worker holds no model
+```
+
+`Profiler(cuda_sync=True)` restores the unconditional drain, context and all, for a caller who wants to synchronise a device this process has not yet touched.
 
 The cost is the pipelining you give up — across that boundary the CPU can no longer run ahead
 of the GPU — so put it on the phases you are actively measuring, not on every phase in the
@@ -110,7 +118,13 @@ DOMINANT PHASES          entries        self    wait       p50       p99
       submission time, not device compute. Re-run that phase with sync=True to
       attribute the device time to it:
       forward                 13,349 entries
+      If a phase's cost does not scale with its batch counter, it is launch-bound:
+      the time is per-kernel launch overhead, not per-element work. Compare its wall
+      time at batch 1 against a large batch; flat means fewer, bigger launches (a
+      captured CUDA graph) is the fix, not a faster kernel.
 ```
+
+That last paragraph is the question the mark leaves open. Knowing 6.3 ms is submission time does not say *why* submitting takes 6.3 ms, and the measurement that settles it is one the profiler cannot run for you: time the same phase at batch 1 and at a large batch. Flat wall time across a 512x range means the cost is per-launch, not per-element — one reported case measured 2.13 ms at both ends, at 145 kernels per call, and replacing the sequence with a captured CUDA graph took it to 0.39 ms for a 2.89x end-to-end win. The counter rows the report already prints are what you compare against; the note only points at the comparison.
 
 `async_work` is ignored when `sync=True` — that phase *did* wait for its work — so flipping
 one to the other is how you turn a submission time into a device time, and the mark
@@ -200,9 +214,7 @@ Measured on Python 3.12 with `benchmarks/bench_accounting.py`, per phase enter+e
 | `phase(async_work=True)` | 3911 — free next to `measure_cpu=True` |
 | `trace_mark()`, `trace=True` | 1277 |
 
-`sync=True` is absent from the table because its cost is not the profiler's: it is however
-long the GPU still had to run. Phases that do *not* set it are unaffected — the check is one
-branch, inside the noise of the numbers above.
+`sync=True` is absent from the table because its cost is not the profiler's: it is however long the GPU still had to run. Phases that do *not* set it are unaffected — the check is one branch, inside the noise of the numbers above. A phase that *does* set it pays one extra `torch.cuda.is_initialized()` flag read per drain, which is what keeps a CPU-only worker from opening a CUDA context; against a `cudaDeviceSynchronize` measured in microseconds to milliseconds it does not register.
 
 `measure_cpu` (on by default) is what produces `wait%`, and it doubles the cost:
 `time.thread_time_ns()` reads `CLOCK_THREAD_CPUTIME_ID`, which is not in the vDSO, so each
@@ -210,9 +222,43 @@ call is a real syscall at roughly 590 ns. `io=True` costs two `/proc` reads and 
 the overhead counter — negligible on a 10 ms checkpoint, ruinous on an inner loop.
 
 **Budget it as a ratio, not as a rule about loops: keep phase overhead under ~1% of the region
-you are measuring.** At ~2 µs per phase that means a phase is affordable around anything taking
-more than ~200 µs, and the table above is there so you can decide per call site without
-measuring.
+you are measuring.** At the default settings that is ~3.9 µs per phase, so a phase is affordable
+around anything taking more than ~400 µs. Budget against the row you will actually run: the
+figure above is `measure_cpu=True`, which is the default because `wait%` is derived from it, and
+turning it off roughly halves the cost at the price of that column. The table above is there so
+you can decide per call site without measuring.
+
+#### If a phase is too expensive, in the order worth trying
+
+Every row of the table above is dominated by Python's own dispatch — allocating the scope, entering and leaving the `with`, and the dictionary work behind the phase tree. There is no configuration that makes those cheaper, so the levers are all about doing less, and they are worth trying in this order:
+
+1. **Turn off `measure_cpu` for that profiler.** The single largest one: two `thread_time_ns()` syscalls at ~590 ns each, measured at **~1.6 µs of a ~4.2 µs phase — 38% of it**. The cost is `wait%`, which is usually the most valuable column on the page, so this is a real trade and not a free win. Take it when you already know a region is CPU-bound, or when you are measuring throughput rather than diagnosing a stall.
+2. **Sample the phase** with `sample=0.01`. Saves ~3.4x rather than 100x — the cost is Python call overhead, not measurement — and everything derived from it becomes a labelled estimate.
+3. **Move the phase outward.** A phase around the loop instead of inside it pays once per loop rather than once per iteration, and `count()` inside the loop still gives you the rate at about a fifth of the price.
+4. **Leave `trace` off unless you need the timeline.** It is off by default; the untraced path costs one identity test.
+
+Not levers, despite looking like them: `sync=True` costs whatever the GPU still had to do rather than any profiler time, and `async_work=True` is one bool test. Neither is worth removing for speed.
+
+#### The part that lands inside the number, not beside it
+
+The table above is what a phase costs *your program*. A different and smaller quantity is what a phase adds to *its own reported wall time*, and it is the one that affects accuracy rather than speed.
+
+`__enter__` reads its clock last and `__exit__` reads its clock first, so almost all of the cost above falls outside the measured interval. What remains inside is the interpreter's own dispatch between those two reads — measured at **~210 ns** with `measure_cpu=False`, **~240 ns** with `measure_cpu=True`, and **~250 ns** with `trace=True`, on the same box as the table above.
+
+That floor is close to irreducible in Python: a bare context manager that does nothing but read `perf_counter_ns()` at each end reports ~185 ns for an empty body, of which ~95 ns is the cost of reading the clock twice. The profiler sits roughly 25 ns above a context manager that measures nothing at all.
+
+**What it means for a reading:** every phase's wall time is inflated by about a quarter of a microsecond, once per entry, and the inflation does not scale with the phase's duration.
+
+| phase duration | inflation from the floor |
+|---|---|
+| 1 ms and up | under 0.03% — ignore it |
+| 100 µs | ~0.25% |
+| 10 µs | ~2.5% |
+| 1 µs | ~25% — the number is mostly measurement |
+
+This is the same ratio the ~1% budget above already enforces, seen from the other side: a phase that clears the budget for speed has also cleared it for accuracy. It matters when you compare a *sum* of very many short phases against a wall clock — a phase entered a million times carries roughly 0.25 s of floor in its total — and when you difference two nested phases whose durations are close.
+
+Neither `self_ns` nor `wait_ns` corrects for it, and the report does not subtract it: the correction would be an estimate, and substituting an estimate for a measurement is exactly what this layer refuses to do elsewhere. It is stated here instead so the arithmetic is yours to do.
 
 Worked example, from an MCTS search: 250 simulations × 3 phases (select / expand / backup) ×
 ~2 µs is 1.5 ms against a 2.4 s search — 0.06%, comfortably worth it. And that select/expand/

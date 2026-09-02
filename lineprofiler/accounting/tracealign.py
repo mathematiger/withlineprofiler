@@ -138,6 +138,15 @@ class AlignedTrace:
     Kept apart from ``arrows`` because they answer a different question: an arrow says who
     released whom, while these decompose one request's wait into named segments stamped in
     the processes that own each transition."""
+    clock_steps: dict[str, int] = field(default_factory=dict)
+    """Lane-owning worker to the number of clock anchors :func:`usable_anchors` rejected.
+
+    A non-empty entry means that worker's wall clock moved mid-run, so its spans are placed
+    by monotonic offset from the run's first anchor rather than by the fit the later ones
+    imply. Durations are unaffected — they come from ``perf_counter`` — but absolute
+    placement after the step, and therefore alignment against another worker, is only as
+    good as the origin. Repairing the axis without saying so would leave a reader trusting a
+    cross-lane gap this module cannot vouch for."""
 
     @property
     def t0_ns(self) -> int:
@@ -158,6 +167,51 @@ class AlignedTrace:
     def is_complete(self) -> bool:
         """Whether every recorded span survived — a wrapped ring means it did not."""
         return self.dropped_spans == 0 and self.dropped_links == 0
+
+
+_CLOCK_STEP_FLOOR_NS = 1_000_000
+"""How far the two clocks may disagree over an interval too short to judge by ratio.
+
+Anchors taken within the same millisecond carry no usable elapsed time to compare against, so
+the ratio test degenerates. A millisecond floor keeps that case decidable without rejecting
+two readings taken back to back."""
+
+
+def usable_anchors(anchors: list[ClockAnchor]) -> list[ClockAnchor]:
+    """Drop the anchors whose wall-clock reading cannot be reconciled with the monotonic one.
+
+    ``perf_counter_ns`` is monotonic and steady; ``time_ns`` is neither. An NTP step, a
+    resumed VM or a container clock correction moves the wall clock by seconds to hours
+    between two anchors, and :func:`to_common_epoch` would fit a line straight through the
+    pair — mapping every span in that bracket onto an axis dilated by four or five orders of
+    magnitude, and *reversed* when the step went backwards. Measured on a real 0.25 s run
+    with one backward hour step: a 40 ms interval placed as −1,440 s, every span after the
+    step drawn as ``0ns``, the page's headline reading ``57m 48s`` and its top finding
+    claiming the lane had no phase open for 100% of the run.
+
+    An anchor is kept when the wall time elapsed since the first anchor is within a factor of
+    two of the monotonic time elapsed. That band is far wider than any drift the anchors
+    exist to correct — slew is parts per million, and even chrony's aggressive default caps
+    at ~8% — and far narrower than any step worth catching, so this rejects steps without
+    rejecting the correction it would be pointless to keep anchors for.
+
+    The first anchor is the origin and is always kept: :meth:`Profiler._start_tracing` takes
+    it to date the worker's monotonic clock, before anything could have moved. Where the whole
+    remaining run disagrees with it, one of the two readings is right and nothing here can
+    know which — so the mapping stays consistent with the run's own start and
+    :attr:`AlignedTrace.clock_steps` reports that it had to.
+    """
+    if len(anchors) < 2:
+        return list(anchors)
+    ordered = sorted(anchors, key=lambda anchor: anchor.perf_ns)
+    origin = ordered[0]
+    kept = [origin]
+    for anchor in ordered[1:]:
+        elapsed = anchor.perf_ns - origin.perf_ns
+        disagreement = abs((anchor.real_ns - origin.real_ns) - elapsed)
+        if disagreement <= elapsed + _CLOCK_STEP_FLOOR_NS:
+            kept.append(anchor)
+    return kept
 
 
 def to_common_epoch(perf_ns: int, anchors: list[ClockAnchor]) -> int:
@@ -212,7 +266,7 @@ def place_spans(
     role: str,
 ) -> list[PlacedSpan]:
     """Map one worker's spans onto the common epoch, resolving their phase paths and depth."""
-    anchors = trace.anchors
+    anchors = usable_anchors(trace.anchors)
     placed = []
     for span in trace.spans:
         path = tuple(trace.path_of(span.phase_id))
@@ -760,8 +814,12 @@ def align_run(run: object) -> AlignedTrace:
             continue
         label = labels[id(worker)]
         role = str(getattr(worker, "role", "main"))
+        anchors = usable_anchors(trace.anchors)
+        rejected = len(trace.anchors) - len(anchors)
+        if rejected:
+            aligned.clock_steps[label] = rejected
         aligned.spans.extend(place_spans(trace, label, role))
-        links_by_worker[label] = (trace.links, trace.anchors)
+        links_by_worker[label] = (trace.links, anchors)
         aligned.dropped_spans += trace.dropped
         aligned.dropped_links += trace.dropped_links
         host = getattr(worker, "host", None)
@@ -842,7 +900,27 @@ def _ordered_lanes(spans: list[PlacedSpan]) -> list[str]:
     return sorted(first_seen, key=lambda lane: (first_seen[lane][0], first_seen[lane][1]))
 
 
-def alignment_accuracy_note(hosts: set[str]) -> str:
+def clock_step_note(clock_steps: dict[str, int]) -> str:
+    """What a rejected anchor means for the reader, or ``""`` when every clock behaved.
+
+    Returned as a sentence rather than a flag because this qualifies the axis itself: every
+    position, gap and cross-lane arrow on the page is measured along it. It belongs beside
+    the headline figures, not only in the trailing caveats — the page's own history is that a
+    disclosure eighty lines below a confident conclusion does not reach the person acting on
+    it.
+    """
+    if not clock_steps:
+        return ""
+    workers = ", ".join(sorted(clock_steps))
+    return (
+        f"The wall clock stepped mid-run on: {workers}. Those readings are ignored and the "
+        "spans are placed by monotonic offset from each worker's first anchor, so durations "
+        "are unaffected — but absolute placement after the step, and so any gap measured "
+        "between one of these lanes and another worker, is only as good as that origin."
+    )
+
+
+def alignment_accuracy_note(hosts: set[str], clock_stepped: bool = False) -> str:
     """How far the shared axis can be trusted, stated rather than assumed.
 
     Within one host the mapping is exact: every process reads the same two clocks. Across
@@ -850,8 +928,18 @@ def alignment_accuracy_note(hosts: set[str]) -> str:
     under a millisecond, occasionally worse. Sub-millisecond arrows between two hosts are
     therefore not evidence of anything, and the page says so rather than letting a reader
     conclude otherwise.
+
+    ``clock_stepped`` withdraws the one-host claim of exactness. Processes on one host do read
+    the same clocks, and that guarantees nothing once one of those clocks moved mid-run —
+    printing "exact" beside :func:`clock_step_note` would contradict it on the same page.
     """
     if len(hosts) <= 1:
+        if clock_stepped:
+            return (
+                "All workers ran on one host and so read the same clocks, but one of those "
+                "clocks stepped during the run — so the axis is exact only within a single "
+                "worker's own spans, not between them."
+            )
         return (
             "All workers ran on one host, so the shared time axis is exact: every process "
             "read the same clocks."

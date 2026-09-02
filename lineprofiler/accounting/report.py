@@ -9,6 +9,7 @@ dominate a global pie chart, whether or not self-play is the bottleneck.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 from typing import Any
 
 from lineprofiler.accounting.analysis import (
@@ -28,6 +29,7 @@ from lineprofiler.accounting.hardware import (
 from lineprofiler.accounting.phasetree import PhasePath, PhaseStats, PhaseTree
 from lineprofiler.accounting.provenance import source_of
 from lineprofiler.accounting.snapshot import MergedRun, WorkerSnapshot, imbalance_of
+from lineprofiler.accounting.trace import FLAG_DEVICE_SYNC
 from lineprofiler.accounting.tracealign import (
     AlignedTrace,
     PlacedSpan,
@@ -186,10 +188,20 @@ def _machine_as_dict(analysis: SampleAnalysis | None, run: MergedRun) -> dict[st
             "rss_peak": analysis.memory.peak_rss,
             "rss_max_process": analysis.peak_rss_max_process,
             "vram_peak": analysis.peak_cuda_alloc,
+            # The allocator's peak and the device's, under names that say which is which. A
+            # capacity question ("does another worker fit?") is only answerable from the
+            # second, because only it counts the per-process CUDA context.
+            "vram_held_peak": (
+                analysis.peak_cuda_process if analysis.cuda_process_measured else None
+            ),
             "per_process": {
                 "cpu_cores": analysis.cpu.peak / processes if analysis.cpu.measured else None,
                 "rss": analysis.memory.peak_rss / processes,
                 "vram": analysis.peak_cuda_alloc / processes,
+                "vram_held": (
+                    analysis.peak_cuda_process / processes
+                    if analysis.cuda_process_measured else None
+                ),
             },
         }
     by_host = run.hardware_by_host
@@ -242,6 +254,11 @@ def _resources_as_dict(analysis: SampleAnalysis) -> dict[str, Any]:
         "gpu": {
             "peak_cuda_alloc": analysis.peak_cuda_alloc,
             "peak_cuda_reserved": analysis.peak_cuda_reserved,
+            # None rather than 0 when unread: a consumer must be able to tell "this run held
+            # no device memory" from "this driver would not say".
+            "peak_cuda_process": (
+                analysis.peak_cuda_process if analysis.cuda_process_measured else None
+            ),
             "devices": [
                 {"index": d.index, "busy_mean": d.busy_mean, "ours_mean": d.ours_mean}
                 for d in analysis.gpu_devices
@@ -250,8 +267,35 @@ def _resources_as_dict(analysis: SampleAnalysis) -> dict[str, Any]:
     }
 
 
+UNUSABLE = "n/a"
+"""What a renderer prints where a duration could not be a duration.
+
+Deliberately not ``0ns``, which is a real reading meaning "too fast to measure" — the same
+distinction ``UNMEASURED = -1`` makes in the trace buffer and ``IoSnapshot.available`` makes
+for byte counters. A reader who sees this knows to distrust that one figure; a reader who
+sees a zero has been told something false.
+
+Deliberately not ``"?"`` either, which this report already uses for an unknown *host* and
+``compare`` uses for a thin sample. ``Runtime ?`` printed directly above ``Host ?`` reads as
+one kind of gap in two places, and the two mean different things. ``n/a`` is also what the
+wait column already prints for an unmeasured share, so the page keeps one vocabulary.
+"""
+
+
 def format_ns(value: float) -> str:
-    """Render a nanosecond duration with a unit that keeps three significant digits."""
+    """Render a nanosecond duration with a unit that keeps three significant digits.
+
+    A non-finite or negative input returns :data:`UNUSABLE` rather than raising or printing a
+    duration that cannot exist. Both are reachable from a worker file that satisfies every
+    guard in ``_read_worker``: ``float("inf")`` and ``float("nan")`` *are* floats, and
+    ``json.dumps`` writes ``Infinity``/``NaN`` by default while ``json.loads`` reads them
+    back, so the writer round-trips a broken clock reading silently. ``int()`` then raised
+    from the first line of the header, which cost the whole report — every other worker
+    included — for one bad file. Negative durations arrive the same way, from a wall clock
+    stepped backwards mid-run by an NTP correction.
+    """
+    if not isfinite(value) or value < 0:
+        return UNUSABLE
     if value >= 3.6e12:
         hours, remainder = divmod(value, 3.6e12)
         return f"{int(hours)}h {int(remainder // 6e10):02d}m"
@@ -264,6 +308,20 @@ def format_ns(value: float) -> str:
     if value >= 1e3:
         return f"{value / 1e3:.1f}us"
     return f"{value:.0f}ns"
+
+
+def format_rate(value: float) -> str:
+    """Render a per-second rate, dropping to exponent form where the digits stop informing.
+
+    The grouped form is what a reader expects and it is kept for every ordinary magnitude.
+    Past a quadrillion the digits are no longer telling anyone anything — a thirty-digit
+    figure quoted to the tenth is harder to read than the exponent and implies a precision the
+    measurement does not have. The threshold is well above any real work rate, so this is the
+    overflow path, not the common one.
+    """
+    if value >= 1e15:
+        return f"{value:.2e}"
+    return f"{value:,.1f}"
 
 
 def format_label(text: str, width: int) -> str:
@@ -280,10 +338,30 @@ def format_label(text: str, width: int) -> str:
     second half of the fix and the ellipsis does not replace it: at exactly the column width
     the old label also swallowed the gap and ran into the heading beside it, printing
     ``…forward_backwardr        0 B``.
+
+    Control characters are replaced before any of that. A phase name is user data, and a
+    newline in one broke a single row into four — three of them carrying no numbers, which
+    reads as three phases that do not exist. Escaping is no help here: these characters are
+    legal in the output and destroy the layout anyway. Replacing rather than dropping keeps
+    the name's length honest, so two names differing only by a control character stay
+    distinguishable on the page.
     """
+    text = _printable(text)
     if len(text) <= width:
         return text
     return "…" + text[-(width - 1):]
+
+
+def _printable(text: str) -> str:
+    """Replace characters that would break a row into lines or corrupt a cell.
+
+    Covers the C0 and C1 ranges plus the line and paragraph separators, which a terminal and
+    a browser disagree about but neither renders as a character in a table cell.
+    """
+    return "".join(
+        "\ufffd" if (ch < " " or "\x7f" <= ch <= "\x9f" or ch in "\u2028\u2029") else ch
+        for ch in text
+    )
 
 
 def _header(run: MergedRun) -> str:
@@ -304,7 +382,86 @@ def _header(run: MergedRun) -> str:
     source = source_of(run.metadata)
     if source:
         lines.append(source)
+    lines.extend(_unusable_runtime_warning(runtime))
+    lines.extend(_self_nesting_warning(run.tree))
+    lines.extend(_excluded_workers_warning(run))
     return "\n".join(lines)
+
+
+def _self_nesting_warning(tree: PhaseTree) -> list[str]:
+    """Call out a phase recorded as nested inside itself, which usually is not nesting.
+
+    Phase stacks are per thread. Asyncio tasks share a thread, so two tasks inside one phase
+    put it on the stack twice and it is stored as its own child — every level claiming the
+    full duration, and the outermost reporting a single entry for however many requests were
+    served. The profiler warns the author at the point it happens, but a report is read by
+    whoever opens the file, usually elsewhere and later, with no terminal in sight. This is
+    the one tree shape that must not be read at face value, so it is named here.
+
+    True recursion produces the same shape and is measured correctly, which is why this is
+    worded as the likelier cause rather than as a verdict.
+    """
+    repeated = sorted({
+        path[-1] for path in tree if len(path) > 1 and path[-1] in path[:-1]
+    })
+    if not repeated:
+        return []
+    names = ", ".join(repr(name) for name in repeated[:3])
+    more = f" (and {len(repeated) - 3} more)" if len(repeated) > 3 else ""
+    return [
+        f"WARNING  {names}{more} appears nested inside itself. If these are asyncio tasks",
+        "         sharing a thread, that is concurrency recorded as nesting: each level"
+        " claims",
+        "         the whole duration and the outermost counts one entry per batch of"
+        " requests.",
+        "         Genuine recursion produces the same shape and is measured correctly.",
+    ]
+
+
+def _unusable_runtime_warning(runtime: float) -> list[str]:
+    """Say why the runtime is missing, and what on the page is unaffected by it.
+
+    ``n/a`` states that a figure is unavailable without saying which of two very different
+    things happened, and the reader needs that to know how much of the rest to trust. A
+    worker's timestamps come from the wall clock, which an NTP correction can step backwards
+    mid-run, and a non-finite one round-trips through JSON silently; neither touches the phase
+    tree, whose durations are ``perf_counter`` deltas. So the numbers below the header are
+    still measurements, and saying so is the point of the line — without it a reader who
+    distrusts the runtime has no reason to trust anything under it either.
+    """
+    if isfinite(runtime) and runtime >= 0:
+        return []
+    return [
+        "WARNING  the run's wall clock is unusable (a timestamp is negative or non-finite),",
+        "         so the runtime above could not be computed. Phase totals are unaffected:",
+        "         they are perf_counter deltas and do not come from the wall clock.",
+    ]
+
+
+def _excluded_workers_warning(run: MergedRun) -> list[str]:
+    """Warn beside the process count when most of the workers present were excluded.
+
+    CAVEATS already lists superseded attempts, but it prints at the foot of the report —
+    below the findings, the role blocks and every total, all of which were computed without
+    those workers. When the excluded files outnumber the kept ones, the reader is looking at a
+    minority of their run under a header that says "Processes 1", and the conclusions above
+    the caveat are conclusions about one worker presented as conclusions about the job.
+
+    The common cause is not a rerun at all: workers that each construct their own ``Profiler``
+    without inheriting ``LINEPROFILER_RUN_ID`` get one attempt id each, so a healthy four-way
+    job reads as four competing attempts. Naming that here is what turns a silently narrowed
+    report into a one-line fix.
+    """
+    if not run.superseded or len(run.superseded) <= len(run.workers):
+        return []
+    attempts = len({worker.run_id for worker in run.superseded})
+    return [
+        f"WARNING  {len(run.superseded)} of {len(run.superseded) + len(run.workers)} worker "
+        f"file(s) are excluded as {attempts} earlier attempt(s) — see CAVEATS.",
+        "         If these ran together, they each generated their own run id: pass the same "
+        "run_id=",
+        "         to every worker, or let them inherit LINEPROFILER_RUN_ID from the parent.",
+    ]
 
 
 def _hosts_line(run: MergedRun) -> str:
@@ -364,13 +521,24 @@ def _resource_rows(
             format_bytes(capacity["ram_total"]) if capacity.get("ram_total") else "",
             format_bytes(analysis.memory.peak_rss / processes),
         ))
+    vram = hardware_total_vram(capacity.get("gpus", []))
     if analysis.peak_cuda_alloc:
-        vram = hardware_total_vram(capacity.get("gpus", []))
         rows.append(_resource_row(
             "VRAM peak alloc",
             format_bytes(analysis.peak_cuda_alloc),
             format_bytes(vram) if vram else "",
             format_bytes(analysis.peak_cuda_alloc / processes),
+        ))
+    # Beside it, never instead of it. The allocator figure is the right answer to "how big are
+    # my tensors"; this one is the right answer to "will another worker fit on the card", and
+    # only this one includes the per-process CUDA context. Replacing the older row would also
+    # silently change what every archived report is being compared against.
+    if analysis.cuda_process_measured:
+        rows.append(_resource_row(
+            "VRAM peak held",
+            format_bytes(analysis.peak_cuda_process),
+            format_bytes(vram) if vram else "",
+            format_bytes(analysis.peak_cuda_process / processes),
         ))
     gpus = capacity.get("gpus") or []
     if gpus:
@@ -462,11 +630,80 @@ def _resource_notes(analysis: SampleAnalysis, run: MergedRun, measured: bool = T
             f"  heaviest process held {format_bytes(analysis.peak_rss_max_process)} RSS"
             f" against a {format_bytes(analysis.memory.peak_rss / processes)} mean",
         )
+    # The CPU counterpart of the RSS skew line. `peak` sums every process at its own peak, which
+    # is a worst case that no instant need have contained; the skew is what says whether one
+    # process drove it or the load was spread. It was computed and carried into report_as_dict
+    # but never rendered, so the block printed the alarming figure without the one beside it that
+    # tells a reader how to size a job.
+    if analysis.cpu.measured and analysis.cpu.max_process:
+        notes.append(
+            f"  heaviest process peaked at {analysis.cpu.max_process:.2f} cores"
+            f" against a {analysis.cpu.peak / processes:.2f} mean",
+        )
+    notes.extend(_vram_notes(analysis, run))
     # Only worth saying when the run sampled at all: a run with sampling switched off is not
     # missing a CPU capability, it declined to measure anything.
     if measured and not analysis.cpu.measured:
         notes.append("  (no CPU readings in this run's samples; install psutil to record them)")
     return [""] + notes if notes else []
+
+
+def _vram_notes(analysis: SampleAnalysis, run: MergedRun) -> list[str]:
+    """What the two VRAM rows measure, and any role holding a context it never uses."""
+    if not analysis.cuda_process_measured:
+        return []
+    notes = [
+        "  VRAM peak alloc is the torch allocator (tensors only); peak held is what the",
+        "  device reports for this run's pids, which includes each process's CUDA context",
+    ]
+    return notes + _idle_context_notes(run)
+
+
+def idle_context_roles(run: MergedRun) -> list[tuple[str, int, float]]:
+    """Roles holding VRAM with no allocator activity, as ``(role, processes, bytes each)``.
+
+    The signature of profiling changing what it measures. ``phase(sync=True)`` used to call
+    ``torch.cuda.synchronize()`` in every process where a device was visible, and that call is
+    what creates a ~414 MiB primary context — so a CPU-only actor paid for one, invisibly,
+    because the allocator figure beside it never sees a context. Four actors cost 1.7 GB of a
+    40 GB card; the runbook's own 32-actor profile would cost ~13 GB.
+
+    Derived here rather than in either renderer so the text report and the HTML page cannot
+    disagree about which roles are affected.
+    """
+    rows: list[tuple[str, int, float]] = []
+    for role in run.roles:
+        idle = [worker for worker in run.workers_of(role) if _holds_an_idle_context(worker)]
+        if not idle:
+            continue
+        held = sum(_peak_device_vram(worker) for worker in idle)
+        rows.append((role, len(idle), held / len(idle)))
+    return rows
+
+
+def _idle_context_notes(run: MergedRun) -> list[str]:
+    """:func:`idle_context_roles`, wrapped to the report's column."""
+    notes: list[str] = []
+    for role, processes, each in idle_context_roles(run):
+        notes.extend([
+            f"  {processes} {role} process(es) hold {format_bytes(each)} of VRAM each with "
+            f"no allocator activity:",
+            "  a CUDA context in a process doing no GPU work. Pass cuda_sync=False to",
+            "  that role's Profiler if it holds no model.",
+        ])
+    return notes
+
+
+def _holds_an_idle_context(worker: WorkerSnapshot) -> bool:
+    """Whether this worker holds device memory it never allocated a tensor in."""
+    return _peak_device_vram(worker) > 0 and not any(
+        sample.cuda_reserved for sample in worker.samples
+    )
+
+
+def _peak_device_vram(worker: WorkerSnapshot) -> int:
+    """The most VRAM the device reported this worker holding, or ``0`` when never measured."""
+    return max((s.cuda_proc_used for s in worker.samples if s.cuda_proc_used >= 0), default=0)
 
 
 def _aligned_or_none(run: MergedRun) -> AlignedTrace | None:
@@ -530,7 +767,7 @@ def _concurrency_rows(role: str, aligned: AlignedTrace | None, limit: int = 3) -
         return []
     blocked = _blocked_spans(aligned, role)
     if not blocked:
-        return []
+        return _device_wait_rows(role, aligned)
     shares = concurrent_activity(aligned, blocked)
     busiest = sorted(shares.items(), key=lambda item: -item[1])[:limit]
     busiest = [(lane, share) for lane, share in busiest if share >= 1.0]
@@ -544,16 +781,59 @@ def _concurrency_rows(role: str, aligned: AlignedTrace | None, limit: int = 3) -
 
 
 def _blocked_spans(aligned: AlignedTrace, role: str) -> list[PlacedSpan]:
-    """The role's spans that spent most of their time off-CPU.
+    """The role's spans that spent most of their time off-CPU waiting on something else.
 
     Overlapping and nested spans are harmless here: :func:`concurrent_activity` merges its
     windows before measuring, so the same blocked microsecond cannot be counted twice however
     deeply the phases nest.
+
+    A phase that drained a CUDA queue is excluded, and so is any phase that encloses one: the
+    first is off-CPU because the device is running *its own* work, and the second inherits that
+    wait from its child. Asking who else was busy during either answers a question nobody asked
+    and prints the answer as a verdict — "this is a stall, not a queue", about a backward pass.
+    Nothing is lost by dropping the enclosing phase: a parent that also waits on something real
+    does so inside a child that is still in this list, carrying the same wait at the depth that
+    can be attributed.
     """
+    enclosing = _phases_around_a_device_sync(aligned, role)
     return [
         span for span in aligned.spans
         if span.role == role and span.cpu_measured and span.duration_ns > 0
         and span.wait_ns > span.duration_ns * 0.5
+        and not span.flags & FLAG_DEVICE_SYNC
+        and span.path not in enclosing
+    ]
+
+
+def _phases_around_a_device_sync(aligned: AlignedTrace, role: str) -> set[PhasePath]:
+    """Paths of this role's phases that contain a ``sync=True`` phase.
+
+    Containment by path prefix, which is exact for a named phase: its path *is* its call stack.
+    """
+    enclosing: set[PhasePath] = set()
+    for span in aligned.spans:
+        if span.role != role or not span.flags & FLAG_DEVICE_SYNC:
+            continue
+        enclosing.update(span.path[:depth] for depth in range(1, len(span.path)))
+    return enclosing
+
+
+def _device_wait_rows(role: str, aligned: AlignedTrace) -> list[str]:
+    """Say that a role's off-CPU time was the device, when that is all it was.
+
+    Reached when nothing is left after the exclusion above. Saying nothing would be the safer
+    silence, but a role with no concurrency line beside a `wait 100%` column reads as a gap in
+    the report rather than as an answer.
+    """
+    device = [
+        span for span in aligned.spans
+        if span.role == role and span.flags & FLAG_DEVICE_SYNC and span.wait_ns > 0
+    ]
+    if not device:
+        return []
+    return [
+        "",
+        f"  {role}'s off-CPU time is device work on sync=True phases, not a wait on a peer.",
     ]
 
 
@@ -650,10 +930,17 @@ def _share_rows(tree: PhaseTree, processes: int = 1) -> list[str]:
 
     The wall column is marked when it sums several processes, so a figure larger than the
     run's own runtime reads as the aggregate it is rather than as a bug.
+
+    The label goes through :func:`format_label` like every other in this report. A bare
+    ``{name:<28}`` pads a short name but does not bound a long one, so a phase named from data
+    — a path, a URL, a serialised config — printed a row as wide as the name and pushed its own
+    percentage and wall time off to a column nobody scans. Truncation here is what keeps the
+    share column a column.
     """
     suffix = f" (Σ{processes} proc)" if processes > 1 else ""
     return [
-        f"{share.name:<28}{share.percent:>7.1f}%{format_ns(share.wall_ns):>14}{suffix}"
+        f"{format_label(share.name, 27):<28}{share.percent:>7.1f}%"
+        f"{format_ns(share.wall_ns):>14}{suffix}"
         for share in sibling_shares(tree)
     ]
 
@@ -768,6 +1055,15 @@ def _async_note(tree: PhaseTree) -> list[str]:
         # the difference between "this number is wrong" and "this number is a mixture".
         share = "" if async_entries >= calls else f" of {calls:,}"
         rows.append(f"      {format_label(name, 23):<24}{async_entries:,}{share} entries")
+    # The next question after "this is submission time" is "why is submission slow", and the
+    # measurement that answers it is one the profiler cannot run for you — but it can name it,
+    # and it costs one line beside the counter rows the reader is already looking at.
+    rows.extend([
+        "      If a phase's cost does not scale with its batch counter, it is launch-bound:",
+        "      the time is per-kernel launch overhead, not per-element work. Compare its wall",
+        "      time at batch 1 against a large batch; flat means fewer, bigger launches (a",
+        "      captured CUDA graph) is the fix, not a faster kernel.",
+    ])
     return rows
 
 
@@ -806,6 +1102,12 @@ def _counter_rows(
     is never truncated to fit — that would print a wrong one — so a field it overflows pushes
     the rest of the row right instead of running into it. A fast counter on a short phase did
     exactly that: 64 entries at 19,161,676.6/s rendered as ``6419,161,676.6/s``.
+
+    The *count* is therefore printed in full however large it is. The *rate* is not the same
+    kind of number: it is derived, and past a point its digits stop being information. A
+    counter of 2**70 on a microsecond phase rendered a thirty-digit per-second figure claimed
+    to the tenth. :func:`format_rate` falls back to three significant digits there, which is
+    the convention :func:`format_ns` already sets for every duration in this report.
     """
     seconds = wall_ns / 1e9
     rows = []
@@ -816,7 +1118,7 @@ def _counter_rows(
         per_unit = wall_ns / total if total else 0.0
         rows.append(
             f"    + {format_label(name, 21):<22}{total:>9,} "
-            f"{rate:>11,.1f}/s {format_ns(per_unit):>8}/ea"
+            f"{format_rate(rate):>11}/s {format_ns(per_unit):>8}/ea"
             f"{_counter_spread(name, stats)}",
         )
     return rows

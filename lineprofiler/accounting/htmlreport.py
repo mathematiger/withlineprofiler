@@ -22,13 +22,14 @@ from lineprofiler.accounting.phasetree import PhasePath, PhaseTree
 from lineprofiler.accounting.provenance import source_of
 from lineprofiler.accounting.report import (
     format_ns,
+    idle_context_roles,
     pooled_capacity,
     report_as_dict,
     sibling_shares,
     wait_share,
 )
 from lineprofiler.accounting.snapshot import MergedRun
-from lineprofiler.htmldoc import document, escape, tile
+from lineprofiler.htmldoc import clip_label, document, escape, tile
 
 # A cell thinner than this is narrower than its own border at any sane figure width, so it
 # would read as a smudge rather than a phase. They are counted and reported, never dropped
@@ -189,9 +190,36 @@ def _resources_block(analysis: SampleAnalysis, run: MergedRun) -> str:
     parts = ["<h2>Resources</h2>"]
     if tiles:
         parts.append(f'<div class="tiles">{tiles}</div>')
+    # Beside the tiles, not in a trailing block: the pair "peak VRAM 290.7 MB" and "VRAM held
+    # 2.0 GB" invites the question here, and an explanation eighty lines below is one a reader
+    # who stops at the headline figures never reaches.
+    parts.extend(_vram_instrument_note(analysis))
+    parts.extend(_idle_context_notes(run))
     if inventory:
         parts.append(inventory)
     return "\n".join(parts)
+
+
+def _vram_instrument_note(analysis: SampleAnalysis) -> list[str]:
+    """Say which instrument each of the two VRAM tiles came from."""
+    if not analysis.cuda_process_measured or not analysis.peak_cuda_alloc:
+        return []
+    return [
+        '<p class="note">“peak VRAM” is the torch allocator (tensors only); “VRAM held” is '
+        "what the device reports for this run's pids, which includes each process's CUDA "
+        "context — typically a few hundred MB per process the allocator never sees.</p>",
+    ]
+
+
+def _idle_context_notes(run: MergedRun) -> list[str]:
+    """Name any role holding VRAM it never allocated a tensor in, and what to do about it."""
+    return [
+        f'<p class="note"><strong>{escape(str(processes))} {escape(role)} process(es) hold '
+        f"{escape(format_bytes(each))} of VRAM each with no allocator activity</strong> — a "
+        "CUDA context in a process doing no GPU work. Pass <code>cuda_sync=False</code> to "
+        "that role's Profiler if it holds no model.</p>"
+        for role, processes, each in idle_context_roles(run)
+    ]
 
 
 def _resource_tiles(analysis: SampleAnalysis, run: MergedRun) -> str:
@@ -209,10 +237,16 @@ def _resource_tiles(analysis: SampleAnalysis, run: MergedRun) -> str:
         total = capacity.get("ram_total")
         tiles.append(tile("peak RSS", f"{used} / {format_bytes(total)}" if total else used))
         tiles.append(tile("RSS per process", format_bytes(analysis.memory.peak_rss / processes)))
+    vram = hardware_total_vram(capacity.get("gpus", []))
     if analysis.peak_cuda_alloc:
         used = format_bytes(analysis.peak_cuda_alloc)
-        vram = hardware_total_vram(capacity.get("gpus", []))
         tiles.append(tile("peak VRAM", f"{used} / {format_bytes(vram)}" if vram else used))
+    # Against the same denominator, and the only one of the two that belongs there: the
+    # allocator's peak omits every process's CUDA context, so putting it over a device total
+    # answers "can I add a worker?" with a number that cannot see what a worker costs.
+    if analysis.cuda_process_measured:
+        held = format_bytes(analysis.peak_cuda_process)
+        tiles.append(tile("VRAM held", f"{held} / {format_bytes(vram)}" if vram else held))
     if tiles:
         tiles.append(tile("processes", str(processes)))
     return "".join(tiles)
@@ -255,7 +289,7 @@ def _role_block(run: MergedRun, role: str) -> str:
         return ""
 
     rows = "".join(
-        f"<tr><td>{escape(share.name)}</td><td>{share.percent:.1f}%</td>"
+        f"<tr><td>{escape(clip_label(share.name))}</td><td>{share.percent:.1f}%</td>"
         f"<td>{escape(format_ns(share.wall_ns))}</td></tr>"
         for share in shares
     )
@@ -301,7 +335,7 @@ def _flame_rect(cell: FlameCell) -> str:
     y = cell.depth * _ROW_HEIGHT
     fill = _wait_colour(cell.wait_pct)
     tooltip = escape(
-        f"{'/'.join(cell.path)}\n"
+        f"{clip_label('/'.join(cell.path))}\n"
         f"wall {format_ns(cell.wall_ns)}  self {format_ns(cell.self_ns)}\n"
         f"calls {cell.calls}  wait {cell.wait_pct:.0f}%",
     )
@@ -385,31 +419,53 @@ def _gpu_block(analysis: SampleAnalysis) -> str:
     if not analysis.has_gpu:
         return ""
     if not analysis.gpu_devices:
-        tiles = "".join([
-            tile("VRAM allocated", format_bytes(analysis.peak_cuda_alloc)),
-            tile("VRAM reserved", format_bytes(analysis.peak_cuda_reserved)),
-        ])
         return (
-            f"<h2>GPU</h2>\n<div class=\"tiles\">{tiles}</div>\n"
+            f"<h2>GPU</h2>\n<div class=\"tiles\">{_vram_tiles(analysis)}</div>\n"
             '<p class="note">No per-device utilisation was recorded — install nvidia-ml-py '
             "to collect it.</p>"
+            f"{_held_vram_note(analysis)}"
         )
     rows = "".join(
         f"<tr><td>GPU {device.index}</td><td>{device.busy_mean:.1f}%</td>"
         f"<td>{'n/a' if device.ours_mean < 0 else f'{device.ours_mean:.1f}%'}</td></tr>"
         for device in analysis.gpu_devices
     )
-    tiles = "".join([
-        tile("VRAM allocated", format_bytes(analysis.peak_cuda_alloc)),
-        tile("VRAM reserved", format_bytes(analysis.peak_cuda_reserved)),
-    ])
     return (
-        f"<h2>GPU</h2>\n<div class=\"tiles\">{tiles}</div>\n"
+        f"<h2>GPU</h2>\n<div class=\"tiles\">{_vram_tiles(analysis)}</div>\n"
         '<div class="scroll"><table><thead><tr><th>device</th><th>busy</th>'
         "<th>this run</th></tr></thead>"
         f"<tbody>{rows}</tbody></table></div>\n"
         '<p class="note">“busy” is the whole device including other tenants; '
         "“this run” is what NVML attributed to these processes.</p>"
+        f"{_held_vram_note(analysis)}"
+    )
+
+
+def _vram_tiles(analysis: SampleAnalysis) -> str:
+    """The allocator's two figures, and what the device says this run actually holds."""
+    tiles = [
+        tile("VRAM allocated", format_bytes(analysis.peak_cuda_alloc)),
+        tile("VRAM reserved", format_bytes(analysis.peak_cuda_reserved)),
+    ]
+    if analysis.cuda_process_measured:
+        tiles.append(tile("VRAM held", format_bytes(analysis.peak_cuda_process)))
+    return "".join(tiles)
+
+
+def _held_vram_note(analysis: SampleAnalysis) -> str:
+    """Say which instrument each VRAM tile came from, next to the tiles themselves.
+
+    Without this the two read as a rounding disagreement rather than as two different
+    measurements, and the gap between them — the per-process CUDA context — is the term that
+    decides whether another worker fits on the card.
+    """
+    if not analysis.cuda_process_measured:
+        return ""
+    return (
+        '\n<p class="note">“allocated” and “reserved” are the torch caching allocator '
+        "(tensors only); “held” is what the device reports for this run's pids, which "
+        "includes each process's CUDA context — typically a few hundred MB per process that "
+        "the allocator never sees.</p>"
     )
 
 

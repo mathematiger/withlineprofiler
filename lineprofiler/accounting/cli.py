@@ -189,6 +189,10 @@ def _render_trace(args: argparse.Namespace) -> str:
                 ],
                 "unmatched_waits": aligned.unmatched_waits,
                 "dropped_spans": aligned.dropped_spans,
+                # Worker to the number of clock anchors rejected as steps. Present so a gate
+                # reading this file learns the axis was repaired; without it the JSON is the
+                # one output that repairs silently, and it is the one a machine acts on.
+                "clock_steps": aligned.clock_steps,
                 # The same ranking the page leads with. A gate that has to re-derive "was
                 # this a queue or a stall" from spans and arrows would be reimplementing
                 # findings.py against the same data, and the two would drift.

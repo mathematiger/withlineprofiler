@@ -110,8 +110,37 @@ def main() -> None:
         measure("accounting.phase(), nothing installed", phase_ambient_uninstalled)
         print(f"\n(baseline call overhead of {baseline:.0f} ns is included in every row)")  # noqa: T201
 
+        _report_in_phase_floor(
+            ("measure_cpu=False", no_cpu),
+            ("measure_cpu=True", with_cpu),
+            ("measure_cpu=True, trace=True", traced),
+        )
+
         for profiler in (with_cpu, no_cpu, traced):
             profiler.close()
+
+
+def _report_in_phase_floor(*profilers: tuple[str, Profiler]) -> None:
+    """Print what each profiler bills *into* a phase, as opposed to beside it.
+
+    A different quantity from every row above, and the one that bounds accuracy rather than
+    speed: ``__enter__`` reads its clock last and ``__exit__`` reads its first, so most of the
+    cost above falls outside the measured interval. What is left inside inflates the phase's
+    own reported wall time, once per entry, regardless of how long the phase ran.
+
+    Read straight off each profiler's own aggregate for an empty body, which is exactly what
+    a user would see for a phase that did nothing.
+    """
+    print("\n=== billed inside the phase (inflates its reported wall time) ===")  # noqa: T201
+    for label, profiler in profilers:
+        stats = profiler.merged_tree().get(("p",))
+        if stats is None or stats.calls == 0:
+            continue
+        print(f"{label:<48}{stats.wall_ns / stats.calls:8.1f} ns/phase")  # noqa: T201
+    print(  # noqa: T201
+        "\n(an empty phase reports this much; a phase shorter than ~10 us is measurably\n"
+        " inflated by it, and docs/accounting-recipes.md gives the ratios)",
+    )
 
 
 if __name__ == "__main__":

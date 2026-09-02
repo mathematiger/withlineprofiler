@@ -19,8 +19,9 @@ from pathlib import Path
 from lineprofiler.accounting import Profiler
 from lineprofiler.accounting.cli import main
 from lineprofiler.accounting.findings import phase_totals, rank_findings
-from lineprofiler.accounting.report import render, report_as_dict
+from lineprofiler.accounting.report import _concurrency_rows, render, report_as_dict
 from lineprofiler.accounting.snapshot import merge_run
+from lineprofiler.accounting.trace import FLAG_DEVICE_SYNC
 from lineprofiler.accounting.tracealign import AlignedTrace, Arrow, PlacedSpan
 
 _MS = 1_000_000
@@ -52,6 +53,7 @@ def _span(
     cpu_ms: int | None = None,
     role: str = "",
     depth: int = 0,
+    flags: int = 0,
 ) -> PlacedSpan:
     """One span in milliseconds, with ``cpu_ms=None`` meaning CPU time was not measured."""
     return PlacedSpan(
@@ -62,7 +64,7 @@ def _span(
         t0_ns=t0_ms * _MS,
         t1_ns=t1_ms * _MS,
         cpu_ns=-1 if cpu_ms is None else cpu_ms * _MS,
-        flags=0,
+        flags=flags,
         depth=depth,
     )
 
@@ -115,6 +117,37 @@ def test_a_parent_that_only_waits_in_its_child_is_not_reported_twice() -> None:
     assert "iteration" not in paths
 
 
+def test_a_phase_blocked_on_every_lane_does_not_cost_more_than_the_run() -> None:
+    """A share above 100% reads as an error, at the top of the page, above everything else.
+
+    Two actors each blocked for the whole run wait two lane-seconds per wall second. Divided
+    by the wall clock that was "costing 155% of the run" — a figure a reader correctly
+    disbelieves, which then discredits the numbers underneath it. The denominator is the lane
+    time the phase could have occupied, and the headline says so once more than one lane is
+    involved.
+    """
+    trace = _trace([
+        _span("actor0", ("queue_wait",), 0, 1000, cpu_ms=0, role="actor"),
+        _span("actor1", ("queue_wait",), 0, 1000, cpu_ms=0, role="actor"),
+    ])
+
+    finding = next(item for item in rank_findings(trace) if item.anchor == "queue_wait")
+
+    assert finding.cost_pct <= 100.0
+    assert "across 2 lanes" in finding.headline
+
+
+def test_a_single_lane_finding_does_not_mention_lanes() -> None:
+    """The qualifier earns its place only where a sum across lanes is what is being shown."""
+    trace = _trace([
+        _span("learner", ("queue_wait",), 0, 1000, cpu_ms=0, role="learner"),
+    ])
+
+    finding = next(item for item in rank_findings(trace) if item.anchor == "queue_wait")
+
+    assert "across" not in finding.headline
+
+
 def test_a_wait_released_by_a_signal_is_called_a_queue_not_a_stall() -> None:
     """A recorded signal/wait_on pair settles the question; concurrency only infers it.
 
@@ -140,6 +173,70 @@ def test_a_wait_released_by_a_signal_is_called_a_queue_not_a_stall() -> None:
 
     assert "queue" in finding.detail
     assert "actor" in finding.detail
+
+
+def test_a_device_synchronised_phase_is_not_reported_as_a_queue() -> None:
+    """GPU compute is off-CPU, and calling that a queue asserts something false.
+
+    ``wait_ns`` is ``wall - cpu``, which is the right definition for a queue ``get()`` and the
+    wrong one for ``.backward()``: the thread has released the GIL and is off-CPU while the
+    device runs the work. A phase opened with ``sync=True`` drained the CUDA queue at both
+    ends, so by construction its blocked time is the device — not another process. The report
+    that prompted this said "this is a queue, not a hang" about a backward pass, and cost a
+    round of investigation into contention that did not exist.
+    """
+    spans = [
+        _span(
+            "learner", ("train_step", "forward_backward"), 0, 1000, cpu_ms=660,
+            role="learner", flags=FLAG_DEVICE_SYNC,
+        ),
+        _span("actor", ("publish",), 100, 200, cpu_ms=100, role="actor"),
+    ]
+    arrows = [
+        Arrow(
+            channel="batch", key="0",
+            src_worker="actor", dst_worker="learner",
+            src_t_ns=150 * _MS, dst_t_ns=400 * _MS,
+        ),
+    ]
+
+    finding = next(
+        item for item in rank_findings(_trace(spans, arrows))
+        if item.anchor == "train_step/forward_backward"
+    )
+
+    assert "this is a queue" not in finding.detail
+    assert "released by" not in finding.detail
+    assert "device" in finding.detail
+    assert "sync=True" in finding.detail
+    assert "blocked" not in finding.headline, "the headline must not call device time blocked"
+
+
+def test_an_arrow_landing_outside_a_phase_does_not_release_it() -> None:
+    """A signal into this worker is only evidence about the wait it actually ended.
+
+    ``_releasing_role`` matched every arrow addressed to the waiting *worker*, whenever it
+    arrived, so one instrumented queue boundary anywhere in a process explained every blocked
+    phase in it — including phases that were waiting on something else entirely.
+    """
+    spans = [
+        _span("learner", ("compute",), 0, 1000, cpu_ms=0, role="learner"),
+        _span("learner", ("queue_get",), 1400, 1600, cpu_ms=0, role="learner"),
+        _span("actor", ("publish",), 1400, 1500, cpu_ms=100, role="actor"),
+    ]
+    arrows = [
+        Arrow(
+            channel="batch", key="0",
+            src_worker="actor", dst_worker="learner",
+            src_t_ns=1500 * _MS, dst_t_ns=1600 * _MS,
+        ),
+    ]
+
+    finding = next(
+        item for item in rank_findings(_trace(spans, arrows)) if item.anchor == "compute"
+    )
+
+    assert "released by" not in finding.detail
 
 
 def test_a_wait_with_nothing_else_running_is_called_a_stall() -> None:
@@ -196,6 +293,46 @@ def test_a_healthy_run_produces_no_findings() -> None:
 
 def test_an_empty_trace_is_not_an_error() -> None:
     assert rank_findings(AlignedTrace()) == []
+
+
+def test_the_phase_summary_marks_a_row_whose_blocked_time_is_the_device() -> None:
+    """The column heading means the opposite of itself on that row, so the row says so.
+
+    A reader ranks by this table before reading the findings above it, and an unmarked
+    ``blocked 100%`` reads as a process waiting on a peer.
+    """
+    totals = phase_totals(_trace([
+        _span("learner", ("forward",), 0, 100, cpu_ms=30, role="learner",
+              flags=FLAG_DEVICE_SYNC),
+        _span("learner", ("queue_get",), 100, 200, cpu_ms=0, role="learner"),
+    ]))
+    by_path = {total.path: total for total in totals}
+
+    assert by_path["forward"].on_device
+    assert not by_path["queue_get"].on_device
+
+
+def test_the_role_summary_does_not_call_a_backward_pass_a_stall() -> None:
+    """The same false claim, in the second place the report makes it.
+
+    ``_concurrency_rows`` asks who else was busy while a role was off-CPU, and answers "no
+    other lane was active — this is a stall, not a queue" when nobody was. For a learner whose
+    off-CPU time is its own backward pass, both halves of that sentence are wrong. The
+    enclosing ``train_step`` must not resurrect it either: its wait is inherited from the child
+    that drained the queue.
+    """
+    trace = _trace([
+        _span("learner", ("train_step",), 0, 1000, cpu_ms=10, role="learner"),
+        _span(
+            "learner", ("train_step", "forward_backward"), 10, 990, cpu_ms=5,
+            role="learner", depth=1, flags=FLAG_DEVICE_SYNC,
+        ),
+    ])
+
+    rows = _concurrency_rows("learner", trace)
+
+    assert not any("stall" in row for row in rows)
+    assert any("device work on sync=True phases" in row for row in rows)
 
 
 # --------------------------------------------------------------------------- #

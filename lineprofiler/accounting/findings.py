@@ -22,11 +22,13 @@ Two rules hold everywhere here:
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass, field
 
-from lineprofiler.accounting.trace import Origin
+from lineprofiler.accounting.trace import FLAG_DEVICE_SYNC, Origin
 from lineprofiler.accounting.tracealign import (
     AlignedTrace,
+    Arrow,
     PlacedSpan,
     concurrent_activity,
     lane_busy_share,
@@ -68,8 +70,11 @@ class Finding:
 
     ``headline`` is the sentence; ``detail`` is why it is true, in the same breath, so the
     reader never has to hold a number from one section against a number from another.
-    ``cost_pct`` is share of the whole traced span, and is what the ranking sorts on — every
-    finding is measured against the same denominator so they can be compared at all.
+    ``cost_pct`` is share of the *lane time* a finding could have occupied — the traced span
+    times the number of lanes it concerns — and is what the ranking sorts on. Normalising by
+    lanes is what keeps the figures comparable across findings that span different numbers of
+    workers, and what stops a phase blocked on every one of two lanes from reporting a share
+    above 100%, which reads as an error rather than as a sum.
 
     ``anchor`` names what to look at on the timeline: a lane id or a phase path, which the
     page turns into a control that jumps there. A finding the reader cannot act on is a
@@ -158,16 +163,27 @@ def _blocked_phase_finding(
     blocked_pct: float,
 ) -> Finding:
     """One blocked phase, classified as a queue or a stall by what else was running."""
-    cost_pct = 100.0 * wait_ns / trace.duration_ns
     lanes = tuple(sorted({span.lane for span in spans}))
+    on_device = _waits_on_the_device(spans)
+    # Against the lane time this phase could have occupied, not the run's wall clock. A phase
+    # blocked on every one of two actor lanes for a whole run waits two lane-seconds per wall
+    # second, and dividing that by the wall clock reported "costing 155% of the run" — a
+    # figure a reader correctly reads as impossible, at the top of the page where it does the
+    # most damage to the credibility of everything under it.
+    available_ns = trace.duration_ns * max(1, len(lanes))
+    cost_pct = 100.0 * wait_ns / available_ns if available_ns else 0.0
     blocked = [span for span in spans if span.wait_ns > 0]
-    detail = _explain_wait(trace, spans, blocked)
+    detail = _explain_wait(trace, spans, blocked, on_device)
+    across = f" across {len(lanes)} lanes" if len(lanes) > 1 else ""
+    # "blocked" is a claim about waiting for something else. A synchronised phase's off-CPU
+    # time is its own device work, so it gets a verb that says that instead.
+    verb = "on the device" if on_device else "blocked"
 
     return Finding(
         kind="blocked-phase",
         headline=(
-            f"{path} spent {blocked_pct:.0f}% of its time blocked, "
-            f"costing {cost_pct:.0f}% of the run"
+            f"{path} spent {blocked_pct:.0f}% of its time {verb}, "
+            f"costing {cost_pct:.0f}% of the run{across}"
         ),
         detail=detail,
         cost_pct=cost_pct,
@@ -180,11 +196,16 @@ def _explain_wait(
     trace: AlignedTrace,
     spans: list[PlacedSpan],
     blocked: list[PlacedSpan],
+    on_device: bool = False,
 ) -> str:
     """Say whether a wait was a queue or a stall, preferring recorded evidence to inference.
 
-    Two sources, in order of authority:
+    Three sources, in order of authority:
 
+    0. **The phase drained a device queue.** ``sync=True`` means the phase waited on the GPU
+       by construction, so its off-CPU time is device compute and none of the peer-attribution
+       below applies to it. This outranks everything because it is not evidence about the
+       wait, it is what the wait *is*.
     1. **A matched arrow.** ``signal``/``wait_on`` records who released this wait and when.
        That is not an inference — the producer is named — so it settles the question outright.
     2. **Concurrent activity.** Absent arrows, the fallback asks how busy everyone else was
@@ -192,10 +213,20 @@ def _explain_wait(
        long wait scores low against the wait's union even though it was producing throughout,
        so a low figure here means "probably a stall", never "certainly".
 
-    Getting the order wrong is what made the learner's ``queue_get`` — released by an actor's
-    ``signal`` on every single iteration — report as a stall because the actors' bursts only
-    covered a quarter of its wait.
+    Getting the order of the last two wrong is what made the learner's ``queue_get`` —
+    released by an actor's ``signal`` on every single iteration — report as a stall because
+    the actors' bursts only covered a quarter of its wait. Missing rule 0 is what made a
+    backward pass report as a queue: the thread releases the GIL while the device runs, so
+    ``wall - cpu`` describes GPU compute, and the sentence "this is a queue, not a hang" sent
+    a reader looking for contention that did not exist.
     """
+    if on_device:
+        return (
+            "This phase was opened with sync=True, so it drained the CUDA queue at both ends "
+            "and its off-CPU time is the device running this phase's own work — not a wait on "
+            "another process. Nothing here is attributable to a peer."
+        )
+
     releaser, delay_share = _releasing_role(trace, spans)
     if releaser:
         return (
@@ -234,10 +265,13 @@ def _releasing_role(trace: AlignedTrace, spans: list[PlacedSpan]) -> tuple[str, 
     separates two very different queues: time before the signal is the producer being slow,
     time after it is the waiter being slow to wake — scheduling pressure rather than
     throughput.
+
+    Only arrows that landed *inside* one of these spans count. Matching every arrow addressed
+    to the waiting worker let one instrumented queue boundary explain every blocked phase in
+    that process, including phases that were waiting on something else entirely — and it named
+    a producer, which reads as measured evidence rather than as the inference it was.
     """
-    lanes = {span.lane for span in spans}
-    workers = {lane.split("#", 1)[0] for lane in lanes}
-    matched = [arrow for arrow in trace.arrows if arrow.dst_worker in workers]
+    matched = _arrows_received_during(trace, spans)
     if not matched:
         return "", 0.0
 
@@ -251,6 +285,56 @@ def _releasing_role(trace: AlignedTrace, spans: list[PlacedSpan]) -> tuple[str, 
     waited = sum(span.wait_ns for span in spans)
     share = 100.0 * total_delay / waited if waited > 0 else 0.0
     return role, min(100.0, share)
+
+
+def _waits_on_the_device(spans: list[PlacedSpan]) -> bool:
+    """Whether these spans drained a CUDA queue, so their off-CPU time is device compute.
+
+    Every span, not any: a phase entered both with and without ``sync=True`` — or one whose
+    worker holds no CUDA context, where the drain is skipped — is partly ordinary waiting, and
+    a wholesale device attribution would be as wrong as the queue one it replaces.
+    """
+    return bool(spans) and all(span.flags & FLAG_DEVICE_SYNC for span in spans)
+
+
+def _arrows_received_during(trace: AlignedTrace, spans: list[PlacedSpan]) -> list[Arrow]:
+    """Arrows whose waiting end landed inside one of ``spans``.
+
+    Per worker, spans are indexed by start time with a running maximum of their end times, so
+    the containment test is a bisect rather than a scan: a phase can hold six figures of spans
+    and every arrow would otherwise be compared against all of them.
+    """
+    by_worker: dict[str, list[PlacedSpan]] = {}
+    for span in spans:
+        by_worker.setdefault(span.worker, []).append(span)
+    index = {worker: _SpanIndex(ordered) for worker, ordered in by_worker.items()}
+    return [
+        arrow
+        for arrow in trace.arrows
+        if arrow.dst_worker in index and index[arrow.dst_worker].covers(arrow.dst_t_ns)
+    ]
+
+
+class _SpanIndex:
+    """One worker's spans of a single phase, searchable by "was anything open at ``t``?"."""
+
+    __slots__ = ("_open_until", "_starts")
+
+    def __init__(self, spans: list[PlacedSpan]) -> None:
+        ordered = sorted(spans, key=lambda span: span.t0_ns)
+        self._starts = [span.t0_ns for span in ordered]
+        # Running maximum of the ends, so a long span that started early still covers a later
+        # instant. Threads of one worker share a lane here, so the spans can overlap.
+        self._open_until: list[int] = []
+        latest = 0
+        for span in ordered:
+            latest = max(latest, span.t1_ns)
+            self._open_until.append(latest)
+
+    def covers(self, t_ns: int) -> bool:
+        """Whether any span had started by ``t_ns`` and had not yet ended."""
+        position = bisect_right(self._starts, t_ns) - 1
+        return position >= 0 and self._open_until[position] >= t_ns
 
 
 def _idle_lane_findings(trace: AlignedTrace) -> list[Finding]:
@@ -397,6 +481,12 @@ class PhaseTotal:
     self_ns: int
     lanes: int
     measured: bool
+    on_device: bool = False
+    """Whether every span of this phase drained a CUDA queue, making its ``wait`` device time.
+
+    The ``blocked`` column then means the opposite of what the word suggests: the phase was not
+    waiting for anything else, it was the device running this phase's own work. A renderer must
+    say so on the row, not only in the findings above it."""
     origin: Origin | None = None
     """Where this phase's code is defined, when every span agreed on one place.
 
@@ -448,6 +538,7 @@ def _phase_total(
         self_ns=sum(self_by_span.get(id(span), span.duration_ns) for span in spans),
         lanes=len({span.lane for span in spans}),
         measured=bool(measured),
+        on_device=_waits_on_the_device(spans),
         origin=_shared_origin(spans),
     )
 

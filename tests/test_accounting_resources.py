@@ -14,9 +14,12 @@ from types import SimpleNamespace
 import pytest
 
 from lineprofiler.accounting import Backend, Profiler, merge_run, render
+from lineprofiler.accounting import capabilities as capabilities_module
 from lineprofiler.accounting import hardware as hardware_module
 from lineprofiler.accounting import sampler as sampler_module
 from lineprofiler.accounting.analysis import (
+    CpuUsage,
+    SampleAnalysis,
     analyse,
     analyse_processes,
     format_bytes,
@@ -30,6 +33,7 @@ from lineprofiler.accounting.report import (
     _dominant_rows,
     _gpu_block,
     _percent_of,
+    _resource_notes,
     pooled_capacity,
     report_as_dict,
 )
@@ -790,14 +794,20 @@ def test_annotation_is_ignored_when_disabled(tmp_path: Path) -> None:
 def _fake_nvml(
     busy: dict[int, float],
     process_samples: dict[int, list[SimpleNamespace]] | None = None,
+    compute_processes: dict[int, list[SimpleNamespace]] | None = None,
 ) -> SimpleNamespace:
     """Stand in for pynvml, so per-device sampling is verified without a GPU.
 
     A device whose busy value is negative raises, mimicking a transient NVML failure on one
     device of several. ``nvmlDeviceGetProcessUtilization`` raises when its window is empty,
     which is what the real one does rather than returning a list of length zero.
+
+    ``nvmlDeviceGetComputeRunningProcesses`` is the per-pid memory column ``nvidia-smi`` shows.
+    Absent from ``compute_processes``, a device reports no running process — the ordinary idle
+    case, and distinct from a device that cannot be read at all.
     """
     rows = process_samples or {}
+    running = compute_processes or {}
 
     def get_rates(handle: int) -> SimpleNamespace:
         if busy[handle] < 0:
@@ -815,7 +825,13 @@ def _fake_nvml(
         nvmlDeviceGetHandleByIndex=lambda index: index,
         nvmlDeviceGetUtilizationRates=get_rates,
         nvmlDeviceGetProcessUtilization=get_process_utilization,
+        nvmlDeviceGetComputeRunningProcesses=lambda handle: running.get(handle, []),
     )
+
+
+def _compute_process(used: int | None, pid: int | None = None) -> SimpleNamespace:
+    """One row of ``nvmlDeviceGetComputeRunningProcesses``; ``used=None`` is the MIG case."""
+    return SimpleNamespace(pid=os.getpid() if pid is None else pid, usedGpuMemory=used)
 
 
 def _sampler_with_nvml(
@@ -882,6 +898,156 @@ def test_process_utilisation_is_absent_when_nvml_reports_no_window(
     sampler = _sampler_with_nvml(tmp_path, monkeypatch, _fake_nvml({0: 90.0}))
 
     assert sampler.take().gpu_proc_utils == {}
+
+
+def test_the_vram_this_process_actually_holds_is_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The allocator cannot see a CUDA context; NVML per pid can, and it is what scales.
+
+    On the run that prompted this, the report said 304.8 MB against a 40 GB card while
+    ``nvidia-smi`` showed 2,702 MiB held across the same processes — an 8.9x gap that is
+    entirely per-process context, and precisely the term that grows with the worker count.
+    """
+    nvml = _fake_nvml(
+        {0: 50.0},
+        compute_processes={0: [
+            _compute_process(434_110_464),
+            _compute_process(1_000_000, pid=os.getpid() + 1),
+        ]},
+    )
+    sampler = _sampler_with_nvml(tmp_path, monkeypatch, nvml)
+
+    assert sampler.take().cuda_proc_used == 434_110_464, "the neighbour's MB is not ours"
+
+
+def test_vram_held_sums_the_devices_this_process_holds_memory_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nvml = _fake_nvml(
+        {0: 50.0, 1: 50.0},
+        compute_processes={
+            0: [_compute_process(400)],
+            1: [_compute_process(600)],
+        },
+    )
+    sampler = _sampler_with_nvml(tmp_path, monkeypatch, nvml)
+
+    assert sampler.take().cuda_proc_used == 1000
+
+
+def test_a_process_holding_no_vram_reports_zero_not_unmeasured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Zero is the finding: a worker on a GPU box that holds nothing is what "CPU-only" means."""
+    sampler = _sampler_with_nvml(tmp_path, monkeypatch, _fake_nvml({0: 50.0}))
+
+    assert sampler.take().cuda_proc_used == 0
+
+
+def test_vram_is_left_unmeasured_when_the_driver_will_not_attribute_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Some MIG and vGPU configurations report ``usedGpuMemory`` as ``None``."""
+    nvml = _fake_nvml({0: 50.0}, compute_processes={0: [_compute_process(None)]})
+    sampler = _sampler_with_nvml(tmp_path, monkeypatch, nvml)
+
+    assert sampler.take().cuda_proc_used == -1, "n/a, never 0"
+
+
+def test_vram_is_left_unmeasured_when_nvml_cannot_see_our_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The container case: NVML reports host pids and ``os.getpid()`` is namespaced.
+
+    Holding allocator memory while NVML lists no row for us is proof of that mismatch — we
+    demonstrably have a context. Reporting the resulting zero would state the opposite of the
+    truth, so the reading is dropped instead.
+    """
+    sampler = _sampler_with_nvml(tmp_path, monkeypatch, _fake_nvml({0: 50.0}))
+    monkeypatch.setattr(
+        sampler_module, "torch_module",
+        lambda: SimpleNamespace(cuda=SimpleNamespace(
+            memory_allocated=lambda: 8_000_000, memory_reserved=lambda: 9_000_000,
+        )),
+    )
+    sampler.capabilities.cuda = True
+
+    assert sampler.take().cuda_proc_used == -1
+
+
+def test_the_held_vram_figure_survives_the_sample_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Including the zero, which ``_compact`` must not drop as a falsy value."""
+    nvml = _fake_nvml({0: 50.0})
+    sampler = _sampler_with_nvml(tmp_path, monkeypatch, nvml)
+    path = tmp_path / "samples"
+    with path.open("a", encoding="utf-8") as handle:
+        sampler._write_row(handle)  # noqa: SLF001
+
+    assert read_samples(path)[0].cuda_proc_used == 0
+
+
+def test_a_worker_file_written_before_this_field_reads_as_unmeasured() -> None:
+    """Back-compatibility: a 0.8.2 file could not record it, and 0 would be a claim."""
+    assert Sample.from_dict({"t": 1.0, "phase": "train"}).cuda_proc_used == -1
+
+
+def test_the_report_shows_the_vram_the_device_holds_beside_the_allocators(
+    tmp_path: Path,
+) -> None:
+    """Two instruments, two rows. The allocator row is right for "how big are my tensors"."""
+    profiler = Profiler(
+        run_dir=tmp_path, role="learner", enabled=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    with profiler.phase("train"):
+        pass
+    profiler.close()
+    _write_samples(tmp_path, [
+        Sample(t=float(i), phase="train", rss=1_000, cuda_alloc=300_000_000,
+               cuda_reserved=320_000_000, cuda_proc_used=734_000_000)
+        for i in range(3)
+    ])
+
+    text = render(merge_run(tmp_path))
+
+    assert "VRAM peak alloc" in text
+    assert "VRAM peak held" in text
+    assert "700.0 MB" in text, "the device figure, context included"
+    assert "includes each process's CUDA context" in text
+
+
+def test_a_role_holding_a_context_it_never_uses_is_named(tmp_path: Path) -> None:
+    """The Issue-1 signature, made visible: VRAM held with no allocator activity at all.
+
+    Two hours of investigation collapse into a glance if the report says it, because the
+    allocator row beside it reads as a perfectly healthy 0.
+    """
+    for index in range(2):
+        profiler = Profiler(
+            run_dir=tmp_path, role="actor", enabled=True, run_id="one-attempt",
+            snapshot_interval_s=None, sample_interval_s=None,
+        )
+        with profiler.phase(f"act_{index}"):
+            pass
+        profiler.close()
+    for worker in sorted((tmp_path / "workers").rglob("w_*.json")):
+        rows = [
+            Sample(t=float(i), phase="act", rss=1_000, cuda_proc_used=434_110_464)
+            for i in range(3)
+        ]
+        worker.with_suffix(".samples").write_text(
+            "\n".join(json.dumps(_compact(sample)) for sample in rows) + "\n",
+            encoding="utf-8",
+        )
+
+    text = render(merge_run(tmp_path))
+
+    assert "2 actor process(es) hold 414.0 MB of VRAM each with no allocator activity" in text
+    assert "a CUDA context in a process doing no GPU work" in text
+    assert "cuda_sync=False" in text
 
 
 def test_per_device_utilisation_survives_the_sample_file(
@@ -987,6 +1153,121 @@ def test_report_falls_back_to_one_figure_for_older_sample_files(tmp_path: Path) 
 
 
 # ── CUDA-synchronised phases ────────────────────────────────────────────────
+
+
+class _FakeCuda:
+    """``torch.cuda`` with the one behaviour that matters: ``synchronize`` opens the context.
+
+    Measured on an A100 box, checking ``nvidia-smi --query-compute-apps`` after each step:
+    ``import torch`` holds no VRAM, ``torch.cuda.is_available()`` returning ``True`` holds no
+    VRAM, and the first ``torch.cuda.synchronize()`` holds 414 MiB — that call is what creates
+    the process's CUDA primary context. So a CPU-only worker that opens one ``sync=True``
+    phase pays for a context it never uses, and the cost scales with the worker count.
+    """
+
+    def __init__(self, available: bool = True, initialised: bool = False) -> None:
+        self.available = available
+        self.initialised = initialised
+        self.syncs = 0
+
+    def is_available(self) -> bool:
+        return self.available
+
+    def is_initialized(self) -> bool:
+        return self.initialised
+
+    def synchronize(self) -> None:
+        self.initialised = True  # the 414 MiB: this call creates the primary context
+        self.syncs += 1
+
+    def memory_allocated(self) -> int:
+        return 0
+
+    def memory_reserved(self) -> int:
+        return 0
+
+
+def _with_fake_torch(monkeypatch: pytest.MonkeyPatch, cuda: _FakeCuda) -> None:
+    """Install a torch stand-in in the capability cache, as a GPU box's torch would resolve."""
+    monkeypatch.setattr(capabilities_module, "_torch", SimpleNamespace(cuda=cuda))
+
+
+def test_a_cpu_only_worker_never_opens_a_cuda_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The profiler must not create the resource it is being used to measure.
+
+    An actor that holds no model and talks to an inference server over a queue has no device
+    work to wait for, so its ``sync=True`` phase is a no-op *by definition*. Calling
+    ``torch.cuda.synchronize`` anyway costs it a ~414 MiB CUDA context; at 32 actors that is
+    ~13 GB of a 40 GB card held by processes doing no GPU work.
+    """
+    cuda = _FakeCuda(available=True, initialised=False)
+    _with_fake_torch(monkeypatch, cuda)
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+
+    with profiler.phase("act", sync=True):
+        pass
+    profiler.close()
+
+    assert cuda.syncs == 0, "a process with no CUDA context has nothing queued to drain"
+    assert not cuda.initialised, "and profiling must not be what initialises the driver"
+
+
+def test_sync_drains_the_queue_once_the_process_actually_uses_cuda(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate is on the context, not on the phase: a real GPU worker still synchronises."""
+    cuda = _FakeCuda(available=True, initialised=True)
+    _with_fake_torch(monkeypatch, cuda)
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+    )
+
+    with profiler.phase("train", sync=True):
+        pass
+    profiler.close()
+
+    assert cuda.syncs == 2, "both ends, exactly as before"
+
+
+def test_cuda_sync_false_switches_synchronisation_off_outright(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The knob for a caller who knows a role is CPU-only, on a box where CUDA is visible."""
+    cuda = _FakeCuda(available=True, initialised=True)
+    _with_fake_torch(monkeypatch, cuda)
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+        cuda_sync=False,
+    )
+
+    assert profiler._cuda_sync is None  # noqa: SLF001
+    with profiler.phase("act", sync=True):
+        pass
+    profiler.close()
+
+    assert cuda.syncs == 0
+
+
+def test_cuda_sync_true_synchronises_even_before_the_context_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The escape hatch: an explicit ``True`` is a caller overriding the auto-detection."""
+    cuda = _FakeCuda(available=True, initialised=False)
+    _with_fake_torch(monkeypatch, cuda)
+    profiler = Profiler(
+        run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
+        cuda_sync=True,
+    )
+
+    with profiler.phase("train", sync=True):
+        pass
+    profiler.close()
+
+    assert cuda.syncs == 2
 
 
 def test_sync_phase_drains_the_queue_at_both_ends(tmp_path: Path) -> None:
@@ -1593,3 +1874,111 @@ def test_a_run_that_knows_nothing_omits_the_machine_key(tmp_path: Path) -> None:
     run = _run_with_hardware(tmp_path, [])
 
     assert "machine" not in report_as_dict(run)  # type: ignore[arg-type]
+
+
+def test_a_cpu_reading_taken_over_a_sub_tick_interval_is_not_recorded(tmp_path: Path) -> None:
+    """The baseline row must not report a CPU percentage its interval cannot carry.
+
+    ``cpu_percent()`` differences against its own previous call and its numerator is quantised to
+    the kernel tick, so over the sub-millisecond gap between the capability probe and the first
+    sample the quotient is a coin flip between 0 and tick/interval. Measured on a process spinning
+    at exactly one core, a 1.4 ms interval returned 0.0 fifty-one times in sixty and exceeded 200%
+    nine times, peaking at 703%. Those readings reached the report as ``CPU peak`` - the figure a
+    reader sizes a job with - which is why this is dropped rather than merely smoothed.
+    """
+    sampler = ResourceSampler(tmp_path / "s.jsonl", interval_s=0.01, phase_of=lambda: "p")
+    sampler._process = SimpleNamespace(cpu_percent=lambda: 703.0)  # noqa: SLF001
+    sampler._cpu_read_at = time.monotonic()  # noqa: SLF001  - as if primed a moment ago
+
+    assert sampler._cpu_percent_or_unmeasured() == -1.0  # noqa: SLF001
+
+
+def test_a_cpu_reading_over_a_real_interval_is_recorded(tmp_path: Path) -> None:
+    """A reading whose interval spans several ticks is kept exactly as measured.
+
+    The guard must not become a filter that quietly drops ordinary samples: at the default 1 s
+    cadence every reading after the baseline covers a hundred ticks.
+    """
+    sampler = ResourceSampler(tmp_path / "s.jsonl", interval_s=1.0, phase_of=lambda: "p")
+    sampler._process = SimpleNamespace(cpu_percent=lambda: 106.0)  # noqa: SLF001
+    sampler._cpu_read_at = time.monotonic() - 1.0  # noqa: SLF001  - a full second ago
+
+    assert sampler._cpu_percent_or_unmeasured() == 106.0  # noqa: SLF001
+
+
+def test_a_discarded_cpu_reading_still_advances_the_interval(tmp_path: Path) -> None:
+    """The reading is taken even when thrown away, or the next one inherits the bad interval.
+
+    ``cpu_percent()`` differences against its own previous call. Skipping the call instead of
+    discarding its result would fold the sub-tick gap into the *following* sample, moving the
+    corruption one row down rather than removing it.
+    """
+    calls: list[int] = []
+
+    def _reading() -> float:
+        calls.append(1)
+        return 703.0
+
+    sampler = ResourceSampler(tmp_path / "s.jsonl", interval_s=0.01, phase_of=lambda: "p")
+    sampler._process = SimpleNamespace(cpu_percent=_reading)  # noqa: SLF001
+    sampler._cpu_read_at = time.monotonic()  # noqa: SLF001
+
+    sampler._cpu_percent_or_unmeasured()  # noqa: SLF001
+
+    assert calls == [1], "the reading must still be taken, to re-prime the next difference"
+    assert time.monotonic() - sampler._cpu_read_at < 0.5, "the interval clock must have advanced"  # noqa: SLF001
+
+
+def test_the_cpu_interval_floor_follows_the_kernel_tick(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The floor is derived from ``SC_CLK_TCK``, not hard-coded, and survives its absence."""
+    monkeypatch.setattr(os, "sysconf", lambda _name: 250)
+    assert sampler_module._min_cpu_interval_s() == pytest.approx(4.0 / 250)  # noqa: SLF001
+
+    def _refuse(_name: str) -> int:
+        raise OSError
+
+    monkeypatch.setattr(os, "sysconf", _refuse)
+    assert sampler_module._min_cpu_interval_s() == pytest.approx(4.0 / 100.0)  # noqa: SLF001
+
+
+# ── the CPU skew line beside the RSS one ────────────────────────────────────
+
+
+def _analysis_with_cpu(peak: float, max_process: float, measured: bool = True) -> SampleAnalysis:
+    """An analysis carrying only the CPU fields the resources notes read."""
+    return SampleAnalysis(
+        cpu=CpuUsage(peak=peak, mean=peak / 2, max_process=max_process, measured=measured)
+    )
+
+
+def _run_of(process_count: int) -> object:
+    """A run double exposing exactly what ``_resource_notes`` asks of it."""
+    workers = [SimpleNamespace(role="worker") for _ in range(process_count)]
+    return SimpleNamespace(
+        hardware_by_host={},
+        workers=workers,
+        roles=["worker"],
+        workers_of=lambda role: [w for w in workers if w.role == role],
+    )
+
+
+def test_the_cpu_skew_is_printed_beside_the_peak_it_qualifies() -> None:
+    """``peak`` sums every process at its own peak, which no instant need have contained.
+
+    Printed alone it reads as a concurrent demand and a reader sizes a job with it. The skew is
+    the sentence that says whether one process drove that total or the load was spread, and it
+    was computed and carried into ``report_as_dict`` while never being rendered.
+    """
+    notes = _resource_notes(_analysis_with_cpu(peak=7.25, max_process=1.06), _run_of(6))  # type: ignore[arg-type]
+
+    assert any("heaviest process peaked at 1.06 cores" in note for note in notes)
+    # 7.25 summed over 6 processes: the mean is what makes 1.06 read as "spread, not one hog".
+    assert any("against a 1.21 mean" in note for note in notes)
+
+
+def test_an_unmeasured_cpu_prints_no_skew_line() -> None:
+    """A run that declined to sample has no skew to report, and inventing 0.00 would read as one."""
+    analysis = _analysis_with_cpu(peak=0.0, max_process=0.0, measured=False)
+    notes = _resource_notes(analysis, _run_of(4))  # type: ignore[arg-type]
+
+    assert not any("heaviest process peaked" in note for note in notes)

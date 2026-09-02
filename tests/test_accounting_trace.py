@@ -11,6 +11,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -43,6 +44,7 @@ from lineprofiler.accounting.tracealign import (
     overlap_ns,
     place_spans,
     to_common_epoch,
+    usable_anchors,
 )
 
 # ── the ring buffer ─────────────────────────────────────────────────────────
@@ -147,6 +149,78 @@ def test_the_accuracy_note_distinguishes_one_host_from_several() -> None:
     """Cross-host alignment is NTP-bounded, and the page has to say so."""
     assert "exact" in alignment_accuracy_note({"node0"})
     assert "clock synchronisation" in alignment_accuracy_note({"node0", "node1"})
+
+
+# ── a stepped wall clock ────────────────────────────────────────────────────
+#
+# `perf_counter_ns` is monotonic; `time.time_ns` is not. An NTP step or a resumed VM moves
+# the wall clock by minutes between two anchors, and fitting a line through that pair maps
+# the spans after it onto a reversed, wildly dilated axis. The whole timeline is then wrong
+# — and being single-host, the page called its own axis "exact".
+
+_HOUR_NS = 3_600 * 1_000_000_000
+
+
+def _stepped_anchors(step_ns: int) -> list[ClockAnchor]:
+    """Three anchors 100 ms apart, the wall clock jumping by ``step_ns`` before the last."""
+    return [
+        ClockAnchor(perf_ns=1_000_000_000, real_ns=1_700_000_000_000_000_000),
+        ClockAnchor(perf_ns=1_100_000_000, real_ns=1_700_000_000_100_000_000),
+        ClockAnchor(perf_ns=1_200_000_000, real_ns=1_700_000_000_200_000_000 + step_ns),
+    ]
+
+
+def test_a_stepped_anchor_is_discarded_rather_than_fitted_through() -> None:
+    """A wall clock that moves an hour in 100 ms is a step, not drift worth correcting for."""
+    anchors = _stepped_anchors(-_HOUR_NS)
+
+    assert usable_anchors(anchors) == anchors[:2]
+
+
+def test_ordinary_drift_between_the_clocks_survives_the_check() -> None:
+    """The check must reject steps without rejecting the drift the anchors exist to correct."""
+    start = ClockAnchor(perf_ns=1_000, real_ns=1_700_000_000_000)
+    end = ClockAnchor(perf_ns=2_000, real_ns=1_700_000_001_100)
+
+    assert usable_anchors([start, end]) == [start, end]
+
+
+def test_a_backward_clock_step_does_not_reverse_the_common_axis() -> None:
+    """Fitting through the step mapped later spans *earlier*, so every one of them read 0ns."""
+    anchors = usable_anchors(_stepped_anchors(-_HOUR_NS))
+
+    early = to_common_epoch(1_150_000_000, anchors)
+    late = to_common_epoch(1_190_000_000, anchors)
+
+    assert late > early
+    assert abs((late - early) - 40_000_000) < 1_000_000
+
+
+def test_a_forward_clock_step_does_not_stretch_the_spans_that_follow_it() -> None:
+    """The forward case dilates instead of reversing: a 2 ms span rendered as minutes."""
+    anchors = usable_anchors(_stepped_anchors(_HOUR_NS))
+
+    t0 = to_common_epoch(1_150_000_000, anchors)
+    t1 = to_common_epoch(1_152_000_000, anchors)
+
+    assert abs((t1 - t0) - 2_000_000) < 100_000
+
+
+def test_a_worker_whose_clock_stepped_is_named_on_the_aligned_trace() -> None:
+    """Repairing the axis silently would leave the reader trusting a placement we do not."""
+    trace = WorkerTrace(paths=[("work",)], anchors=_stepped_anchors(-_HOUR_NS))
+    trace.spans.append(
+        Span(phase_id=0, thread_id=0, t0_ns=1_150_000_000, t1_ns=1_190_000_000, cpu_ns=0,
+             flags=0),
+    )
+    run = SimpleNamespace(
+        workers=[SimpleNamespace(trace=trace, role="actor", label="rank 0", pid=1, host="n0")],
+    )
+
+    aligned = align_run(run)
+
+    assert aligned.clock_steps == {"rank 0": 1}
+    assert aligned.duration_ns == 40_000_000
 
 
 # ── links and arrows ────────────────────────────────────────────────────────

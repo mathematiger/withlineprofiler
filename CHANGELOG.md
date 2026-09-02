@@ -6,6 +6,135 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed — the `CPU peak` figure was quantisation noise, not a measurement
+
+`RESOURCES` reported `CPU peak 8.7 cores` on a run whose true concurrent peak was about 1.5, and the identical benchmark reported `1.4`, `8.7` and `19.5` cores across three runs on the same machine with the same workload. It is the figure a reader sizes a job with, it was wrong by 5.8x, and it was non-deterministic between identical runs.
+
+The cause is the baseline row. `ResourceSampler._run` writes it "before any interval elapses", and `_add_process_metrics` reads `psutil.Process.cpu_percent()` on it — which differences against the priming call inside `_detect_capabilities`, a thread start and a file open earlier, on the order of a millisecond. `psutil` then divides a CPU-time delta quantised to the kernel tick by that sub-millisecond wall interval. Below one tick the quotient is not a noisy measurement but a coin flip between `0` and `tick / interval`: measured on a process spinning at exactly one core, with `SC_CLK_TCK` at 100 Hz, a 1.4 ms interval returned `0.0` fifty-one times in sixty and exceeded 200% nine times, peaking at 703%. Those outliers are maxima, so they land squarely on a *peak*.
+
+A reading is now kept only when its interval spans at least four kernel ticks, and is recorded as the existing `-1.0` "not measured" sentinel otherwise. Four ticks bounds the quantisation error at 25%, and from two ticks upward the same measurement was already exact; the floor is derived from `SC_CLK_TCK` rather than hard-coded, so it is 40 ms at 100 Hz and 4 ms on a 1000 Hz kernel. `-1.0` rather than `0.0` because the report already distinguishes them and an unmeasured row recorded as an idle one would drag every mean down instead of leaving a gap.
+
+The reading is still *taken* on the rows whose value is discarded. `cpu_percent()` differences against its own previous call, so skipping the call would fold the sub-tick gap into the following sample and move the corruption one row down rather than remove it.
+
+`RESOURCES` now also prints the CPU skew beside that peak: `heaviest process peaked at 1.06 cores against a 1.21 mean`. `CpuUsage.max_process` was already computed and already carried into `report_as_dict` as `cpu_cores_max_process`, and its own docstring already said that against `peak / processes` it is the skew — only `_resource_notes` never rendered it, while the RAM row beside it has had that line all along. It belongs with the fix above rather than after it: `CPU peak` sums every process at its own peak, so it describes an instant that need never have existed, and the skew is the sentence that says whether one process drove the total or the load was spread. Printing the alarming figure without it is what makes a reader over-size a job.
+
+### Fixed — `sync=True` no longer opens a CUDA context in a process that never uses the GPU
+
+`Profiler` resolved `torch.cuda.synchronize` for every enabled profiler on a box where a device was visible, and `phase(sync=True)` then called it. That call is what creates a process's CUDA primary context: measured on an A100, `import torch` holds no VRAM, `torch.cuda.is_available()` returning `True` holds no VRAM, and the first `synchronize()` holds **414 MiB**. So a CPU-only worker — an actor that holds no model and talks to an inference server over a queue — bought a context it never used, purely by being profiled. On a four-actor debug run that was 1.7 GB of a 40 GB card; the same pipeline's recommended 32-actor profile would be ~13 GB. This is profiling changing the thing it measures, and it scales with worker count.
+
+The obvious caller-side workaround does not work and fails silently: torch caches the visible-device count on the first `is_available()`, so `CUDA_VISIBLE_DEVICES=""` set inside a spawned worker is already too late, and the worker has no way to detect that it failed. A fix that works has to bracket every `Process.start()` in the parent.
+
+`cuda_synchronize()` now returns a callable that drains only while `torch.cuda.is_initialized()`. A process that has not initialised CUDA by the time it opens a `sync=True` phase has submitted no device work, so the drain is a no-op *by definition* — skipping it is free and correct, and it fixes every existing caller with no API change. The check is a flag read, not a driver call, and it is deliberately not cached: a process that initialises CUDA later starts synchronising from that point, and a forked child that inherited the callable without the parent's context gets the right answer. `Profiler(cuda_sync=False)` switches synchronisation off outright for a role known to be CPU-only, and `cuda_sync=True` restores the unconditional drain.
+
+The comment that justified resolving the callable eagerly claimed `torch.cuda.is_available()` initialises the driver. Measured, it does not — the cost sits on the other side of that line, and the comment now says what `is_available()` actually costs.
+
+### Fixed — GPU compute is no longer reported as "blocked", and no longer called a queue
+
+`wait_ns` is `max(0, wall - cpu)`, documented as wall time during which the thread was not executing on a CPU. That is the right definition for a queue `get()` and the wrong one for a phase waiting on the GPU: a thread inside `.backward()` or `cudaStreamSynchronize` has released the GIL and is off-CPU, so legitimate device compute was counted as blocked. The findings block then went further and attributed it: *"`train_step/forward_backward` spent 34% of its time blocked … released by actor on a recorded signal/wait_on pair, so this is a queue, not a hang."* The 34% was the backward pass. The finding's own closing sentence — 100% of the wait was after the producer had already signalled — was the evidence against its conclusion, printed as a supporting detail.
+
+Two defects, fixed separately. A span now records `FLAG_DEVICE_SYNC` when its phase actually drained a CUDA queue, and `_explain_wait` returns a device explanation before it considers any peer: a `sync=True` phase waited on the device by construction, so nothing about that wait is attributable to another process. The headline says "waiting on the device" rather than "blocked" for those phases. The flag is set only when a drain really happened, so a `sync=True` phase in a process with no CUDA context keeps its ordinary wait explanation. It is derived in `_record_span`, which runs only when tracing is on, so the untraced hot path is unchanged.
+
+The report made the same claim in two further places, and both are fixed with it. A role's `while learner waited, no other lane was active — this is a stall, not a queue` line now excludes synchronised phases and the phases that enclose them, and says the off-CPU time was device work instead. The timeline's phase summary marks such a row `‡` with a footnote, because that table is what a reader ranks by before reading the findings above it, and an unmarked `blocked 100%` there reads as a process waiting on a peer.
+
+Separately, `_releasing_role` matched every arrow addressed to the waiting *worker*, whenever it arrived — so one instrumented queue boundary anywhere in a process explained every blocked phase in it, naming a producer that had nothing to do with the wait. Only arrows that landed inside the phase's own spans count now, tested by bisect over a running maximum of the span end times so a phase with six figures of spans stays affordable.
+
+### Added — the VRAM figure that includes what actually scales
+
+The `RESOURCES` block reported `VRAM peak alloc` from `torch.cuda.memory_allocated()` — the caching allocator's view — against `nvmlDeviceGetMemoryInfo().total` as its denominator: an allocator number under a device-total column. On the run above it read `304.8 MB / 40.0 GB` while `nvidia-smi` showed **2,702 MiB** held by the same eight processes, an 8.9x gap that is entirely per-process CUDA context. The one figure a reader uses to answer "can I raise `num_actors`?" was the one that omits the term growing with `num_actors`, and it hid the context leak above completely.
+
+The sampler now also records `cuda_proc_used` per pid via `nvmlDeviceGetComputeRunningProcesses` — the column `nvidia-smi` prints — and the report shows it as a second row, `VRAM peak held`, beside the allocator row rather than instead of it. The allocator figure is genuinely the right answer to "how big are my tensors", and replacing it would silently change what every archived report is being compared against. The HTML report gains the matching tile, and both pages carry one line saying which instrument each figure came from. `report_as_dict` carries it as `vram_held_peak`, `None` rather than `0` when the driver would not say.
+
+`-1` is the unmeasured sentinel and `0` is a real reading — a process holding no VRAM is the finding, not a gap. Two cases are left unmeasured because zero would be a lie: a driver that will not attribute memory per process (some MIG and vGPU configurations report `usedGpuMemory` as `None`), and a pid-namespace mismatch in a container, where NVML reports host pids and `os.getpid()` is namespaced — detected by holding allocator memory while NVML lists no row for us.
+
+Finally the derived hint, which is what turns the two rows into an answer: when a role holds VRAM with no allocator activity at all, the report names it — *"2 actor process(es) hold 414.0 MB of VRAM each with no allocator activity — a CUDA context in a process doing no GPU work"* — and points at `cuda_sync=False`. That is the signature of the first entry above, and it collapses a two-hour investigation into a glance.
+
+### Added — the `async_work` footnote names the measurement that explains a slow submission
+
+The `†` note says a phase's wall time is submission time, not device compute, which is what points a reader at the real bottleneck. It did not say why submitting might be slow. It now names the decisive comparison — a phase whose cost does not scale with its batch counter is launch-bound, so compare its wall time at batch 1 against a large batch — because that measurement is one the profiler cannot run for you but can point at, using counter rows it already prints. The reported case measured flat at 2.13 ms across a 512x batch range at 145 kernels per call, and a captured CUDA graph took it to 0.39 ms for 2.89x end to end.
+
+### Fixed — a wall clock that steps mid-run no longer destroys the whole timeline
+
+`perf_counter_ns` is monotonic; `time.time_ns` is not. An NTP step, a resumed VM or a container clock correction moves the wall clock between two of a worker's clock anchors, and `to_common_epoch` fitted a straight line through the pair — so every span in that bracket was mapped onto an axis dilated by four or five orders of magnitude, and *reversed* when the step went backwards.
+
+Measured on a real 0.25-second run with one backward hour step: a 40 ms interval placed at −1,440 s, every span after the step drawn as `0ns`, a 2 ms span rendered as `1m 11s`, the page's headline reading `traced span 57m 48s`, the lane table reporting `phase open 0.0% / on CPU 0.0%`, and the top-ranked finding claiming the lane *"had no phase open for 100% of the run"* — which `lineprofiler trace --fail-over` would have failed a build on. The run was single-host, so the caveat block asserted the exact opposite of the truth: *"the shared time axis is exact: every process read the same clocks."*
+
+`usable_anchors` now rejects any anchor whose wall-clock elapsed disagrees with the monotonic elapsed by more than a factor of two, measured against the run's first anchor. That band is far wider than the drift the anchors exist to correct — slew is parts per million, and even chrony's aggressive default caps near 8% — and far narrower than any step worth catching, so it rejects steps without rejecting corrections. Verified against a real twelve-flush run: thirteen anchors written, thirteen kept.
+
+The repair is invisible by nature, so it is disclosed rather than assumed. `AlignedTrace.clock_steps` names each affected worker; the timeline states it beside the headline figures, not only in the trailing caveats, because this page has already learned once that a disclosure eighty lines under a confident conclusion does not reach whoever acts on it. `lineprofiler trace --format json` carries `clock_steps` for the same reason — the JSON is the output a machine acts on. Durations are unaffected either way: they are `perf_counter` deltas, and only absolute placement after the step depends on the anchor that was thrown away. The one-host accuracy note stops claiming the axis is "exact" when a clock stepped, since printing that one line under "the wall clock stepped mid-run" reads as an arithmetic bug in the tool.
+
+### Fixed — a finding that compares two hosts now carries its clock caveat
+
+Several findings are claims about the *relative* timing of processes: `only one of 2 lanes was active for 52% of the run`, a lane idle while another worked, a phase blocked across lanes. Within a host that relation is exact — every process reads the same two clocks. Across hosts it is only as good as NTP, and `alignment_accuracy_note` has always said so.
+
+It said so in `Caveats`, at the foot of the page, about 7,800 characters below the ranked findings that rest on it. The page is deliberately ordered conclusions-first so a reader can stop after the findings; doing that meant never seeing the one sentence that qualifies them. This is the same defect as the superseded-worker disclosure that used to sit below a header claiming `Processes 1` — the caveat was present, correct, and in the wrong place.
+
+The findings block now carries one sentence on a run spanning more than one host, pointing at `Caveats` for the full statement. Single-host runs — most runs — are unchanged, so the note does not become furniture readers learn to skip.
+
+### Fixed — concurrent asyncio tasks are no longer silently recorded as nesting
+
+Phase statistics are per *thread*, which is what lets the hot path take no locks. Asyncio tasks share a thread, so a phase held across an `await` while another task enters the same phase goes onto the stack twice and is stored as its own child. Eight concurrent requests produced `handle_request/handle_request/…` eight levels deep, every level claiming the full duration, and the outermost row reporting `entries 1` for eight requests served. At sixty-four they reached `MAX_DEPTH` and folded, which records nothing at all — sixty-three entries survived for sixty-four requests.
+
+That is the failure mode this layer exists to prevent: not a crash, but a complete-looking report that answers the throughput question wrong. It matters because an async inference server is the standard shape for batched policy inference in an RL pipeline.
+
+Attributing per task needs a per-task stack and a `contextvars` lookup on every phase entry, which a ~3 µs hot path cannot afford. So this reports rather than repairs. The profiler raises a `RuntimeWarning` naming the phase, the cause and the two workarounds — put the phase around a region that does not `await`, or run one task per thread — and the report header carries the same caveat for whoever opens the file later, since a warning printed to a terminal is gone by the time a profile is read. Detection sits in `_admit`, which runs once per distinct phase path and never on the hot path, and is gated on a phase repeating in its own path *and* a running event loop: sequential `async` code that nests different phases is measured correctly and stays quiet, as does ordinary threaded nesting.
+
+### Fixed — the advertised phase overhead now describes the default configuration
+
+The README's headline quoted **~2 µs per phase**. The default is `measure_cpu=True` — it has to be, since `wait%` is derived from it — and that measures **4.16 µs**, so the advertised figure was about half the cost a first user actually pays. The README contradicted itself twenty lines later (5.4 µs for the same call), and `docs/accounting-recipes.md` derived its "a phase is affordable above ~200 µs" rule from the non-default row while its own table listed 3909 ns for the default.
+
+Overhead figures are load-bearing in this package — the pitch is that it is cheap enough to leave enabled for twelve hours, and a reader deciding where to put a `with` block does that arithmetic with the headline number. Both places now quote the default, name it, and give the lever (`measure_cpu=False` roughly halves it at the price of the `wait%` column). The affordability threshold moves from ~200 µs to ~400 µs.
+
+### Fixed — one worker file with a broken clock no longer costs the entire report
+
+`_read_worker` guards everything after the JSON parse precisely so that an unusable file is a lost worker rather than a lost run. `float("inf")` and `float("nan")` defeated that guard by satisfying it: they *are* floats, so every cast and every `except (TypeError, ValueError)` passed them through. The value then reached `format_ns`, whose `int()` raised `ValueError` from the first line of the header — so a report over sixty-four workers was lost entirely because one of them wrote a bad timestamp.
+
+This is reachable rather than hypothetical. `json.dumps` writes `Infinity` and `NaN` by default and `json.loads` reads them back, so the profiler's own snapshot writer round-trips a non-finite clock reading silently. The same path delivers a *negative* runtime — a wall clock stepped backwards mid-run by an NTP correction on a long job — which printed as `Runtime -1000000000000ns`, a duration that cannot exist.
+
+`format_ns` now returns `n/a` for any non-finite or negative input. It is the single chokepoint every duration on every page passes through, so the text report, the HTML report, the comparison table and the timeline are all covered by the one change. The sentinel is deliberately not `?`, which the header already uses for an unknown host and `compare` uses for a thin sample: `Runtime ?` directly above `Host ?` reads as one kind of gap in two places.
+
+Because `n/a` says a figure is missing without saying why — and the reader needs that to know how much of the rest to trust — the header now carries a line naming the cause and stating what is unaffected: phase totals are `perf_counter` deltas and never come from the wall clock, so every number below the header is still a measurement. It is silent on a healthy run.
+
+### Fixed — a phase named from data no longer stretches every page it appears on
+
+A phase name is user data, and one built from a value — a file path, a URL, a serialised config — has no length bound. The text report's pipeline breakdown was the single label not passed through `format_label`: a bare `{name:<28}` pads a short name but does not bound a long one, so a 10,000-character name printed a 10,022-character line and pushed its own percentage and wall time into a column nobody scans. The two HTML pages had no bound at all and repeated the name once per table cell and per SVG tooltip.
+
+Labels are now bounded at two chokepoints — `format_label` for text, the new `htmldoc.clip_label` (90 columns) for HTML — both keeping the tail, because the leaf is what a reader greps for, and both marking the cut, because an unmarked truncation prints a name that does not exist. The complete name stays in the embedded JSON block the page is drawn from. On a run carrying one such name the HTML report fell from 39,587 to 19,724 bytes and the timeline from 84,384 to 54,899.
+
+A measured *count* is still never truncated, however wide: an overflowing field pushes the row right rather than printing a wrong number. Only the derived per-second rate is compacted — `format_rate` switches to exponent form above 1e15, so a counter of 2^70 on a microsecond phase no longer claims `61,202,261,312,462,999,586,340,864.0/s`, thirty digits quoted to the tenth from a single entry.
+
+### Fixed — a control character in a phase name no longer breaks a row apart
+
+A name of `a\nb\rc\x00d` rendered as four lines in the text report, three of which carried no numbers and so read as three phases that do not exist, and reached a `<td>` in the timeline page intact, carrying a NUL into a file people open in a browser. This is not an escaping hole and escaping does not address it: these characters are legal in HTML and in a terminal, and destroy the layout anyway.
+
+C0 and C1 control characters plus U+2028/U+2029 are now replaced with U+FFFD in `report._printable` and in `htmldoc.escape` — the two functions every label already passes through. Replacing rather than dropping keeps two names differing only by a control character distinguishable on the page.
+
+### Fixed — a phase blocked on several lanes no longer costs more than 100% of the run
+
+A finding read `mcts/ipc/queue_wait spent 100% of its time blocked, costing 155% of the run`, and the timeline's phase summary showed `share of run 183.6%` beside it. Both summed a figure across every lane the phase ran on and then divided by the run's wall clock, which is one lane's worth of time: two actors each blocked for a whole run genuinely wait two lane-seconds per wall second. The arithmetic was right and the denominator was not.
+
+A percentage over 100% reads as a bug rather than as a sum, and it appeared in the *first sentence of the first finding* — the one place on the page where losing the reader's trust costs the most, because every correct number below it then looks equally suspect.
+
+Both now divide by the lane time the phase could have occupied (`traced span × lanes`), and both say so: the finding appends `across 2 lanes` once more than one is involved, and the summary's note names the denominator and explains why the share column does not fall strictly (rows are ordered by summed wall time, so a phase on two lanes outranks a longer one on a single lane). `Finding.cost_pct` is what the ranking sorts on, so findings that span different numbers of workers are now comparable — with `wait_for_batch` on one lane correctly outranking `queue_wait` on two, which the old denominator had inverted.
+
+### Fixed — losing most of the workers is said beside the process count, not only at the foot
+
+Four workers that each construct their own `Profiler` without inheriting `LINEPROFILER_RUN_ID` get one attempt id each, so `_split_by_attempt` reads a healthy four-way job as four competing attempts, keeps one and discards three. `CAVEATS` declared this correctly — but it prints below the findings, the role blocks and every total, all of which were computed from the surviving quarter under a header reading `Processes 1`. A reader who stops at the conclusions never learns they are conclusions about one worker.
+
+The header now carries a `WARNING` whenever the excluded files outnumber the kept ones, naming the likely cause and the one-line fix (pass the same `run_id=`, or let children inherit it from the parent). An ordinary rerun into the same directory — one superseded attempt against one kept worker — is what the mechanism exists for and stays silent, so the line does not become noise.
+
+### Added — the device strip says what it is and what it cannot attribute
+
+The GPU utilisation strip was drawn under the lanes with no label, legend or note of any kind, directly beneath rows of span-resolution bars. Nothing said it is a 1 Hz whole-device reading covering every process on the device, and nothing said that no reading is tied to the call that launched the kernel — so the natural reading of a busy strip beside a busy lane is that one caused the other, which is the same wrong conclusion as the async-submission trap, arrived at from the other direction.
+
+A note now sits with the strip stating the source, the resolution, that it covers every process, and that it must not be used to attribute device time to a phase. It is driven by the same payload the script draws from, so it cannot describe a strip that is not painted, and it is absent entirely on a run with no device.
+
+### Documented — the measurement floor, and the levers when a phase costs too much
+
+Two additions to `docs/accounting-recipes.md`, both measured rather than estimated:
+
+- **What a phase bills *into* its own reported wall time**, as distinct from the ~2.6 µs it takes from the surrounding program that the overhead table already covers. `__enter__` reads its clock last and `__exit__` reads its first, so what remains inside is the interpreter's dispatch between them: ~210 ns at `measure_cpu=False`, ~240 ns with it on, ~250 ns tracing. That is within ~25 ns of a bare context manager that measures nothing, so it is close to irreducible in Python — but it is a per-entry inflation that does not shrink with the phase, which matters when summing very many short phases or differencing two nested ones. The report does not subtract it, because the correction would be an estimate standing in for a measurement. `benchmarks/bench_accounting.py` now prints it, so the documented figures cannot rot.
+- **The levers, in the order worth trying**, since every row of the overhead table is dominated by Python's own dispatch and no setting makes that cheaper. `measure_cpu=False` is the largest at ~1.6 µs of a ~4.2 µs phase (38%), against the cost of losing `wait%`; then sampling (~3.5x, not the sampling rate); then moving the phase out of the loop; then leaving `trace` off. `sync=True` and `async_work=True` are named as *not* levers — the first costs GPU time rather than profiler time, the second is one bool test.
+
 ### Fixed — `nvml_module()` no longer reports a GPU that isn't there
 
 A runner where the NVML driver library initialises cleanly but enumerates zero devices — the

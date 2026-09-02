@@ -53,6 +53,19 @@ itself lands on whichever later span happens to synchronise. Recorded so a rende
 so, because a wall time that looks like a measurement but answers a different question is the
 failure this layer exists to avoid."""
 
+FLAG_DEVICE_SYNC = 8
+"""The phase drained the CUDA queue at both ends, so its off-CPU time is device compute.
+
+The exact opposite claim to ``FLAG_ASYNC_UNSYNCED``, and recorded for the same reason: a
+span's ``wait`` is ``wall - cpu``, which reads as "blocked on something" and is right for a
+queue ``get()``. Inside ``.backward()`` the thread has released the GIL and is off-CPU while
+the *device* runs the work, so the same arithmetic describes GPU compute — and a renderer
+calling that a queue asserts something false about another process.
+
+Set only when a drain actually happened: a ``sync=True`` phase in a process with no CUDA
+context synchronises nothing (see :func:`capabilities.cuda_synchronize`), and its wait is an
+ordinary one."""
+
 DEFAULT_CAPACITY = 200_000
 """Spans retained per worker. At 48 bytes a span this is ~10 MB, which is affordable next to
 a training process and deep enough to cover many thousands of iterations."""

@@ -42,12 +42,20 @@ from lineprofiler.accounting.tracealign import (
     PlacedSpan,
     align_run,
     alignment_accuracy_note,
+    clock_step_note,
     critical_path,
     lane_busy_share,
     lane_working_share,
     max_depth_of,
 )
-from lineprofiler.htmldoc import JsonValue, document, escape, tile
+from lineprofiler.htmldoc import (
+    MAX_LABEL_DRAWN,
+    JsonValue,
+    clip_label,
+    document,
+    escape,
+    tile,
+)
 
 _MAX_SPANS_DRAWN = 120_000
 """Spans handed to the page. Past this the canvas stays smooth but the file gets large, so
@@ -107,9 +115,9 @@ def render_trace_html(
     # which is the opposite of the order the page used to impose on them.
     body = "\n".join([
         _header(aligned, title, run),
-        _findings_block(findings),
+        _findings_block(findings, aligned.hosts),
         _phase_summary(totals, aligned),
-        _canvas_block(),
+        _canvas_block(_gpu_device_count(payload)),
         _critical_path_block(chain, aligned),
         _lane_summary(aligned),
         _sequence_block(aligned),
@@ -172,7 +180,12 @@ def _empty_body(title: str) -> str:
 
 
 def _header(aligned: AlignedTrace, title: str, run: MergedRun) -> str:
-    """Headline figures: how long, how many lanes, and how much of it was waiting."""
+    """Headline figures: how long, how many lanes, and how much of it was waiting.
+
+    A rejected clock anchor is disclosed *here*, not only in the caveats: it qualifies the
+    axis every figure below is measured along, and this page has already learned once that a
+    caveat eighty lines under a confident conclusion does not reach whoever acts on it.
+    """
     waiting = _overall_wait_share(aligned)
     tiles = "".join([
         # "traced span", not "runtime": this is first-span to last-span, which is legitimately
@@ -188,10 +201,13 @@ def _header(aligned: AlignedTrace, title: str, run: MergedRun) -> str:
     run_id = escape(str(run.metadata.get("run_id", "unknown")))
     source = source_of(run.metadata)
     source_html = f" · {escape(source)}" if source else ""
+    stepped = clock_step_note(aligned.clock_steps)
+    stepped_html = f'<p class="warn">{escape(stepped)}</p>\n' if stepped else ""
     return (
         f"<h1>{escape(title)}</h1>\n"
         f'<p class="sub mono">run {run_id}{source_html}</p>\n'
         f'<div class="tiles">{tiles}</div>\n'
+        f"{stepped_html}"
         '<p class="note">“traced span” is first span to last, which is shorter than the '
         "run's wall clock: a worker starts before its first phase and ends after its last.</p>"
     )
@@ -277,6 +293,26 @@ def _sequence_block(aligned: AlignedTrace) -> str:
     )
 
 
+def _cell_label(text: str) -> str:
+    """A phase name as a table cell: bounded, escaped, and honest about the cut.
+
+    The tail is kept for the same reason :func:`report.format_label` keeps it — the leaf is
+    what a reader is looking for — and the cut is marked, because an unmarked truncation
+    prints a name that does not exist. The ``title`` says how much was dropped rather than
+    carrying the rest: a tooltip holding the whole name would put it back into the markup
+    once per table, which is the cost this bound exists to avoid. The complete name is in the
+    embedded JSON, which is where a reader goes for exact values anyway.
+    """
+    cut = clip_label(text)
+    if cut == text:
+        return escape(text)
+    hidden = len(text) - (MAX_LABEL_DRAWN - 1)
+    return (
+        f'<span title="name truncated for display; {hidden:,} leading characters not shown '
+        f'— the full name is in the data block">{escape(cut)}</span>'
+    )
+
+
 def _sequence_row(span: PlacedSpan, origin: int) -> str:
     """One call in a lane's sequence, indented to show what it was called from."""
     indent = "&nbsp;" * (4 * min(span.depth, _MAX_DEPTH_DRAWN))
@@ -284,14 +320,14 @@ def _sequence_row(span: PlacedSpan, origin: int) -> str:
     wait = "n/a" if span.wait_pct < 0 else f"{span.wait_pct:.0f}%"
     return (
         f'<tr><td class="mono">{span.depth}</td>'
-        f'<td class="mono">{indent}{arrow}{escape(span.name)}</td>'
+        f'<td class="mono">{indent}{arrow}{_cell_label(span.name)}</td>'
         f"<td>{escape(format_ns(span.t0_ns - origin))}</td>"
         f"<td>{escape(format_ns(span.duration_ns))}</td>"
         f"<td>{wait}</td></tr>"
     )
 
 
-def _findings_block(findings: list[Finding]) -> str:
+def _findings_block(findings: list[Finding], hosts: set[str] | None = None) -> str:
     """What is wrong with this run, ranked, at the top of the page.
 
     The page used to open with a lane table and a canvas, which is evidence rather than a
@@ -301,6 +337,14 @@ def _findings_block(findings: list[Finding]) -> str:
     Each finding that names something on the timeline gets a button rather than a sentence
     telling the reader to go and find it, so the connection between the claim and the picture
     survives the reader not knowing the vocabulary yet.
+
+    On a run spanning hosts the block carries one line saying the axis is only as good as the
+    clocks. Several of these findings — a lane idle while another worked, one lane active at a
+    time, a phase blocked across lanes — are claims about the *relative* timing of processes,
+    and across hosts that relation is NTP-accurate rather than exact. ``Caveats`` states this
+    in full at the foot of the page, which is precisely where the superseded-worker disclosure
+    used to sit while the header claimed one process: a reader who stops at the ranked
+    conclusions, which is what this block is for, never gets there.
     """
     if not findings:
         return (
@@ -314,8 +358,25 @@ def _findings_block(findings: list[Finding]) -> str:
     return (
         "<h2>Findings</h2>\n"
         '<p class="note">Ranked by how much of the traced span each one accounts for. '
-        "“Show on timeline” filters the chart below to what the finding is about.</p>\n"
+        "“Show on timeline” filters the chart below to what the finding is about."
+        f"{_findings_clock_note(hosts)}</p>\n"
         f'<ol class="findings">{items}</ol>'
+    )
+
+
+def _findings_clock_note(hosts: set[str] | None) -> str:
+    """One sentence qualifying cross-host findings, or nothing on the ordinary one-host run.
+
+    Deliberately short and deliberately not a repeat of :func:`alignment_accuracy_note`, which
+    keeps the full statement in ``Caveats``. This is the pointer that stops a reader acting on
+    a comparison between hosts without knowing it rests on NTP; most runs are one host, and a
+    note they see every time is one they stop reading.
+    """
+    if not hosts or len(hosts) < 2:
+        return ""
+    return (
+        f" These workers ran on {len(hosts)} hosts: any finding comparing one lane against "
+        "another is only as accurate as the clocks agree — see Caveats."
     )
 
 
@@ -371,10 +432,26 @@ def _phase_summary(totals: list[PhaseTotal], aligned: AlignedTrace) -> str:
         "<h2>Phase summary</h2>\n"
         '<p class="note">Every phase by total wall time across all lanes. “self” excludes '
         "time spent inside nested phases, so a wrapper does not out-rank the callee that "
-        "spent the time. Bar colour is the share of the phase spent blocked.</p>\n"
+        "spent the time. Bar colour is the share of the phase spent blocked. “wall” and "
+        "“self” are summed over every lane the phase ran on, so they can exceed the run's "
+        "duration; “share of lane time” divides by that same lane count, so it cannot. Rows "
+        "are ordered by wall, which is why the share column does not fall strictly — a phase "
+        "on two lanes outranks a longer one on a single lane.</p>\n"
+        f"{_device_footnote(totals)}"
         '<div class="scroll"><table><thead><tr><th>phase</th><th>calls</th><th>lanes</th>'
-        "<th>wall</th><th>self</th><th>blocked</th><th>share of run</th></tr></thead>"
+        "<th>wall</th><th>self</th><th>blocked</th><th>share of lane time</th></tr></thead>"
         f"<tbody>{rows}</tbody></table></div>{more}"
+    )
+
+
+def _device_footnote(totals: list[PhaseTotal]) -> str:
+    """Define the ‡ mark, and only when a row on this page carries it."""
+    if not any(total.on_device and total.wait_pct >= 0 for total in totals):
+        return ""
+    return (
+        '<p class="note">‡ = the phase drained the CUDA queue at both ends '
+        "(<code>sync=True</code>), so its “blocked” share is the device running that phase's "
+        "own work — not a wait on another process.</p>\n"
     )
 
 
@@ -385,9 +462,20 @@ def _phase_row(
     root: str = "",
 ) -> str:
     """One phase's totals, with a bar whose length is wall time and colour is its wait."""
-    share = 100.0 * total.wall_ns / aligned.duration_ns if aligned.duration_ns else 0.0
+    # Against the lane time this phase could have occupied, not the run's wall clock: a phase
+    # running on two lanes has two lane-seconds available per wall second, so dividing a
+    # summed wall time by the wall clock produced shares over 100% — which reads as a bug and
+    # discredits every other figure on the page.
+    available_ns = aligned.duration_ns * max(1, total.lanes)
+    share = 100.0 * total.wall_ns / available_ns if available_ns else 0.0
     width = 100.0 * total.wall_ns / widest
     blocked = "n/a" if total.wait_pct < 0 else f"{total.wait_pct:.0f}%"
+    # A synchronised phase's off-CPU time is the device running its own work, so the column
+    # heading means the opposite of what it says on that row. Marked here rather than only in
+    # the findings above: the table is what a reader ranks by, and an unmarked 100% there
+    # reads as a process waiting on a peer.
+    if total.on_device and total.wait_pct >= 0:
+        blocked = f"{blocked} ‡"
     colour = _wait_colour(total.wait_pct)
     where = (
         f'<div class="src">{escape(_relative_to(total.origin.file, root))}'
@@ -396,7 +484,7 @@ def _phase_row(
         else ""
     )
     return (
-        f'<tr><td class="mono">{escape(total.path)}{where}</td>'
+        f'<tr><td class="mono">{_cell_label(total.path)}{where}</td>'
         f"<td>{total.calls:,}</td><td>{total.lanes}</td>"
         f"<td>{escape(format_ns(total.wall_ns))}</td>"
         f"<td>{escape(format_ns(total.self_ns))}</td>"
@@ -422,7 +510,40 @@ def _wait_colour(wait_pct: float) -> str:
     return f"rgb({red},{green},{blue})"
 
 
-def _canvas_block() -> str:
+def _gpu_device_count(payload: dict[str, JsonValue]) -> int:
+    """How many device rows the chart will draw, read back off the payload it will draw from.
+
+    Taken from the payload rather than recomputed so the note cannot claim a strip the script
+    does not paint — the two would otherwise be free to disagree about an empty series.
+    """
+    gpu = payload.get("gpu")
+    return len(gpu) if isinstance(gpu, list) else 0
+
+
+def _gpu_note(devices: int) -> str:
+    """Say what the device strip is, and what it is not, beside the strip itself.
+
+    The strip is drawn under lanes of precise spans, so without a word next to it a reader
+    reasonably assumes it has the same resolution and the same attribution. It has neither:
+    it is a 1 Hz whole-device reading, and nothing here ties a kernel to the call that
+    launched it. A reader who believes otherwise will read a busy device next to a busy lane
+    as the one causing the other, which is exactly the wrong conclusion this page exists to
+    prevent — and the same error, from the other direction, as the async-submission trap.
+    """
+    if not devices:
+        return ""
+    strip = "strip" if devices == 1 else "strips"
+    return (
+        f'<p class="note"><strong>GPU {strip}</strong> below the lanes: whole-device '
+        "utilisation from the 1 Hz sampler, 0–100% per device, on the same axis. It is every "
+        "process's work on that device, not only this run's, and it is far coarser than the "
+        "spans above it — a kernel shorter than a second may not appear at all. Nothing "
+        "connects a reading to the call that launched it: use it to ask whether the device "
+        "was busy while a lane sat idle, never to attribute device time to a phase.</p>\n"
+    )
+
+
+def _canvas_block(gpu_devices: int = 0) -> str:
     """The timeline itself, drawn by the inlined script into a canvas."""
     # The legend is markup rather than something the script paints, so it is readable before
     # the canvas has drawn and survives the reader printing the page. What each control does
@@ -445,6 +566,7 @@ def _canvas_block() -> str:
         "call; its width is wall time and its colour is how much of that time was spent "
         "blocked rather than running. A gap is a lane with nothing open at all.</p>\n"
         f"{legend}\n"
+        f"{_gpu_note(gpu_devices)}"
         '<div class="tl-controls">'
         '<button type="button" id="tl-reset">reset zoom</button>'
         '<button type="button" id="tl-critical" aria-pressed="false">'
@@ -496,7 +618,7 @@ def _critical_path_block(chain: list[PlacedSpan], aligned: AlignedTrace) -> str:
         )
         rows.append(
             f"<tr><td>{escape(span.worker)}</td>"
-            f"<td>{escape('/'.join(span.path))}{where}</td>"
+            f"<td>{_cell_label('/'.join(span.path))}{where}</td>"
             f"<td>{escape(format_ns(span.duration_ns))}</td>"
             f"<td>{'n/a' if span.wait_pct < 0 else f'{span.wait_pct:.0f}%'}</td>"
             f"<td>{escape(gap)}</td></tr>",
@@ -571,7 +693,10 @@ def _caveats(aligned: AlignedTrace, omitted: int = 0) -> str:
             f"{unmeasured:,} span(s) were derived from function calls, which cannot measure "
             "CPU time; they are drawn hatched and their wait is unknown, not zero.",
         )
-    items.append(alignment_accuracy_note(aligned.hosts))
+    stepped = clock_step_note(aligned.clock_steps)
+    if stepped:
+        items.append(stepped)
+    items.append(alignment_accuracy_note(aligned.hosts, clock_stepped=bool(stepped)))
     entries = "".join(f"<li>{escape(item)}</li>" for item in items)
     return f"<h2>Caveats</h2>\n<ul>{entries}</ul>"
 
@@ -760,6 +885,11 @@ def _device_samples(run: MergedRun, index: int) -> list[tuple[float, float]]:
 
 
 _STYLE = """
+.warn {
+  background: var(--panel); border: 1px solid var(--rule);
+  border-left: 3px solid var(--accent); border-radius: 6px;
+  padding: .55rem .8rem; margin: .7rem 0 0; font-size: .87rem;
+}
 .findings { list-style: none; counter-reset: finding; margin: 0; padding: 0; }
 .finding {
   counter-increment: finding; position: relative; background: var(--panel);

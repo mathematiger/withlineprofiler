@@ -19,11 +19,13 @@ import pytest
 from test_accounting_report_golden import _build_fixed_run
 
 from lineprofiler import LineProfiler
-from lineprofiler.accounting import merge_run
+from lineprofiler.accounting import Profiler, merge_run
 from lineprofiler.accounting.cli import main
 from lineprofiler.accounting.htmlreport import flame_cells, render_html, write_html
 from lineprofiler.accounting.phasetree import PhaseStats, PhaseTree
 from lineprofiler.accounting.report import report_as_dict
+from lineprofiler.accounting.sampler import Sample
+from lineprofiler.htmldoc import escape
 
 THIS_DIR = str(Path(__file__).resolve().parent)
 
@@ -129,6 +131,46 @@ def test_the_resources_block_reports_capacity_and_use(tmp_path: Path) -> None:
     assert "<h2>Resources</h2>" in html
     assert "64" in html
     assert "peak RSS" in html
+
+
+def test_the_page_shows_the_vram_the_device_holds_beside_the_allocators(
+    tmp_path: Path,
+) -> None:
+    """The same two instruments as the text report, and the same reason to show both.
+
+    A tile reading "peak VRAM 304.8 MB / 40.0 GB" invites exactly one question — can I add
+    more workers? — and the allocator figure it is built from cannot see what a worker costs,
+    because a CUDA context is invisible to it.
+    """
+    _build_fixed_run(tmp_path)
+    run = merge_run(tmp_path)
+    run.workers[0].samples = [
+        Sample(t=float(i), phase="train", rss=1_000, cuda_alloc=300_000_000,
+               cuda_reserved=320_000_000, cuda_proc_used=734_000_000)
+        for i in range(3)
+    ]
+
+    html = render_html(run)
+
+    assert "VRAM held" in html
+    assert "700.0 MB" in html
+    assert "the torch caching allocator" in html
+
+
+def test_the_page_names_a_role_holding_a_context_it_never_uses(tmp_path: Path) -> None:
+    """The same hint as the text report, on the artifact people actually mail around."""
+    _build_fixed_run(tmp_path)
+    run = merge_run(tmp_path)
+    run.workers[0].role = "actor"
+    run.workers[0].samples = [
+        Sample(t=float(i), phase="act", rss=1_000, cuda_proc_used=434_110_464)
+        for i in range(3)
+    ]
+
+    html = render_html(run)
+
+    assert "1 actor process(es) hold 414.0 MB of VRAM each with no allocator activity" in html
+    assert "<code>cuda_sync=False</code>" in html
 
 
 def test_source_html_escapes_the_code_it_shows(tmp_path: Path) -> None:
@@ -240,3 +282,49 @@ def test_cli_rejects_html_for_compare(tmp_path: Path) -> None:
     """``compare`` cannot render HTML, so argparse should say so rather than fail later."""
     with pytest.raises(SystemExit):
         main(["compare", str(tmp_path), str(tmp_path), "--format", "html"])
+
+
+def test_escape_neutralises_control_characters_that_would_corrupt_a_cell() -> None:
+    """Markup escaping is not layout safety, and phase names are user data.
+
+    ``&<>"`` are escaped because they change the *markup*. A newline or a NUL does not — both
+    are legal in an HTML document — and both still destroy the table they land in: a name of
+    ``a\\nb\\rc\\x00d`` reached a ``<td>`` verbatim, splitting one cell across lines in the
+    source and carrying a NUL into a file people open in a browser. Every label on the trace
+    page goes through this function, so it is the one place the guarantee can be made.
+    """
+    escaped = escape("a\nb\rc\x00d")
+
+    assert "\n" not in escaped and "\r" not in escaped and "\x00" not in escaped
+    assert escaped.startswith("a") and escaped.endswith("d")
+
+
+def test_escape_leaves_ordinary_text_untouched() -> None:
+    """The replacement is for the characters that break a page, not for anything unusual."""
+    assert escape("train_step/forward") == "train_step/forward"
+    assert escape("épisode → 😀") == "épisode → 😀"
+    assert escape("<b>&\"") == "&lt;b&gt;&amp;&quot;"
+
+
+def test_an_overlong_phase_name_is_bounded_in_the_html_report(tmp_path: Path) -> None:
+    """The icicle page has the same unbounded-label problem the text report had.
+
+    A name built from data reaches both a table cell and an SVG ``<title>`` tooltip. Neither
+    has a width to overflow, so the failure is quieter than the text report's: the table
+    stretches until its own numbers are off-screen, and the string is repeated once per site.
+    The full name stays in the embedded JSON block, which is what the page is drawn from.
+    """
+    name = "x" * 10_000
+    profiler = Profiler(
+        run_dir=tmp_path, role="probe", enabled=True,
+        snapshot_interval_s=None, sample_interval_s=None,
+    )
+    with profiler, profiler.phase(name):
+        pass
+
+    html = render_html(merge_run(tmp_path))
+    body = html.split('<script type="application/json"', 1)[0]
+
+    assert name not in body, "the drawn markup must not carry the whole name"
+    assert name in html, "the payload must still hold it in full"
+    assert "…" in body, "the cut is marked, not silent"

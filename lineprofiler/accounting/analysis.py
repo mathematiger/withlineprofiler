@@ -160,6 +160,19 @@ class SampleAnalysis:
     is the one that says whether that total is evenly spread or carried by one fat worker."""
     peak_cuda_alloc: int = 0
     peak_cuda_reserved: int = 0
+    peak_cuda_process: int = 0
+    """Sum over processes of each one's peak device-reported VRAM, context included.
+
+    Measured with a different instrument from ``peak_cuda_alloc``: NVML per pid, which is what
+    ``nvidia-smi`` shows, against the torch caching allocator's view of its own tensors. The
+    difference is the per-process CUDA context the allocator never sees, and on a run with
+    several workers it dominates — 304.8 MB of allocator against 2.7 GB actually held. Summed
+    across processes exactly as ``memory.peak_rss`` is, so it is an upper bound: two processes
+    need not peak at the same instant."""
+    cuda_process_measured: bool = False
+    """Whether any worker could read the figure above. Without it the row is omitted rather
+    than shown as zero — a run on a driver that cannot attribute per-process memory has an
+    unknown device footprint, not an empty one."""
     gpu_util_mean: float = -1.0
     gpu_devices: list[GpuDevice] = field(default_factory=list)
     gpu_by_phase: dict[str, GpuPhaseUsage] = field(default_factory=dict)
@@ -184,7 +197,10 @@ class SampleAnalysis:
         the specific misreading that makes an unsynchronised device phase hard to catch.
         """
         return bool(
-            self.gpu_util_mean >= 0 or self.gpu_devices or self.peak_cuda_reserved,
+            self.gpu_util_mean >= 0
+            or self.gpu_devices
+            or self.peak_cuda_reserved
+            or self.cuda_process_measured,
         )
 
     @property
@@ -504,11 +520,31 @@ def _fill_gpu(analysis: SampleAnalysis, per_process: list[list[Sample]]) -> None
     pooled = [sample for samples in per_process for sample in samples]
     analysis.peak_cuda_alloc = max((s.cuda_alloc for s in pooled), default=0)
     analysis.peak_cuda_reserved = max((s.cuda_reserved for s in pooled), default=0)
+    _fill_device_memory(analysis, per_process)
     utilisations = [s.gpu_util for s in pooled if s.gpu_util >= 0]
     if utilisations:
         analysis.gpu_util_mean = sum(utilisations) / len(utilisations)
     analysis.gpu_devices = _gpu_devices(per_process)
     analysis.gpu_by_phase = _gpu_by_phase(pooled)
+
+
+def _fill_device_memory(analysis: SampleAnalysis, per_process: list[list[Sample]]) -> None:
+    """Sum each process's peak device-reported VRAM, skipping the ones that could not read it.
+
+    Per process and then summed, never pooled and maxed: the readings are per-pid slices of
+    one device, so the total is what the card is holding for this run. A process whose driver
+    could not attribute memory contributes nothing and is not counted as zero — the sum is
+    then a floor, which is why ``cuda_process_measured`` records that anything was read at all.
+    """
+    peaks = [
+        max((s.cuda_proc_used for s in samples if s.cuda_proc_used >= 0), default=-1)
+        for samples in per_process
+    ]
+    measured = [peak for peak in peaks if peak >= 0]
+    if not measured:
+        return
+    analysis.cuda_process_measured = True
+    analysis.peak_cuda_process = sum(measured)
 
 
 def _gpu_by_phase(samples: list[Sample]) -> dict[str, GpuPhaseUsage]:

@@ -10,6 +10,9 @@ Run with the extras installed:  poetry install --extras all
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -215,3 +218,106 @@ def test_the_torch_backend_writes_a_trace(run_dir: Path) -> None:
     artifacts = merge_run(run_dir).backend_artifacts()
     assert artifacts, "the window never produced a trace"
     assert Path(str(artifacts[0]["artifact"])).exists()
+
+
+# ── the CUDA context, against the real driver ───────────────────────────────
+
+
+@requires_nvml
+def test_compute_running_processes_reports_a_pid_and_its_memory() -> None:
+    """The load-bearing assumption behind ``_process_memory_on``.
+
+    The stub returns objects with ``pid`` and ``usedGpuMemory``, and the sampler reads both by
+    name. If a driver release renamed either, or started reporting ``usedGpuMemory`` as
+    ``None`` on an ordinary device, the VRAM-held row would silently become "n/a" and this is
+    what would notice.
+    """
+    import torch
+
+    nvml = nvml_module()
+    assert nvml is not None
+    handle = nvml.nvmlDeviceGetHandleByIndex(0)
+    held = torch.randn(2048, 2048, device="cuda")
+    torch.cuda.synchronize()
+
+    mine = [
+        process for process in nvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        if process.pid == os.getpid()
+    ]
+    del held
+
+    assert mine, "this process holds a tensor; NVML must list it"
+    assert mine[0].usedGpuMemory is not None
+    assert mine[0].usedGpuMemory > 0
+
+
+@requires_nvml
+@requires_cuda
+def test_the_device_sees_more_than_the_allocator_does(run_dir: Path) -> None:
+    """The gap the second VRAM row exists to show: the CUDA primary context.
+
+    Roughly 414 MiB on an A100 and invisible to ``torch.cuda.memory_reserved``, which is why a
+    report built on the allocator alone showed 304.8 MB where the card held 2.7 GB.
+    """
+    import torch
+
+    profiler = Profiler(
+        run_dir=run_dir, enabled=True, snapshot_interval_s=None, sample_interval_s=0.05,
+    )
+    held = torch.randn(1024, 1024, device="cuda")
+    torch.cuda.synchronize()
+    assert profiler._sampler is not None  # noqa: SLF001
+    sample = profiler._sampler.take()  # noqa: SLF001
+    profiler.close()
+    del held
+
+    assert sample.cuda_proc_used > sample.cuda_reserved, "the context is the difference"
+
+
+def test_is_available_does_not_open_a_cuda_context() -> None:
+    """The measurement the whole ``cuda_sync`` gate rests on.
+
+    Must run in a fresh interpreter: this process may already have initialised CUDA, and the
+    claim is about a process that has not. Skips rather than fails where torch is absent, so
+    the file's other tests still run.
+    """
+    probe = (
+        "import torch;"
+        "print(torch.cuda.is_available(), torch.cuda.is_initialized())"
+    )
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        pytest.skip("torch is not importable in a fresh interpreter here")
+
+    available, initialised = result.stdout.split()
+    if available != "True":
+        pytest.skip("no CUDA device visible")
+    assert initialised == "False", "is_available() must not initialise the driver"
+
+
+@requires_cuda
+def test_a_sync_phase_leaves_a_cpu_only_process_without_a_context() -> None:
+    """End to end, in a fresh interpreter: profiling must not create what it measures.
+
+    The regression is worth a subprocess. In-process the answer is decided by whatever ran
+    before it, and the whole defect was that one ``sync=True`` phase in a worker that touches
+    no tensor used to be enough to hold ~414 MiB for the life of the process.
+    """
+    probe = (
+        "import tempfile, torch;"
+        "from lineprofiler.accounting import Profiler;"
+        "d = tempfile.mkdtemp();"
+        "p = Profiler(run_dir=d, enabled=True, snapshot_interval_s=None,"
+        " sample_interval_s=None);"
+        "ctx = p.phase('act', sync=True);"
+        "ctx.__enter__(); ctx.__exit__(); p.close();"
+        "print(torch.cuda.is_initialized())"
+    )
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "False", "a sync=True phase opened a CUDA context"

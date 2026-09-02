@@ -36,6 +36,36 @@ from lineprofiler.accounting.capabilities import (
 )
 from lineprofiler.accounting.selfio import bytes_written, record_bytes_written
 
+_CPU_MIN_TICKS = 4.0
+"""Scheduler ticks a CPU-percentage reading must span before it means anything.
+
+``psutil.Process.cpu_percent()`` divides a CPU-time delta by a wall-clock interval, and the
+numerator is quantised to the kernel's tick. Below one tick the quotient is not a noisy
+measurement, it is a coin flip between ``0`` and ``tick / interval``: measured on a process
+spinning at exactly one core, a 1.4 ms interval returned ``0.0`` fifty-one times in sixty and
+exceeded 200% nine times, peaking at 703%. Four ticks bounds the quantisation error at 25%,
+and from two ticks upward the same measurement was already exact.
+"""
+
+_DEFAULT_CLOCK_TICK_HZ = 100.0
+"""Assumed tick rate where ``SC_CLK_TCK`` cannot be read. The usual Linux value."""
+
+
+def _min_cpu_interval_s() -> float:
+    """Shortest wall interval over which a CPU-percentage reading is worth keeping.
+
+    Derived from the kernel's own tick rather than hard-coded, because the quantisation this
+    guards against is the tick: at 100 Hz the floor is 40 ms, and on a kernel built at 250 or
+    1000 Hz it falls to 16 ms or 4 ms, which is correct rather than merely safer.
+    """
+    try:
+        ticks_per_second = float(os.sysconf("SC_CLK_TCK"))
+    except (AttributeError, ValueError, OSError):
+        ticks_per_second = _DEFAULT_CLOCK_TICK_HZ
+    if ticks_per_second <= 0:
+        ticks_per_second = _DEFAULT_CLOCK_TICK_HZ
+    return _CPU_MIN_TICKS / ticks_per_second
+
 
 class MemoryInfo(Protocol):
     """Resident set size, as returned by ``psutil.Process.memory_info()``."""
@@ -137,6 +167,18 @@ class Sample:
     self_write_bytes: int = 0
     cuda_alloc: int = 0
     cuda_reserved: int = 0
+    cuda_proc_used: int = -1
+    """VRAM the *device* reports this process holding — what ``nvidia-smi`` shows for this pid.
+
+    A different instrument from ``cuda_alloc``/``cuda_reserved``, which are the torch caching
+    allocator's view and therefore see tensors only. The gap between them is the CUDA primary
+    context, measured at ~414 MiB per process on an A100 and never visible to the allocator —
+    and it is the term that scales with worker count, so it is the one that answers "can I
+    raise ``--num-actors``?".
+
+    ``-1`` means not measured, never ``0``: a process holding no VRAM is a real reading, and a
+    driver that cannot attribute memory (some MIG and vGPU configurations report the memory as
+    ``None``) must not be recorded as one."""
     cpu_percent: float = -1.0
     """Process CPU over the interval ending at ``t``, as a percentage of one core; a
     multithreaded process exceeds 100. ``-1.0`` means not measured — never ``0.0``, which is a
@@ -164,6 +206,7 @@ class Sample:
             self_write_bytes=data.get("self_write_bytes", 0),
             cuda_alloc=data.get("cuda_alloc", 0),
             cuda_reserved=data.get("cuda_reserved", 0),
+            cuda_proc_used=data.get("cuda_proc_used", -1),
             cpu_percent=data.get("cpu_percent", -1.0),
             gpu_util=data.get("gpu_util", -1.0),
             gpu_utils=_device_map(data.get("gpu_utils")),
@@ -209,6 +252,8 @@ class ResourceSampler:
         - every visible device gets its own utilisation entry, and ``gpu_util`` is their mean
         - only this pid's rows are counted towards the per-process figure
         - a device whose utilisation call fails is skipped without losing the others
+        - the VRAM the device attributes to this pid is recorded, and a process holding none
+          records ``0`` while a driver that will not attribute records the ``-1`` sentinel
     """
 
     def __init__(self, path: Path, interval_s: float, phase_of: Callable[[], str]) -> None:
@@ -219,6 +264,9 @@ class ResourceSampler:
         self._thread: threading.Thread | None = None
         self._process: ProcessHandle | None = open_process()
         self.capabilities = _detect_capabilities(self._process)
+        # The priming call inside _detect_capabilities is what the next reading differences
+        # against, so its timestamp is what decides whether that reading covers a real interval.
+        self._cpu_read_at = time.monotonic()
         self._devices: list[tuple[int, Any]] = _open_devices()
         self._proc_util_since = 0
         self.write_failures = 0
@@ -248,6 +296,8 @@ class ResourceSampler:
         self._add_process_metrics(sample)
         self._add_cuda_metrics(sample)
         self._add_gpu_utilisation(sample)
+        # After the allocator reading, which it cross-checks against.
+        self._add_device_memory(sample)
         return sample
 
     def _run(self) -> None:
@@ -302,7 +352,7 @@ class ResourceSampler:
         # after it, a platform with no per-process byte counters would lose its CPU readings
         # too, for no reason.
         if self.capabilities.cpu:
-            sample.cpu_percent = self._process.cpu_percent()
+            sample.cpu_percent = self._cpu_percent_or_unmeasured()
         if self.capabilities.io:
             counters = read_io_snapshot(self._process)
             sample.io_ok = counters.available
@@ -313,6 +363,30 @@ class ResourceSampler:
             sample.read_chars = counters.read_chars
             sample.write_chars = counters.write_chars
             sample.self_write_chars, sample.self_write_bytes = bytes_written()
+
+    def _cpu_percent_or_unmeasured(self) -> float:
+        """This process's CPU over the interval since the last reading, or ``-1.0`` if too short.
+
+        The reading is always *taken*, even when it is thrown away: ``cpu_percent()`` differences
+        against its own previous call, so skipping it would push the discarded interval into the
+        next reading and corrupt that one instead.
+
+        What is discarded is the baseline row. It differences against the priming call inside
+        :func:`_detect_capabilities`, a thread start and a file open earlier — well under a
+        millisecond — and dividing a tick-quantised CPU-time delta by that is not a noisy
+        measurement but a coin flip. It reached the report as the ``CPU peak`` figure, the one a
+        reader sizes a job with: the same benchmark reported 1.4, 8.7 and 19.5 cores on identical
+        runs against a true peak near 1.5.
+
+        ``-1.0`` rather than ``0.0`` because the two mean different things and the report already
+        distinguishes them: zero is a real reading about an idle process, and recording "we did not
+        measure this" as "it used no CPU" would drag every mean down instead of leaving a gap.
+        """
+        reading = self._process.cpu_percent() if self._process is not None else -1.0
+        now = time.monotonic()
+        elapsed = now - self._cpu_read_at
+        self._cpu_read_at = now
+        return reading if elapsed >= _min_cpu_interval_s() else -1.0
 
     def _add_cuda_metrics(self, sample: Sample) -> None:
         if not self.capabilities.cuda:
@@ -364,6 +438,55 @@ class ResourceSampler:
         if not mine:
             return -1.0
         return sum(float(s.smUtil) for s in mine) / len(mine)
+
+    def _add_device_memory(self, sample: Sample) -> None:
+        """Record the VRAM the device says this process holds, summed over its devices.
+
+        The allocator figure this sits beside cannot see a CUDA primary context — ~414 MiB per
+        process on an A100 — so a report built on it alone shows 300 MB where the card is
+        holding 2.7 GB, and hides exactly the term that grows with the worker count. NVML
+        reports what ``nvidia-smi`` reports, per pid, which closes that gap.
+
+        Left unmeasured rather than zeroed in the two cases where zero would be a lie: a
+        driver that declines to attribute memory (MIG and vGPU report it as ``None``), and a
+        pid this process cannot recognise as its own. The second is a container: NVML reports
+        host pids while ``os.getpid()`` is namespaced, so our rows are simply absent and
+        "holds nothing" is indistinguishable from "cannot tell". Holding allocator memory
+        while NVML lists no row for us is proof of that mismatch, and is what the cross-check
+        below detects.
+        """
+        if not self.capabilities.gpu_util or not self._devices:
+            return
+        nvml = nvml_module()
+        if nvml is None:
+            return
+        held = 0
+        measured = False
+        for _index, handle in self._devices:
+            device_total = _process_memory_on(nvml, handle, os.getpid())
+            if device_total < 0:
+                return  # one device cannot attribute memory; a partial sum is not the figure
+            held += device_total
+            measured = True
+        if measured and not (held == 0 and sample.cuda_reserved > 0):
+            sample.cuda_proc_used = held
+
+
+def _process_memory_on(nvml: ModuleType, handle: Any, pid: int) -> int:  # noqa: ANN401
+    """VRAM ``pid`` holds on one device, ``0`` when it holds none, ``-1`` when unknowable."""
+    try:
+        running = nvml.nvmlDeviceGetComputeRunningProcesses(handle)
+    except Exception:  # noqa: BLE001 - any NVML failure means this device cannot be read
+        return -1
+    total = 0
+    for process in running:
+        if getattr(process, "pid", -1) != pid:
+            continue
+        used = getattr(process, "usedGpuMemory", None)
+        if used is None:
+            return -1  # MIG/vGPU: the process is there, its memory is not attributable
+        total += int(used)
+    return total
 
 
 def read_samples(path: Path) -> list[Sample]:
@@ -479,6 +602,10 @@ def _compact(sample: Sample) -> dict[str, Any]:
             row[name] = value
     # ``>= 0`` rather than truthiness: an idle process legitimately reads 0.0, and dropping
     # that would make "measured, idle" indistinguishable from "never measured".
+    # ``>= 0`` for the same reason as ``cpu_percent``: a process holding no VRAM is a
+    # measurement, and it is the measurement that makes an idle CUDA context visible.
+    if sample.cuda_proc_used >= 0:
+        row["cuda_proc_used"] = sample.cuda_proc_used
     if sample.cpu_percent >= 0:
         row["cpu_percent"] = sample.cpu_percent
     if sample.gpu_util >= 0:

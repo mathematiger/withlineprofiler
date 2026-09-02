@@ -23,6 +23,7 @@ import hashlib
 import os
 import re
 import signal
+import sys
 import threading
 import warnings
 import weakref
@@ -40,6 +41,7 @@ from typing import ParamSpec, TypeVar, overload
 
 from lineprofiler.accounting.backend import Backend, BackendWindow
 from lineprofiler.accounting.capabilities import (
+    cuda_context_probe,
     cuda_synchronize,
     nvtx_range_functions,
     record_function_factory,
@@ -59,6 +61,7 @@ from lineprofiler.accounting.snapshot import SnapshotWriter, new_run_id
 from lineprofiler.accounting.trace import (
     DEFAULT_CAPACITY,
     FLAG_ASYNC_UNSYNCED,
+    FLAG_DEVICE_SYNC,
     FLAG_SAMPLED,
     UNMEASURED,
     ClockAnchor,
@@ -269,6 +272,13 @@ class Profiler:
         trace_functions: Qualified-name globs limiting which functions ``trace="auto"``
             records, e.g. ``["train*", "*.step"]``. Without them every function in the
             project is traced, which is affordable for a bounded window and not much else.
+        cuda_sync: Whether ``phase(sync=True)`` may drain the CUDA queue. ``None`` — the
+            default — drains only once this process has a live CUDA context, so a CPU-only
+            worker in a GPU job never opens one just by being profiled (``synchronize()`` is
+            what creates the ~414 MiB primary context; ``is_available()`` does not). ``False``
+            switches synchronisation off outright for a role you already know holds no model.
+            ``True`` drains unconditionally, accepting that context in exchange for
+            synchronising a device this process has not yet touched.
 
     Statistics are accumulated per thread and merged only when a snapshot is written, so the
     hot path takes no locks and needs none. A snapshot taken while another thread is inside
@@ -303,6 +313,7 @@ class Profiler:
         trace_capacity: int = DEFAULT_CAPACITY,
         trace_functions: list[str] | None = None,
         source: dict[str, object] | None = None,
+        cuda_sync: bool | None = None,
     ) -> None:
         self.enabled: bool = _resolve_enabled(enabled)
         self.measure_cpu: bool = measure_cpu
@@ -333,12 +344,14 @@ class Profiler:
         self._snapshot_callbacks: list[Callable[[PhaseTree], None]] = []
         self._callback_failures = 0
         self._phase_overflow = 0
+        self._task_concurrency_warned = False
         self._window: BackendWindow | None = None
         self._process: ProcessHandle | None = None
         self._sample_interval_s = sample_interval_s
         self._nvtx: tuple[Callable[[str], object], Callable[[], object]] | None = None
         self._record_function: Callable[[str], AbstractContextManager[object]] | None = None
         self._cuda_sync: Callable[[], None] | None = None
+        self._cuda_live: Callable[[], bool] | None = None
         self._env_keys_propagated: list[str] = []
         # None is the hot path's off switch: _PhaseScope tests identity, exactly as it does
         # for _sync, _nvtx and _record_function, so an untraced phase pays one pointer
@@ -361,9 +374,12 @@ class Profiler:
         self._process = open_process()
         self._nvtx = nvtx_range_functions() if annotate else None
         self._record_function = record_function_factory() if annotate else None
-        # Resolved once: torch.cuda.is_available() initialises the driver on first call, so
-        # asking per phase would put a lock on the hot path.
-        self._cuda_sync = cuda_synchronize()
+        # Resolved once: torch.cuda.is_available() walks the driver's device list, which is
+        # far too much to ask per phase. It does *not* initialise CUDA — measured at 0 MiB of
+        # VRAM — so resolving here is free for a process that never uses the device. The
+        # callable it returns is what defers the decision to sync (see cuda_synchronize).
+        self._cuda_sync = _resolve_cuda_sync(cuda_sync)
+        self._cuda_live = cuda_context_probe()
 
         _warn_if_already_live(self.run_dir)
         self._env_keys_propagated = _propagate_to_children(
@@ -810,6 +826,38 @@ class Profiler:
             f"folded into their parent. The first that did not fit was {'/'.join(path)!r}. "
             "This usually means a phase name is built from data — use a fixed name and "
             "count() for the varying part.",
+            RuntimeWarning,
+            stacklevel=4,
+        )
+
+    def _note_possible_task_concurrency(self, path: PhasePath) -> None:
+        """Warn once that a phase re-entered under a running event loop is not real nesting.
+
+        Statistics are per *thread*, which is what lets the hot path take no locks — but
+        asyncio tasks share a thread, so two tasks inside the same phase put it on the stack
+        twice and it is recorded as nested inside itself. Every level then claims the full
+        duration, the outermost row reports one entry for however many requests were served,
+        and at ``MAX_DEPTH`` the phases fold and stop being recorded at all. All of that is
+        plausible and none of it is true, which is the failure this layer exists to prevent.
+
+        Attributing per task would need a per-task stack — ``contextvars`` — and a lookup on
+        every phase entry, which the ~3 µs hot path cannot afford. So this reports rather than
+        repairs: the numbers are what they are, and the reader is told not to trust the tree.
+
+        Gated on the leaf repeating in its own path, not on asyncio being in use. Sequential
+        ``async`` code that nests *different* phases is measured correctly and must stay
+        quiet, or the warning becomes noise and gets filtered.
+        """
+        if self._task_concurrency_warned or not _in_running_event_loop():
+            return
+        self._task_concurrency_warned = True
+        warnings.warn(
+            f"phase {path[-1]!r} was entered while already open on this thread, inside a "
+            "running asyncio event loop. Phase statistics are per thread, and asyncio tasks "
+            "share one, so concurrent tasks are recorded as nesting: each level claims the "
+            "whole duration and the outermost reports one entry for every request served. "
+            "Past 32 levels they fold and record nothing. Wrap the phase around code that "
+            "does not await, or run one task per thread.",
             RuntimeWarning,
             stacklevel=4,
         )
@@ -1335,6 +1383,10 @@ class _PhaseScope:
             return None
         # Only reached once per distinct path, never on the hot path, so a regex here is free.
         self._profiler._check_name_shape(path)
+        # Same budget: a phase nested inside itself is either recursion or asyncio tasks
+        # sharing a thread, and only the second is a wrong number.
+        if len(path) > 1 and path[-1] in path[:-1]:
+            self._profiler._note_possible_task_concurrency(path)
         stats = PhaseStats()
         state.tree[path] = stats
         return stats
@@ -1425,6 +1477,8 @@ class _PhaseScope:
         flags = FLAG_SAMPLED if scale != 1 else 0
         if self._async_work:
             flags |= FLAG_ASYNC_UNSYNCED
+        if self._sync is not None and self._device_was_drained():
+            flags |= FLAG_DEVICE_SYNC
         buffer.record(
             phase_id=phase_id,
             thread_id=self._trace_tid,
@@ -1433,6 +1487,18 @@ class _PhaseScope:
             cpu_ns=self._cpu_span if self._profiler.measure_cpu else UNMEASURED,
             flags=flags,
         )
+
+    def _device_was_drained(self) -> bool:
+        """Whether this phase's ``sync=True`` actually waited on a device.
+
+        Asked here rather than at the drain itself because ``_record_span`` runs only when
+        tracing is on, which is not the default — the untraced hot path must not grow a
+        second question. A live CUDA context at exit is the answer: the exit drain runs before
+        this, so a context that exists now is one the drain waited on, and a process that has
+        none never submitted device work for it to wait on.
+        """
+        live = self._profiler._cuda_live
+        return live is not None and live()
 
     def _record_io(self, stats: PhaseStats, scale: int = 1) -> None:
         """Attribute the bytes this phase moved, measured at its own boundaries.
@@ -1690,11 +1756,41 @@ def _stride_of(sample: float) -> int:
     return max(1, round(1.0 / sample))
 
 
+def _in_running_event_loop() -> bool:
+    """Whether this thread is inside a running asyncio event loop.
+
+    Reads ``sys.modules`` rather than importing asyncio, so a program that never uses it pays
+    nothing and does not gain the import. Only ever called once per distinct phase path.
+    """
+    asyncio = sys.modules.get("asyncio")
+    if asyncio is None:
+        return False
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
 def _resolve_enabled(enabled: bool | None) -> bool:
     """Resolve the master switch, reading the environment only when not given explicitly."""
     if enabled is not None:
         return enabled
     return _truthy(os.environ.get(ENV_ENABLE, ""))
+
+
+def _resolve_cuda_sync(cuda_sync: bool | None) -> Callable[[], None] | None:
+    """Resolve what ``phase(sync=True)`` should call, from the constructor's three-way switch.
+
+    ``None`` — the default — drains only when this process has a live CUDA context, which is
+    the semantically correct rule: a process that has not initialised CUDA has submitted no
+    device work to wait for. ``False`` is the caller saying "this role is CPU-only" outright.
+    ``True`` restores the unconditional drain for a caller who wants it despite the context it
+    creates.
+    """
+    if cuda_sync is False:
+        return None
+    return cuda_synchronize(only_when_initialised=cuda_sync is None)
 
 
 def _resolve_trace(trace: bool | str | None) -> str:

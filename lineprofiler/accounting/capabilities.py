@@ -102,18 +102,53 @@ def cuda_is_available() -> bool:
     return bool(torch and torch.cuda.is_available())
 
 
-def cuda_synchronize() -> Callable[[], None] | None:
-    """Return ``torch.cuda.synchronize``, or ``None`` when there is no CUDA device.
+def cuda_context_probe() -> Callable[[], bool] | None:
+    """Return a predicate saying whether *this process* has a live CUDA context.
+
+    ``None`` when torch is absent or no device is visible, which is the same "capability
+    absent" convention the rest of this module uses. The predicate itself never initialises
+    anything: it reads a flag torch already holds.
+    """
+    torch = torch_module()
+    if torch is None or not torch.cuda.is_available():
+        return None
+    is_initialized: Callable[[], bool] | None = getattr(torch.cuda, "is_initialized", None)
+    return is_initialized
+
+
+def cuda_synchronize(only_when_initialised: bool = True) -> Callable[[], None] | None:
+    """Return a CUDA drain callable, or ``None`` when there is no CUDA device.
 
     Handed to ``phase(name, sync=True)``. Returning ``None`` rather than a no-op lambda is
     what lets the phase hot path skip the call with a single ``is not None`` test on a CPU
     box, instead of paying for a Python-level call that does nothing.
+
+    ``only_when_initialised`` — the default — is what keeps profiling from creating the
+    resource it measures. ``torch.cuda.synchronize()`` is what opens a process's CUDA primary
+    context, at a measured ~414 MiB of VRAM on an A100; neither ``import torch`` nor
+    ``torch.cuda.is_available()`` costs anything. A worker that has not initialised CUDA by
+    the time it opens a ``sync=True`` phase has submitted no device work, so the drain is a
+    no-op *by definition* and skipping it is both free and correct. Without the gate, a
+    CPU-only actor in a GPU job pays for a context it never uses, and the bill scales with the
+    worker count — 32 actors hold ~13 GB of a 40 GB card doing no GPU work.
+
+    The check is a flag read, not a driver call, and it is not cached: a process that
+    initialises CUDA later, or a forked child that inherited the callable without inheriting
+    the parent's context, must both get the right answer.
     """
     torch = torch_module()
     if torch is None or not torch.cuda.is_available():
         return None
     synchronize: Callable[[], None] = torch.cuda.synchronize
-    return synchronize
+    is_initialized = cuda_context_probe()
+    if not only_when_initialised or is_initialized is None:
+        return synchronize
+
+    def synchronize_when_cuda_is_live() -> None:
+        if is_initialized():
+            synchronize()
+
+    return synchronize_when_cuda_is_live
 
 
 def _initialise_nvml() -> ModuleType | None:

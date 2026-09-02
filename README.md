@@ -52,7 +52,7 @@ Want a picture instead? `profiler.to_html("profile.html")` writes an annotated, 
 | Tool | What it does | Use it when |
 |---|---|---|
 | **`lineprofiler.LineProfiler`** | Line-by-line tracing for a bounded region, scoped to your project folder. | You have narrowed the problem down and want per-line timings inside it. |
-| **`lineprofiler.accounting`** | Semantic accounting for regions *you* name. Aggregates only — counts, sums, a fixed-bucket histogram — at ~2 µs per phase, across every process in a pipeline. | You are profiling a long, multi-process training run and need to know which phase, which role and which node the time went to. |
+| **`lineprofiler.accounting`** | Semantic accounting for regions *you* name. Aggregates only — counts, sums, a fixed-bucket histogram — at ~3.9 µs per phase with the default `measure_cpu=True`, or ~2.3 µs without it, across every process in a pipeline. | You are profiling a long, multi-process training run and need to know which phase, which role and which node the time went to. |
 
 They share nothing but the distribution: `accounting` never imports `LineProfiler`. If you arrived here for a training run, you want the accounting layer — it is the one built to stay enabled for twelve hours.
 
@@ -444,8 +444,8 @@ pip install torch                       # separately — see below
 | Package | Install | What it adds | Reach for it when |
 |---|---|---|---|
 | **[psutil](https://github.com/giampaolo/psutil)** | `with-line-profiler[resources]` | The `RESOURCES` and `I/O` blocks: RSS, CPU-cores-used, and per-process read/write bytes split into disk vs page cache. | Almost always. This is the one to install first — without it the report cannot tell you what the run *cost*, only where the time went. |
-| **[nvidia-ml-py](https://pypi.org/project/nvidia-ml-py/)** | `with-line-profiler[gpu]` | The `GPU` block: per-device utilisation, split into your run's share (`this run`) and the whole device (`busy`), sampled at 1 Hz. | You are on a GPU box and need to know whether the GPU is the constraint — especially on a *shared* node, where "busy" includes other tenants. |
-| **[torch](https://pytorch.org/)** | `pip install torch` (never a dependency of this package) | VRAM allocated/reserved; `phase(sync=True)`; `annotate=True`; the `backend="torch"` window. | You are training. The `sync=True` and `annotate=True` features are the ones people miss — see the two sections below. |
+| **[nvidia-ml-py](https://pypi.org/project/nvidia-ml-py/)** | `with-line-profiler[gpu]` | The `GPU` block: per-device utilisation, split into your run's share (`this run`) and the whole device (`busy`), sampled at 1 Hz. Also `VRAM peak held` — what the device reports for your pids, which unlike the allocator figure includes each process's CUDA context. | You are on a GPU box and need to know whether the GPU is the constraint — especially on a *shared* node, where "busy" includes other tenants, or when deciding whether another worker fits on the card. |
+| **[torch](https://pytorch.org/)** | `pip install torch` (never a dependency of this package) | VRAM allocated/reserved; `phase(sync=True)`; `annotate=True`; the `backend="torch"` window. `sync=True` never drains in a process that has not initialised CUDA, so a CPU-only worker in a GPU job does not open a ~414 MiB context just by being profiled; `Profiler(cuda_sync=False)` switches it off outright. | You are training. The `sync=True` and `annotate=True` features are the ones people miss — see the two sections below. |
 | **[VizTracer](https://github.com/gaogaotiantian/viztracer)** | `with-line-profiler[viztracer]` | The `backend="viztracer"` window: a full per-call timeline for a bounded slice of the run. | A phase is slow and you do not know which *function* inside it is responsible. |
 
 ### The two heavy backends
