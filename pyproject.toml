@@ -1,6 +1,6 @@
 [project]
 name = "with_line_profiler"
-version = "0.8.2"
+version = "0.8.3"
 description = "Line-by-line profiling, plus a low-overhead accounting layer for long multi-process RL training runs"
 readme = "README.md"
 license = "MIT"

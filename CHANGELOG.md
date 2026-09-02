@@ -6,6 +6,8 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-09-02
+
 ### Fixed — the `CPU peak` figure was quantisation noise, not a measurement
 
 `RESOURCES` reported `CPU peak 8.7 cores` on a run whose true concurrent peak was about 1.5, and the identical benchmark reported `1.4`, `8.7` and `19.5` cores across three runs on the same machine with the same workload. It is the figure a reader sizes a job with, it was wrong by 5.8x, and it was non-deterministic between identical runs.
@@ -134,6 +136,8 @@ Two additions to `docs/accounting-recipes.md`, both measured rather than estimat
 
 - **What a phase bills *into* its own reported wall time**, as distinct from the ~2.6 µs it takes from the surrounding program that the overhead table already covers. `__enter__` reads its clock last and `__exit__` reads its first, so what remains inside is the interpreter's dispatch between them: ~210 ns at `measure_cpu=False`, ~240 ns with it on, ~250 ns tracing. That is within ~25 ns of a bare context manager that measures nothing, so it is close to irreducible in Python — but it is a per-entry inflation that does not shrink with the phase, which matters when summing very many short phases or differencing two nested ones. The report does not subtract it, because the correction would be an estimate standing in for a measurement. `benchmarks/bench_accounting.py` now prints it, so the documented figures cannot rot.
 - **The levers, in the order worth trying**, since every row of the overhead table is dominated by Python's own dispatch and no setting makes that cheaper. `measure_cpu=False` is the largest at ~1.6 µs of a ~4.2 µs phase (38%), against the cost of losing `wait%`; then sampling (~3.5x, not the sampling rate); then moving the phase out of the loop; then leaving `trace` off. `sync=True` and `async_work=True` are named as *not* levers — the first costs GPU time rather than profiler time, the second is one bool test.
+
+## [0.8.2] - 2026-08-20
 
 ### Fixed — `nvml_module()` no longer reports a GPU that isn't there
 
