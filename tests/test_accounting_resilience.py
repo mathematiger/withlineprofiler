@@ -229,8 +229,13 @@ def test_a_counter_added_during_a_merge_does_not_raise() -> None:
     writer = threading.Thread(target=keep_adding, daemon=True)
     writer.start()
     started.wait(timeout=2.0)
-    while writer.is_alive():
+    # A do-while, not a while: on a fast machine the writer finishes all 3000 inserts before
+    # the first is_alive() check, and a plain `while` would then merge zero times and assert
+    # on an empty target instead of on the race it is here to exercise.
+    while True:
         target.merge(source)  # must not raise "dictionary changed size during iteration"
+        if not writer.is_alive():
+            break
     writer.join(timeout=5.0)
 
     assert target.counters["counter_0"] > 0

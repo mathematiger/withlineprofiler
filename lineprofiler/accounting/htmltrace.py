@@ -278,9 +278,12 @@ def _sequence_block(aligned: AlignedTrace) -> str:
             else ""
         )
         role = aligned.roles.get(lane, "")
+        # Built as its own statement rather than nested inside the f-string below: a
+        # backslash in an f-string expression is a SyntaxError before 3.12, and the package
+        # supports 3.10.
+        role_span = f' <span class="note">{escape(role)}</span>' if role else ""
         sections.append(
-            f"<h3>{escape(lane)}"
-            f"{f' <span class=\"note\">{escape(role)}</span>' if role else ''}</h3>\n"
+            f"<h3>{escape(lane)}{role_span}</h3>\n"
             '<div class="scroll"><table><thead><tr><th>#</th><th>call</th><th>at</th>'
             "<th>duration</th><th>wait</th></tr></thead>"
             f"<tbody>{rows}</tbody></table></div>{more}",

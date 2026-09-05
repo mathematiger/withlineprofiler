@@ -25,9 +25,11 @@ jobs:
       - name: Install poetry
         run: pipx install poetry==${{ env.POETRY_VERSION }}
       - uses: actions/setup-python@v5
+        id: setup
         with:
           python-version: "3.12"
           cache: poetry
+      - run: poetry env use "${{ steps.setup.outputs.python-path }}"
       - run: poetry install --with dev,test --extras resources
       - run: poetry run ruff check lineprofiler tests with_line_profiler.py
       - run: poetry run mypy lineprofiler tests with_line_profiler.py
@@ -44,12 +46,21 @@ jobs:
       - name: Install poetry
         run: pipx install poetry==${{ env.POETRY_VERSION }}
       - uses: actions/setup-python@v5
+        id: setup
         with:
           python-version: ${{ matrix.python }}
           cache: poetry
+      # poetry is installed by pipx against the runner's own interpreter, so left to itself it
+      # can build the venv for that Python rather than the matrix one -- a leg then reports
+      # green while testing the wrong version. A 3.12-only f-string shipped through "py3.10"
+      # and "py3.11" this way. Pin the venv, then refuse to run if it is still not the leg's
+      # Python, so the next drift fails loudly instead of silently passing.
+      - run: poetry env use "${{ steps.setup.outputs.python-path }}"
       # psutil is installed on purpose: without it the I/O and memory paths degrade to
       # their absent-capability branches and the suite silently stops testing them.
       - run: poetry install --with dev,test --extras resources
+      - name: The venv really is ${{ matrix.python }}
+        run: poetry run python -VV | grep -q "^Python ${{ matrix.python }}\."
       - run: poetry run pytest tests/ -q
 
   coverage:
@@ -60,9 +71,11 @@ jobs:
       - name: Install poetry
         run: pipx install poetry==${{ env.POETRY_VERSION }}
       - uses: actions/setup-python@v5
+        id: setup
         with:
           python-version: "3.12"
           cache: poetry
+      - run: poetry env use "${{ steps.setup.outputs.python-path }}"
       - run: poetry install --with dev,test --extras resources
       - run: poetry run pytest tests/ --cov=lineprofiler --cov-report=term-missing --cov-report=xml
       - uses: actions/upload-artifact@v4
@@ -78,9 +91,11 @@ jobs:
       - name: Install poetry
         run: pipx install poetry==${{ env.POETRY_VERSION }}
       - uses: actions/setup-python@v5
+        id: setup
         with:
           python-version: "3.12"
           cache: poetry
+      - run: poetry env use "${{ steps.setup.outputs.python-path }}"
       - run: poetry install --with dev,test --extras resources
       # The whole value proposition is a ns/call number; without this a 10x regression in
       # _PhaseScope would merge unnoticed. Bounds are deliberately loose — a shared runner is

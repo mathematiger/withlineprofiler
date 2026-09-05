@@ -137,7 +137,11 @@ def test_merge_trees_does_not_alias_the_source() -> None:
 # ── phases ──────────────────────────────────────────────────────────────────
 
 
-def test_known_sleep_durations_are_reproduced_within_five_percent(tmp_path: Path) -> None:
+def test_known_sleep_durations_are_reproduced(tmp_path: Path) -> None:
+    """`time.sleep(t)` guarantees *at least* t and nothing at all about the overshoot, so the
+    durations are bounded below at the sleep and above only loosely — a shared CI runner
+    routinely oversleeps by tens of milliseconds. The accounting relations between the
+    numbers carry no scheduler noise, so those are asserted exactly."""
     profiler = Profiler(
         run_dir=tmp_path, enabled=True, snapshot_interval_s=None, sample_interval_s=None,
     )
@@ -150,10 +154,13 @@ def test_known_sleep_durations_are_reproduced_within_five_percent(tmp_path: Path
     outer = tree[("outer",)]
     inner = tree[("outer", "inner")]
 
-    assert inner.wall_ns == pytest.approx(0.10e9, rel=0.05)
-    assert outer.wall_ns == pytest.approx(0.15e9, rel=0.05)
-    assert outer.child_wall_ns == pytest.approx(0.10e9, rel=0.05)
-    assert outer.self_ns == pytest.approx(0.05e9, rel=0.05)
+    assert 0.10e9 <= inner.wall_ns < 0.30e9
+    assert 0.15e9 <= outer.wall_ns < 0.45e9
+    # Exact: child_wall_ns is inner's wall summed, and self_ns is the remainder. A regression
+    # in either would survive any tolerance loose enough to absorb sleep overshoot.
+    assert outer.child_wall_ns == inner.wall_ns
+    assert outer.self_ns == outer.wall_ns - outer.child_wall_ns
+    assert outer.self_ns >= 0.05e9
 
 
 def test_sleeping_phase_is_almost_entirely_wait(tmp_path: Path) -> None:
