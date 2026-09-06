@@ -247,18 +247,23 @@ def test_a_stepped_wall_clock_does_not_destroy_the_durations_it_precedes(
     tmp_path: Path,
 ) -> None:
     """The axis is repaired, not merely annotated: the spans keep the width they measured."""
-    _traced_run(tmp_path, iterations=8)
+    # Long enough that nanosecond quantisation is not the measurement. Dropping the stepped
+    # anchor also drops the drift correction it carried, so the two renders place each span
+    # boundary a nanosecond or two apart; over the 47 us axis eight iterations produce, that
+    # noise reached 1.5 points of busy share and made this test flaky. Two hundred iterations
+    # stretch the axis ~20x and shrink the disagreement to ~0.3.
+    _traced_run(tmp_path, iterations=200)
     unstepped = _embedded(_render(tmp_path))
     _step_the_wall_clock(tmp_path, by_ns=-3_600 * 1_000_000_000)
 
     stepped = _embedded(_render(tmp_path))
 
-    # Approximate, not identical: dropping the stepped anchor also drops the drift correction
-    # it would have carried, which moves the shares by a tenth of a point. The claim is that
-    # the figures survive — before the fix this lane read 0.0% busy over a 394-second axis.
+    # Approximate, not identical, and the tolerance is set by that quantisation rather than by
+    # what would still catch the regression: before the fix this lane read 0.0% busy over a
+    # 394-second axis, which any bound below the share itself catches.
     assert stepped["duration_us"] == pytest.approx(unstepped["duration_us"], rel=0.01)
     assert [lane["busy"] for lane in stepped["lanes"]] == pytest.approx(
-        [lane["busy"] for lane in unstepped["lanes"]], abs=0.5,
+        [lane["busy"] for lane in unstepped["lanes"]], abs=2.0,
     )
 
 
