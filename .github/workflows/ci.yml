@@ -63,16 +63,24 @@ jobs:
       # match, which also self-heals the caches already poisoned.
       - name: Use the matrix Python, rebuilding a cached venv that is not it
         run: |
+          marker="import sys; print('%d.%d' % sys.version_info[:2])"
           poetry env use "${{ steps.setup.outputs.python-path }}"
-          if ! poetry run python -VV | grep -q "^Python ${{ matrix.python }}\."; then
+          if [ "$(poetry run python -c "$marker" || true)" != "${{ matrix.python }}" ]; then
             poetry env remove --all
             poetry env use "${{ steps.setup.outputs.python-path }}"
           fi
       # psutil is installed on purpose: without it the I/O and memory paths degrade to
       # their absent-capability branches and the suite silently stops testing them.
       - run: poetry install --with dev,test --extras resources
+      # Prints what it found before comparing. A bare `grep -q` here failed three legs while
+      # showing nothing of the interpreter it objected to, which is the same defect this
+      # package's own reports are written to avoid: state the measurement, not just the verdict.
       - name: The venv really is ${{ matrix.python }}
-        run: poetry run python -VV | grep -q "^Python ${{ matrix.python }}\."
+        run: |
+          poetry env info
+          found="$(poetry run python -c "import sys; print('%d.%d' % sys.version_info[:2])")"
+          echo "poetry run python reports ${found}, this leg wants ${{ matrix.python }}"
+          test "$found" = "${{ matrix.python }}"
       - run: poetry run pytest tests/ -q
 
   coverage:
