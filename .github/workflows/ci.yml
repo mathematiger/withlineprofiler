@@ -55,12 +55,22 @@ jobs:
       # green while testing the wrong version. A 3.12-only f-string shipped through "py3.10"
       # and "py3.11" this way. Pin the venv, then refuse to run if it is still not the leg's
       # Python, so the next drift fails loudly instead of silently passing.
-      # `env use` alone is not enough: the restored cache still holds the venv built during
-      # the drift above, under the name this leg's Python would get, and poetry adopts an
-      # existing directory by name without checking the interpreter inside it. The cache key
-      # is the Python version plus the lock hash, so fixing the workflow does not change it
-      # and the wrong venv is restored for as long as it lives. Rebuild when it does not
-      # match, which also self-heals the caches already poisoned.
+      #
+      # `env use` does not do it on its own. Poetry builds the venv with the interpreter *it*
+      # runs on whatever path it is handed: the py3.11 leg produced a venv correctly named
+      # py3.11 whose base executable was /usr/bin/python3.12 -- the Python pipx first
+      # installed poetry with. Put poetry on the matrix interpreter, now that setup-python
+      # has provided it, so the venv it builds is this leg's. The first install above has to
+      # stay: setup-python's `cache: poetry` runs `poetry config` before this point.
+      - run: >-
+          pipx install poetry==${{ env.POETRY_VERSION }}
+          --python "${{ steps.setup.outputs.python-path }}" --force
+      # A venv restored from the cache is still one built during the drift, under the name
+      # this leg's Python would be given, and poetry adopts an existing directory by name
+      # without checking the interpreter inside it. The cache key is the Python version plus
+      # the lock hash, so fixing the workflow does not change it and the wrong venv is
+      # restored for as long as it lives. Rebuild when it does not match, which self-heals
+      # the caches already poisoned and is a no-op once they are clean.
       - name: Use the matrix Python, rebuilding a cached venv that is not it
         run: |
           marker="import sys; print('%d.%d' % sys.version_info[:2])"
