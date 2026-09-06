@@ -3,12 +3,14 @@
     lineprofiler report <run_dir> [--no-samples] [--format text|json|html] [-o PATH]
     lineprofiler compare <run_a> <run_b> [--format text|json] [-o PATH]
     lineprofiler trace <run_dir> [--max-spans N] [--quiet] [--format html|json] [-o PATH]
+    lineprofiler run <script.py> [args...] [--top N] [--functions] [--html PATH]
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import runpy
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -40,7 +42,41 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "trace":
         _emit(_render_trace(args), args.output)
         return _gate_exit_code(args)
+    elif args.command == "run":
+        return _run_script(args)
     return 0
+
+
+def _run_script(args: argparse.Namespace) -> int:
+    """Run a script under the line profiler with no edit to it — ``kernprof`` without the
+    decorators. Everything under the script's project folder is profiled.
+
+    The summary is printed even when the script fails, because a traceback is usually the
+    moment the profile is wanted. The script's own exit status is preserved.
+    """
+    from lineprofiler.config import find_project_root
+    from lineprofiler.profiler import LineProfiler
+
+    script = Path(args.script).resolve()
+    if not script.is_file():
+        print(f"lineprofiler run: {script} is not a file", file=sys.stderr)  # noqa: T201
+        return 2
+    sys.argv = [str(script), *args.args]
+    sys.path.insert(0, str(script.parent))
+    profiler = LineProfiler(project_folder=find_project_root(script))
+    status = 0
+    try:
+        with profiler:
+            runpy.run_path(str(script), run_name="__main__")
+    except SystemExit as exc:
+        status = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+    finally:
+        if args.functions:
+            profiler.print_stats()
+        profiler.print_global_top_stats(top_n=args.top)
+        if args.html:
+            profiler.to_html(args.html)
+    return status
 
 
 def _emit(text: str, output: str | None) -> None:
@@ -112,6 +148,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     # html first: a timeline is a picture, and the text form of one is a wall of numbers.
     _add_output_arguments(trace, formats=("html", "json"), default="html")
+
+    run = subcommands.add_parser(
+        "run",
+        help="run a script under the line profiler, without editing it",
+    )
+    run.add_argument("script", help="the script to run; everything under its project is profiled")
+    run.add_argument("args", nargs=argparse.REMAINDER, help="arguments passed to the script")
+    run.add_argument("--top", type=int, default=25, help="lines in the summary (default 25)")
+    run.add_argument(
+        "--functions",
+        action="store_true",
+        help="also print every profiled function's full table, in source order",
+    )
+    run.add_argument("--html", metavar="PATH", help="also write the annotated source view here")
     return parser
 
 

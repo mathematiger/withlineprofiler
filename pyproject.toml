@@ -1,7 +1,7 @@
 [project]
 name = "with_line_profiler"
-version = "0.8.5"
-description = "Line-by-line profiling, plus a low-overhead accounting layer for long multi-process RL training runs. Installed as with-line-profiler, imported as lineprofiler."
+version = "0.10.0"
+description = "Line-by-line profiling of a `with` block, timed by line_profiler, plus a low-overhead accounting layer for long multi-process RL training runs. Installed as with-line-profiler, imported as lineprofiler."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -35,10 +35,12 @@ classifiers = [
     "Topic :: System :: Monitoring",
     "Typing :: Typed",
 ]
-# tomllib entered the stdlib in 3.11; on 3.10 the config reader needs its backport. This is
-# the only required dependency and it disappears on every version above 3.10, so the
-# zero-dependency property holds everywhere it can.
+# line_profiler does the per-line timing in C; this package decides what it watches. It ships
+# wheels for every supported interpreter, and the pure-Python engine remains as the fallback
+# for the interpreter it does not import on. tomllib entered the stdlib in 3.11; on 3.10 the
+# config reader needs its backport.
 dependencies = [
+    "line_profiler>=5.0",
     "tomli>=2.0; python_version < '3.11'",
 ]
 

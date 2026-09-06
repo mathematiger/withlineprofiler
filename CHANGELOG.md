@@ -6,6 +6,111 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-06
+
+### Added — `with profiler.region("select"):`, per-line statistics by named phase
+
+A line profile says line 52 is slow. It cannot say that line 52 is slow *during selection* and fine during backpropagation, because the same line is one row however many phases run through it. Naming the phases makes the split a measurement:
+
+```python
+with profiler:
+    for _ in range(iterations):
+        with profiler.region("select"):
+            node = select(root)
+        with profiler.region("rollout"):
+            reward = rollout(node)
+
+profiler.print_regions()
+```
+
+`print_regions()` prints each region's slowest lines with its share of the profiled total, its entry count and its cost per entry. `region_stats()` returns the same data in `get_stats()`'s shape, and `region_entries()` the counts. Both engines support it and agree on the hit counts.
+
+Regions nest and the reading is **inclusive**: a line inside `rollout` is billed to `rollout` and to every region open around it, the same way a phase's wall time in the accounting layer includes its children. Shares are taken against the profiled total, so they do not sum to 100% — regions may nest and need not cover the whole run — and the report says so rather than normalising to a tidier wrong number.
+
+A region is a **window, not a call stack**: every line executed while it is open is billed to it, including lines in the frame that opened it and lines on other threads. Opening regions concurrently on several threads does not mean anything useful, and is documented as such rather than silently producing a number. Entering a region while the profiler is not active records nothing and costs one boolean test, so the calls are safe to leave in code that is usually not profiled.
+
+### How it is implemented, and what was rejected
+
+The obvious design is to snapshot the statistics at each region boundary and difference them. It was measured first and rejected: a full `get_stats()` walk costs **~1.5 ms** on a 600-function registry, because `line_profiler` indexes one hash per bytecode offset and the walk visits all of them. At two walks per entry, four regions around a 200-iteration loop would spend about 2.4 seconds inside the profiler doing nothing but bookkeeping.
+
+What shipped instead gives each region its own `line_profiler.LineProfiler`, enabled only while that region is open. The region's share is then *measured* rather than differenced, at **~7.6 µs** per boundary against the 3 ms the snapshot approach would have cost — about 400x cheaper. Every function registered with the session is registered with each region's profiler as well, including functions discovered later, or a region would report a confident zero for code that ran inside it but was first seen elsewhere.
+
+The pure-Python engine needs none of that: it does its own billing, so it appends the open region names to the record it is already writing. That gives it the opposite cost profile, and the benchmark reports both:
+
+| Engine | Per line event, region open | Per boundary |
+|---|---|---|
+| `line_profiler` | ~400 ns (from ~240) | ~7.6 µs |
+| `builtin`, `sys.monitoring` | ~1,435 ns (from ~900) | ~430 ns |
+| `builtin`, `sys.settrace` | ~1,420 ns | ~1,760 ns |
+
+Many small regions favour the builtin engine; a few regions around substantial work favour the C engine, which is the usual case and the default. The placement rule is the accounting layer's: put a region where the entry count is bounded by your loop, not by your data.
+
+`_RegionScope` is cached per name and does its own bookkeeping rather than calling back into the profiler, for the same reason the accounting layer inlines `_PhaseScope.__exit__`: every Python line executed at a boundary is a line the profiler is itself timing. Inlining took the C engine's boundary from ~12 µs to ~7.6 µs.
+
+The C engine's region total *excludes* the cost of opening and closing the region, which the session's total absorbs into the surrounding line — so a run's regions can sum to slightly less than the session. That is the cleaner number of the two.
+
+### Known limit — region shares are approximate, and the report says so
+
+Under the C engine a region is timed by its own `line_profiler` instance, and `line_profiler` re-reads the clock inside its per-instance loop: the second instance to be visited stamps its "last line" a few tens of nanoseconds after the first. Which one that is depends on the iteration order of a `set`, so a region's total sits either side of the session's, by roughly **46 ns per line event**. On real work that is invisible; on a three-millisecond synthetic loop it is about a fifth, and it can print a single region at slightly over 100% of the profiled total.
+
+Rather than clamp the number or normalise it away, `print_regions()` states the three reasons its shares do not sum to 100% — nesting, gaps, and independent timing — and points at the µs-per-entry column, which is stable across runs. Hit counts are exact under both engines, and the two engines agree on them.
+
+### Added — the benchmark covers regions
+
+`benchmarks/bench_lineprofiler.py` now reports both region columns. The per-boundary figure profiles an empty directory on purpose, so neither the timing loop nor the region machinery is traced and what is left is the switch itself; the cost of the `with` line you write is one line event, already priced in the other column. An earlier version of this measurement timed its own loop and reported a *negative* cost for the builtin engine, which is how the artefact was caught.
+
+## [0.9.0] - 2026-09-06
+
+### Changed (breaking) — the line profiler is a front end over `line_profiler`
+
+The per-line timing is now done by [`line_profiler`](https://github.com/pyutils/line_profiler)'s C callback, which becomes this package's one runtime dependency. `with profiler:` is unchanged and still names no function: a `sys.monitoring` discovery hook registers each admitted code object the first time it runs, so closures, methods, `runpy` scripts and modules imported inside the block are all found without a decorator, a `kernprof` run or a build step.
+
+Measured over 600,000 line events on one machine (`benchmarks/bench_lineprofiler.py`, new): 239 ns per event through this `with` block against 240 ns calling `line_profiler` directly — the wrapper is free — and 895 ns for the pure-Python engine it replaces. That engine remains as `engine="builtin"` and is selected automatically where `line_profiler` cannot be imported, so nothing loses the ability to profile; `backend=` also selects it. Both engines report the same shape of answer.
+
+Below Python 3.12 there is no discovery hook, so the C engine registers the functions of every in-project module already imported and misses anything imported later. The builtin engine has no such limit.
+
+### Fixed — a line that called a function was billed almost nothing
+
+`b = inner()` reported 2.2 µs for a call that took 9.5 ms. The engine reset its clock when the callee started and never gave the caller its time back on return, so the call line was billed only the interpreter's dispatch. It was also inconsistent: a call into the standard library *was* billed inclusively, because those frames are not traced, so the same syntax meant two different things depending on where the callee lived.
+
+Both engines now bill a call line for the whole call, which is what `line_profiler`, `cProfile` and every other line profiler mean by that column. The rewrite keeps a stack of open frames per thread and closes each one on return, so a nested call's time lands on the line that made it rather than disappearing.
+
+**This changes reported numbers.** A line calling in-project code will now show a larger figure, and the percentages around it shift accordingly. The old numbers were wrong, not merely differently scoped.
+
+### Fixed — threads lost hits, or were not recorded at all
+
+Four threads running the same function recorded 370,794 of 400,000 hits under the `monitoring` backend: one shared "current line" was mutated by every thread. Under `settrace` the same test recorded *nothing* from the worker threads, because `sys.settrace` only affects the thread that installs it and `threading.settrace()` was never called.
+
+The open-frame stack is now thread-local, `threading.settrace()` is installed alongside `sys.settrace()`, and the per-function record is created with `setdefault` so two threads reaching a function at the same moment cannot each build one and lose the loser's hits. Four threads now record exactly 400,000, and there is a test.
+
+### Fixed — a generator's `yield` line absorbed its consumer's time
+
+`PY_YIELD` was not subscribed, so a suspended generator looked like a running one: everything the consumer did between two `next()` calls was billed to the `yield`. A generator yielding three times into a loop that slept 10 ms per item reported 30 ms on the `yield` line. The event is now handled like a return, and `PY_RESUME`/`PY_THROW` reopen the frame.
+
+### Added — `lineprofiler run script.py`
+
+    lineprofiler run train.py --epochs 3 --top 20 --html profile.html
+
+`kernprof` without the decorators: the script runs normally under `runpy`, everything under its project folder is profiled, its own exit status is preserved, and the summary prints even when it raises — which is usually the moment the profile is wanted.
+
+### Added — `.lprof` export, so the run leaves this package
+
+`profiler.dump_stats("run.lprof")` writes `line_profiler`'s own pickle format from either engine. `python -m line_profiler run.lprof` displays it, `LineStats.from_files()` merges several, and anything that reads `kernprof` output reads this.
+
+### Added — `start_profiling(enabled=True)`
+
+The two-line pair only ever profiled when `LINEPROFILER_ENABLED` was truthy, which is right for a call committed to a repository and wrong for a session where the call site *is* the switch — and it contradicted the `with` block a few lines above it in the README, which profiles immediately. `enabled=True` profiles there and then, `enabled=False` never does, and the default still asks the environment.
+
+### Changed — `print_stats` defaults to source order and takes a stream
+
+Every other line profiler prints a function's lines in the order they appear, because the table is read against the code. This one sorted by time, which scrambled the function. `sort_by="time"` still does that on request, and the cross-function ranking is unchanged — ranking is what *that* table is for. Both printers now accept `stream=`, so a report can go into a log or a test instead of stdout.
+
+Also fixed: the `filename not in folde` typo in `print_stats`.
+
+### Known limits
+
+Two functions with identical bytecode whose line numbers overlap cannot be told apart by the C engine's index, which keys on the hash of the bytecode and the line number. The second one found is left unprofiled rather than reported as a blend of the two; `engine="builtin"` keys on the code object and has no such limit. The engine never rewrites the caller's bytecode to work around this, because doing so loses the call that is in flight at that moment — which, for a function discovered at its first call, is every call it would otherwise record.
+
 ## [0.8.5] - 2026-09-06
 
 ### Documented — a version history in the README

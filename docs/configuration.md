@@ -23,6 +23,11 @@ start_profiling()          # line 1
 stop_profiling()           # line 2
 ```
 
+`start_profiling(enabled=True)` profiles there and then, without the environment variable —
+the form to reach for in a session where the call site is the switch rather than the
+launcher. `enabled=False` never profiles. Left unset, the environment decides, which is what
+makes the pair safe to commit.
+
 Both are **opt-in and off by default**: with nothing configured, `start_profiling()` /
 `accounting.start()` cost a no-op check and nothing else, so the two lines are safe to leave
 committed permanently rather than added and removed per debugging session. Turn profiling on
@@ -53,6 +58,15 @@ never runs on the hot per-line path.
 `with profiler:` (below) remains the better choice inside a Jupyter notebook or any region
 you're actively iterating on interactively — the two APIs are interchangeable and neither is
 deprecated by the other.
+
+### Choosing an engine
+
+`LineProfiler(engine="line_profiler")` — the default wherever `line_profiler` is importable —
+hands the per-line timing to its C callback, at ~240 ns per line event.
+`LineProfiler(engine="builtin")` uses this package's pure-Python callback instead, at ~895 ns,
+and is what runs when `line_profiler` is absent. Passing `backend="monitoring"` or
+`backend="settrace"` also selects the builtin engine. The two agree on what they report; see
+[the line profiler](line-profiler.md#engines).
 
 ### Optional dependencies
 

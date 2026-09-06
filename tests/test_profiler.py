@@ -7,10 +7,14 @@ Standard-library and pytest internals live elsewhere and are filtered out.
 from __future__ import annotations
 
 import contextlib
+import importlib
+import io
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal, cast
 
 import pytest
 
@@ -21,22 +25,40 @@ from lineprofiler.profiler import _MONITORING, _TOOL_ID, _qualname_of
 
 THIS_DIR = str(Path(__file__).resolve().parent)
 
-# Both event sources where the interpreter has both, so the older one keeps being exercised
-# on a runner that defaults to the newer. Without this the settrace path — the only one
-# 3.10 and 3.11 can use — would be untested everywhere CI actually runs.
-_BACKENDS = ("monitoring", "settrace") if _MONITORING is not None else ("settrace",)
+# Every engine, and for the builtin one every event source the interpreter offers, so the
+# settrace path — the only one 3.10 and 3.11 can use — keeps being exercised on a runner that
+# defaults to the newer.
+_MODES = (
+    ("line_profiler", "builtin:monitoring", "builtin:settrace")
+    if _MONITORING is not None
+    else ("line_profiler", "builtin:settrace")
+)
 
 
-@pytest.fixture(params=_BACKENDS, autouse=True)
-def backend(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
-    """Run every profiler test against each event source this interpreter offers.
+@pytest.fixture(params=_MODES, autouse=True)
+def mode(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Run every profiler test under each engine and backend.
 
-    Patches the default rather than each construction site, so the thirty-odd
+    Patches the defaults rather than each construction site, so the thirty-odd
     ``LineProfiler(project_folder=THIS_DIR)`` calls in this file need no edit.
     """
     chosen: str = request.param
-    monkeypatch.setattr(profiler_module, "_default_backend", lambda: chosen)
+    engine, _, backend = chosen.partition(":")
+    monkeypatch.setattr(profiler_module, "_default_engine", lambda: engine)
+    if backend:
+        monkeypatch.setattr(profiler_module, "_default_backend", lambda: backend)
     return chosen
+
+
+@pytest.fixture
+def backend(mode: str) -> str:
+    """The builtin backend in force — the interpreter's default under the C engine."""
+    return mode.partition(":")[2] or profiler_module._default_backend()
+
+
+def _needs_monitoring_for_discovery(mode: str) -> None:
+    if mode == "line_profiler" and _MONITORING is None:
+        pytest.skip("below 3.12 the line_profiler engine registers loaded modules only")
 
 
 # --------------------------------------------------------------------------- #
@@ -80,6 +102,19 @@ def sleeper() -> int:
 def raiser() -> None:
     prepared = 1  # noqa: F841
     raise ValueError("expected by the unwind test")
+
+
+def counting_up(n: int):  # type: ignore[no-untyped-def]  # noqa: ANN201 - a generator
+    for i in range(n):  # noqa: UP028 - the test asserts on the `yield` line itself
+        yield i  # must not be billed the consumer's work
+
+
+def consume_slowly(n: int) -> int:
+    seen = 0
+    for _ in counting_up(n):
+        time.sleep(0.01)
+        seen += 1
+    return seen
 
 
 def line_source(func_stats: FunctionStats, needle: str) -> LineStats:
@@ -296,8 +331,7 @@ def test_clear_resets_state() -> None:
     assert profiler.get_stats() == {}
     assert profiler._source_cache == {}
     assert profiler._project_cache == {}
-    assert profiler._last_key is None
-    assert profiler._last_line is None
+    assert profiler._frames.entries == []
 
 
 def test_reset_is_clear() -> None:
@@ -405,21 +439,25 @@ def test_nesting_the_same_profiler_is_refused(tmp_path: Path) -> None:
     assert sys.gettrace() is incumbent, "the profiler leaked its tracer"
 
 
-def test_two_different_profilers_nest_or_are_refused(backend: str) -> None:
-    """Distinct instances chain under ``settrace`` and are refused under ``monitoring``.
+def test_two_different_profilers_nest_or_are_refused(mode: str) -> None:
+    """Distinct instances chain under ``settrace`` and are refused under builtin ``monitoring``.
 
     The backends genuinely differ here and neither behaviour is a bug. ``sys.settrace``
-    tracers chain, so the inner profiler restores the outer one on exit. ``sys.monitoring``
-    has one profiler slot, so the inner claim is refused — which is the better outcome of
-    the two: nesting double-counts every line either way, and the refusal says so instead
-    of quietly returning inflated numbers.
+    tracers chain, so the inner profiler restores the outer one on exit. The builtin
+    ``sys.monitoring`` engine has one profiler slot, so the inner claim is refused — which is
+    the better outcome of the two: nesting double-counts every line either way, and the
+    refusal says so instead of quietly returning inflated numbers. ``line_profiler`` keeps
+    per-instance state and nests, and its discovery slot is refused instead.
     """
     incumbent = sys.gettrace()
     outer = LineProfiler(project_folder=THIS_DIR)
     inner = LineProfiler(project_folder=THIS_DIR)
 
-    if backend == "monitoring":
+    if mode == "builtin:monitoring":
         with outer, pytest.raises(RuntimeError, match="profiler slot"):
+            inner.__enter__()
+    elif mode == "line_profiler" and _MONITORING is not None:
+        with outer, pytest.raises(RuntimeError, match="slot 4"):
             inner.__enter__()
     else:
         with outer, inner:
@@ -540,6 +578,251 @@ def test_an_exceptional_exit_does_not_bleed_into_the_next_line(backend: str) -> 
 
     fs = stats_for(profiler, "raiser")
     assert line_source(fs, "raise ValueError").hits == 5
+
+
+# --------------------------------------------------------------------------- #
+# The timing model: inclusive call lines, per-thread frames, generators
+# --------------------------------------------------------------------------- #
+def test_a_call_line_is_billed_the_whole_call() -> None:
+    """The line ``b = inner()`` costs what ``inner`` costs — the convention every line profiler
+    uses, and the one the old engine broke by resetting the caller's clock on the call.
+    """
+    profiler = LineProfiler(project_folder=THIS_DIR)
+    with profiler:
+        outer()
+
+    call_line = line_source(stats_for(profiler, "outer"), "b = inner()")
+    assert call_line.total_time >= stats_for(profiler, "inner").total_time * 0.9
+
+
+def test_threads_started_inside_the_block_are_profiled_exactly() -> None:
+    """Four threads, every hit counted once. One shared "last line" used to race here."""
+    profiler = LineProfiler(project_folder=THIS_DIR)
+    with profiler:
+        threads = [threading.Thread(target=loop_sum, args=(500,)) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    assert line_source(stats_for(profiler, "loop_sum"), "total += i").hits == 2000
+
+
+def test_a_yield_line_is_not_billed_the_consumers_time() -> None:
+    """A suspended generator is not running; its ``yield`` must not absorb the consumer's sleep."""
+    profiler = LineProfiler(project_folder=THIS_DIR)
+    with profiler:
+        consume_slowly(3)
+
+    yield_line = line_source(stats_for(profiler, "counting_up"), "yield i")
+    assert yield_line.hits == 3
+    assert yield_line.total_time < 0.005, "three 10 ms sleeps landed on the yield line"
+
+
+def test_functions_defined_inside_a_function_are_profiled(mode: str) -> None:
+    """A closure is not an attribute of any module, so the C engine can only see it when it
+    runs; the discovery hook is what makes ``with`` cover it too."""
+    _needs_monitoring_for_discovery(mode)
+    profiler = LineProfiler(project_folder=THIS_DIR)
+
+    def local_product(n: int) -> int:
+        product = 1
+        for i in range(1, n + 1):
+            product *= i
+        return product
+
+    with profiler:
+        local_product(6)
+
+    assert line_source(stats_for(profiler, "local_product"), "product *= i").hits == 6
+
+
+def test_a_module_imported_inside_the_block_is_profiled(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A function that did not exist when profiling started is still profiled on 3.12+."""
+    _needs_monitoring_for_discovery(mode)
+    (tmp_path / "late_module.py").write_text(
+        "def late(n):\n    total = 0\n    for i in range(n):\n        total += i\n"
+        "    return total\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, "late_module", raising=False)
+    profiler = LineProfiler(project_folder=str(tmp_path))
+
+    with profiler:
+        late = importlib.import_module("late_module")
+        late.late(40)
+
+    assert line_source(stats_for(profiler, "late"), "total += i").hits == 40
+
+
+# --------------------------------------------------------------------------- #
+# Regions: per-line statistics partitioned by a named block
+# --------------------------------------------------------------------------- #
+def region_total(profiler: LineProfiler, name: str) -> float:
+    return sum(f.total_time for f in profiler.region_stats()[name].values())
+
+
+def test_regions_split_a_run_in_the_proportion_it_was_spent() -> None:
+    """Two regions around known amounts of work must report that ratio, not a guess."""
+    profiler = LineProfiler(project_folder=THIS_DIR)
+    with profiler:
+        for _ in range(3):
+            with profiler.region("slow"):
+                sleeper()  # ~50 ms
+            with profiler.region("quick"):
+                loop_sum(50)
+
+    slow, quick = region_total(profiler, "slow"), region_total(profiler, "quick")
+    assert slow > quick * 20, f"slow {slow:.4f}s should dominate quick {quick:.4f}s"
+    assert profiler.region_entries() == {"slow": 3, "quick": 3}
+
+
+def test_a_region_records_only_the_lines_run_inside_it() -> None:
+    """What ran inside is billed to the region; what ran after it closed is not.
+
+    The enclosing frame's own lines *are* included while the region is open — a region is the
+    window it brackets, and the caller is running inside that window too.
+    """
+    profiler = LineProfiler(project_folder=THIS_DIR)
+    with profiler:  # noqa: SIM117 - the nesting is the subject of the test
+        with profiler.region("only_add"):
+            add(1, 2)
+        loop_sum(20)
+
+    inside = {name for _, name, _ in profiler.region_stats()["only_add"]}
+    assert "add" in inside
+    assert "loop_sum" not in inside, "a function called after the region closed was billed to it"
+    assert {name for _, name, _ in profiler.get_stats()} >= {"add", "loop_sum"}
+
+
+def test_regions_nest_and_the_outer_one_includes_the_inner() -> None:
+    """The same inclusive reading as a phase's wall time in the accounting layer."""
+    profiler = LineProfiler(project_folder=THIS_DIR)
+    with profiler:  # noqa: SIM117 - the nesting is the subject of the test
+        with profiler.region("outer"):
+            loop_sum(200)
+            with profiler.region("inner"):
+                sleeper()  # ~50 ms, and must show up in both
+
+    assert region_total(profiler, "inner") >= 0.04
+    assert region_total(profiler, "outer") >= region_total(profiler, "inner")
+
+
+def test_a_region_left_by_an_exception_still_closes() -> None:
+    profiler = LineProfiler(project_folder=THIS_DIR)
+    with profiler:
+        with contextlib.suppress(ValueError), profiler.region("raises"):
+            raiser()
+        add(1, 2)
+
+    assert profiler._region_stack == []
+    assert "raiser" in {name for _, name, _ in profiler.region_stats()["raises"]}
+
+
+def test_a_region_entered_outside_the_block_records_nothing() -> None:
+    """The calls are safe to leave in code that is not being profiled."""
+    profiler = LineProfiler(project_folder=THIS_DIR)
+    with profiler.region("not_profiling"):
+        add(1, 2)
+
+    assert profiler.region_stats() == {}
+    assert profiler.region_entries() == {}
+
+
+def test_clear_forgets_regions() -> None:
+    profiler = LineProfiler(project_folder=THIS_DIR)
+    with profiler:  # noqa: SIM117 - the nesting is the subject of the test
+        with profiler.region("gone"):
+            add(1, 2)
+    profiler.clear()
+
+    assert profiler.region_stats() == {}
+    assert profiler.region_entries() == {}
+
+
+def test_print_regions_reports_each_region_and_its_share(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    profiler = LineProfiler(project_folder=THIS_DIR)
+    with profiler:  # noqa: SIM117 - the nesting is the subject of the test
+        with profiler.region("counting"):
+            loop_sum(60)
+
+    # top_n is generous because the caller's own lines are inside the region too, and they
+    # are billed inclusively, so they outrank the loop body they are waiting on.
+    profiler.print_regions(top_n=10)
+    out = capsys.readouterr().out
+    assert "Region: counting" in out
+    assert "entries" in out
+    assert "total += i" in out
+    assert "need not sum to 100%" in out
+
+
+def test_print_regions_says_so_when_none_were_used(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    profiler = LineProfiler(project_folder=THIS_DIR)
+    with profiler:
+        add(1, 2)
+    profiler.print_regions()
+
+    assert "No regions recorded." in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# Engine selection and interoperability with line_profiler
+# --------------------------------------------------------------------------- #
+def test_the_engine_defaults_to_line_profiler_where_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.undo()  # the mode fixture pins the default; this test asks what it really is
+    assert LineProfiler(project_folder=THIS_DIR).engine == "line_profiler"
+
+
+def test_passing_a_backend_selects_the_builtin_engine(backend: str) -> None:
+    chosen = cast('Literal["monitoring", "settrace"]', backend)
+    assert LineProfiler(project_folder=THIS_DIR, backend=chosen).engine == "builtin"
+
+
+@pytest.mark.skipif(_MONITORING is None, reason="needs sys.monitoring")
+def test_the_c_engine_frees_both_tool_slots_on_exit() -> None:
+    assert _MONITORING is not None
+    with LineProfiler(project_folder=THIS_DIR, engine="line_profiler"):
+        add(1, 2)
+
+    assert _MONITORING.get_tool(2) is None
+    assert _MONITORING.get_tool(4) is None
+
+
+def test_dump_stats_is_readable_by_line_profiler(tmp_path: Path) -> None:
+    """``python -m line_profiler run.lprof`` and ``LineStats.from_files`` read this output."""
+    import line_profiler
+
+    profiler = LineProfiler(project_folder=THIS_DIR)
+    with profiler:
+        loop_sum(7)
+    target = tmp_path / "run.lprof"
+    profiler.dump_stats(target)
+
+    loaded = line_profiler.load_stats(str(target))
+    key = next(k for k in loaded.timings if k[2] == "loop_sum")
+    assert key[0].endswith("test_profiler.py")
+    assert any(hits == 7 for _, hits, _ in loaded.timings[key])
+
+
+def test_print_stats_writes_to_a_stream_in_source_order() -> None:
+    profiler = LineProfiler(project_folder=THIS_DIR)
+    with profiler:
+        loop_sum(3)
+    out = io.StringIO()
+    profiler.print_stats(stream=out)
+
+    rows = [line for line in out.getvalue().splitlines() if line[:1].isdigit()]
+    numbers = [int(row.split()[0]) for row in rows]
+    assert numbers == sorted(numbers)
 
 
 # --------------------------------------------------------------------------- #
@@ -674,6 +957,57 @@ def test_double_start_profiling_warns_and_returns_the_running_instance(
     stop_profiling(print_stats=False)
 
     assert second is first
+
+
+def test_start_profiling_enabled_true_works_without_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(ENV_ENABLED, raising=False)
+
+    start_profiling(project_folder=THIS_DIR, enabled=True)
+    add(1, 2)
+    profiler = stop_profiling(print_stats=False)
+
+    assert profiler is not None
+    assert stats_for(profiler, "add")
+
+
+def test_start_profiling_enabled_false_wins_over_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(ENV_ENABLED, "1")
+
+    profiler = start_profiling(project_folder=THIS_DIR, enabled=False)
+    add(1, 2)
+
+    assert stop_profiling(print_stats=False) is None
+    assert profiler.get_stats() == {}
+
+
+def test_lineprofiler_run_profiles_a_script_without_editing_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The ``kernprof`` equivalent: a script, no decorators, its own exit status kept."""
+    from lineprofiler.accounting.cli import main
+
+    (tmp_path / ".git").mkdir()
+    script = tmp_path / "job.py"
+    script.write_text(
+        "import sys\n"
+        "def busy(n):\n    total = 0\n    for i in range(n):\n        total += i\n"
+        "    return total\n"
+        "busy(int(sys.argv[1]))\nsys.exit(3)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys, "argv", list(sys.argv))
+    monkeypatch.setattr(sys, "path", list(sys.path))
+
+    status = main(["run", str(script), "12", "--top", "20"])
+
+    out = capsys.readouterr().out
+    assert status == 3
+    assert "job.py::busy" in out
+    assert "total += i" in out
 
 
 def test_start_profiling_respects_config_include(monkeypatch: pytest.MonkeyPatch) -> None:

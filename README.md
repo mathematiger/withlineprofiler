@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-informational.svg)](LICENSE)
 [![Python](https://img.shields.io/pypi/pyversions/with-line-profiler.svg)](https://pypi.org/project/with-line-profiler/)
 
-Two independent profiling tools in one distribution: line-by-line tracing for a region you suspect, and low-overhead phase accounting for a run too long to trace. Zero dependencies on Python 3.10+, MIT licensed.
+Two independent profiling tools in one distribution: line-by-line tracing for a region you suspect, and low-overhead phase accounting for a run too long to trace. The line profiler is a `with` block over [`line_profiler`](https://github.com/pyutils/line_profiler)'s C timing engine — the speed of the trusted library, without decorating anything. Python 3.10+, MIT licensed.
 
 ```
 pip install with-line-profiler
@@ -45,15 +45,36 @@ Line #   Hits       Time (µs)       Per Hit (µs)    % Time     Line Content
 
 (numbers vary by machine; `File:` prints the absolute path)
 
-No decorators to add, no separate `kernprof` run, no build step. Only code under your project folder is traced — the folder is auto-detected by walking up to the nearest `.git` — so the output is your code, not the standard library.
+No decorators to add, no separate `kernprof` run, no build step. Only code under your project folder is traced — the folder is auto-detected by walking up to the nearest `.git` — so the output is your code, not the standard library. Closures, methods, and modules imported inside the block are all found on their first call.
+
+The timing is `line_profiler`'s, so the numbers cost what its own users pay: **239 ns per line event through this `with` block, 240 ns calling `line_profiler` directly** (600,000 events, one machine, `benchmarks/bench_lineprofiler.py`). Where `line_profiler` is not installed, a pure-Python engine takes over at ~895 ns and reports the same shape of answer.
+
+Already have a script you would rather not edit?
+
+```
+lineprofiler run train.py --epochs 3        # kernprof, without the decorators
+```
 
 Want a picture instead? `profiler.to_html("profile.html")` writes an annotated, heat-coloured source view as a single self-contained file.
+
+Want to know which *phase* a line was slow in? Name the phases and ask:
+
+```python
+with profiler:
+    for _ in range(200):
+        with profiler.region("select"):
+            best = score_children(children)
+        with profiler.region("rollout"):
+            rollout(state)
+
+profiler.print_regions()     # one ranked table per region, with a cost per entry
+```
 
 ## Which tool
 
 | Tool | What it does | Use it when |
 |---|---|---|
-| **`lineprofiler.LineProfiler`** | Line-by-line tracing for a bounded region, scoped to your project folder. | You have narrowed the problem down and want per-line timings inside it. |
+| **`lineprofiler.LineProfiler`** | Line-by-line tracing for a bounded region, scoped to your project folder. Timed by `line_profiler`. | You have narrowed the problem down and want per-line timings inside it. |
 | **`lineprofiler.accounting`** | Semantic accounting for regions *you* name. Aggregates only — counts, sums, a fixed-bucket histogram — at ~3.9 µs per phase with the default `measure_cpu=True`, or ~2.3 µs without it, across every process in a pipeline. | You are profiling a long, multi-process training run and need to know which phase, which role and which node the time went to. |
 
 They share nothing but the distribution: `accounting` never imports `LineProfiler`. If you arrived here for a training run, you want the accounting layer — it is the one built to stay enabled for twelve hours.
@@ -161,7 +182,7 @@ Line #   Hits       Time (µs)       Per Hit (µs)    % Time     Line Content
 ...
 ```
 
-The report is sorted by time, but the **line numbers sort themselves into four contiguous bands** — and those bands are the four phases. Group the rows by band and the structure the textbook claims falls straight out of the measurement:
+The report is sorted by time here, and the **line numbers sort themselves into four contiguous bands** — those bands are the four phases. (Once you know where the seams are, `with profiler.region("select"):` around each one makes the split a measurement rather than a reading exercise.) Group the rows by band and the structure the textbook claims falls straight out of the measurement:
 
 | Lines | Phase | Share | Hits on the hot line |
 |---|---|---|---|
@@ -425,11 +446,13 @@ Wrap the candidate regions in `io=True`, read the `MB/s` column, and compare it 
 
 ## What it is built on, and what it plugs into
 
-The core of this package depends on **nothing**. Both tools are built directly on interpreter and OS primitives, which is why `pip install with-line-profiler` pulls in no third-party packages at all (except `tomli`, and only on Python 3.10):
+The line profiler stands on `line_profiler`, which is its one runtime dependency and the reason a line event costs 240 ns rather than 900. The accounting layer depends on **nothing** — it is built directly on interpreter and OS primitives, and it never imports the line profiler or anything the line profiler needs:
 
 | Built on | Used for |
 |---|---|
-| `sys.monitoring` (3.12+), `sys.settrace` below | the line profiler's per-line events |
+| [`line_profiler`](https://github.com/pyutils/line_profiler) | the line profiler's per-line timing, in C |
+| `sys.monitoring` (3.12+) | finding the functions to hand it; the pure-Python fallback engine |
+| `sys.settrace` (below 3.12) | the fallback engine's per-line events |
 | `time.perf_counter_ns` | wall-clock timing everywhere |
 | `time.thread_time_ns` | CPU time, so `wait%` = wall − CPU |
 | `/proc` (Linux) | per-process I/O byte counters |
@@ -502,6 +525,8 @@ Full detail in [CHANGELOG.md](https://github.com/mathematiger/withlineprofiler/b
 
 | Version | Major changes |
 |---|---|
+| **0.10.0** | `with profiler.region("select"):` — per-line statistics partitioned by a named block, on both engines, with `print_regions()`. |
+| **0.9.0** | The line profiler is now a front end over `line_profiler`'s C engine: 3.7x faster, correct inclusive billing for a line that calls a function, and correct under threads. `lineprofiler run script.py`, `dump_stats()` to `.lprof`, `start_profiling(enabled=True)`, `print_stats(stream=...)` in source order. |
 | **0.8.5** | This version history. |
 | **0.8.4** | `Profiler(run_dir=...)` now turns profiling on by itself; a disabled-but-used profiler warns on `close()`; an empty vs missing run directory says which it is; `write_report()` / `write_trace()`; `python -m lineprofiler` and `import with_line_profiler`. |
 | **0.8.3** | Correctness pass: `CPU peak` was quantisation noise; `sync=True` no longer opens a CUDA context in CPU-only workers; GPU compute no longer called "blocked"; a stepping wall clock no longer destroys the timeline; concurrent asyncio tasks no longer recorded as nesting; one broken worker file no longer costs the report. |
@@ -519,7 +544,7 @@ Full detail in [CHANGELOG.md](https://github.com/mathematiger/withlineprofiler/b
 
 ## Python support
 
-3.10 and newer. On 3.12+ the line profiler uses `sys.monitoring`, so it can run alongside coverage.py, pdb and other tracing tools; below that it falls back to `sys.settrace`, which is a single global hook and cannot. `tomli` is required only on 3.10, where `tomllib` is not yet in the standard library.
+3.10 and newer. On 3.12+ the line profiler finds functions through `sys.monitoring`, so it discovers closures, scripts and late imports on their first call, and it can run alongside coverage.py and pdb. Below 3.12 it registers the in-project modules already imported and misses anything imported later. `tomli` is required only on 3.10, where `tomllib` is not yet in the standard library.
 
 ## Licence
 

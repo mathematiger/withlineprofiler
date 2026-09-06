@@ -10,8 +10,8 @@ to help you pick the right one, including when that is not this package.
 | **Granularity** | per line | per line | per line, sampled | per line, and per function | per function call, on a timeline |
 | **Marking what to profile** | nothing — every function under your project folder while active | a `@profile` decorator on each function (`kernprof` injects it) | nothing | nothing | nothing |
 | **How you run it** | two lines inside your existing script, run it normally | `kernprof -lv script.py`, a separate invocation | `py-spy record -- python script.py`, or attach to a live pid | `scalene script.py` | `viztracer script.py` |
-| **Mechanism** | `sys.monitoring` (3.12+) or `sys.settrace` | `sys.monitoring` (3.12+), callback in C++ | sampling, from a separate process | sampling with interposition | C-extension tracer |
-| **Overhead** | high — meant for a region you already suspect | lower; the 4.0 C++ rewrite cut 0.3–1 µs per line hit, up to ~4x faster | very low | low to moderate | roughly 2–4x |
+| **Mechanism** | `line_profiler`'s C callback, told what to watch by a `sys.monitoring` discovery hook | `sys.monitoring` (3.12+), callback in C++ | sampling, from a separate process | sampling with interposition | C-extension tracer |
+| **Overhead** | ~240 ns per line event — the same engine, so the same cost | ~240 ns per line event | very low | low to moderate | roughly 2–4x |
 | **Attach to an already-running process** | no | no | **yes** | no | no |
 | **Memory / GPU** | no (but see the accounting layer) | no | no | **yes, both** | no |
 | **Multi-process aggregation** | **yes, via `lineprofiler.accounting`** | no | per process | limited | per-process traces |
@@ -19,10 +19,11 @@ to help you pick the right one, including when that is not this package.
 
 ## When to use which
 
-**Use `line_profiler`** if you already know which function is slow and want the lowest
-possible per-line overhead. Its tracing callback is implemented in C++ and it is the faster
-tool for a hot function you can decorate. If you are willing to add `@profile` and run
-`kernprof`, it is the better choice for that job.
+**Use `line_profiler`** directly if `kernprof` is already in your workflow, if you want to
+profile exactly one decorated function rather than a region, or if you need the parts of its
+surface this package does not wrap — `--prof-mod` auto-profiling, `%lprun`, rich output, the
+scoping policies. This package *uses* `line_profiler` for the timing, so the numbers are the
+same either way; what differs is how you say what to profile.
 
 **Use py-spy** if you cannot modify or restart the process — a production service, a job
 already running, something wedged that you need a stack trace out of. Nothing else here can
@@ -46,22 +47,40 @@ role the time went to across the run, then the line profiler on the region it po
 
 ## Honest notes
 
-- **`sys.monitoring` is not a differentiator.** `line_profiler` 5.0 adopted it too. It is
-  what lets either tool coexist with coverage.py rather than fighting for the trace hook, and
-  both benefit.
-- **This package's line profiler is the slower one.** It is pure Python where
-  `line_profiler`'s hot path is C++. That is the right trade for a bounded region you are
-  investigating, and the wrong one for leaving enabled on hot code.
+- **The timing is `line_profiler`'s.** Since 0.9.0 this package's line profiler is a front end:
+  it decides *what* to watch and renders the result, and `line_profiler`'s C callback does the
+  measuring. Measured on one machine over 600,000 line events, `with profiler:` costs 239 ns
+  per event and `line_profiler` called directly costs 240 ns — the wrapper is free. What this
+  package adds is that you never name a function.
+- **The pure-Python engine is the fallback, and it is 3.7x slower.** ~895 ns per line event
+  against ~240. It runs when `line_profiler` is not importable, or when you ask for it with
+  `engine="builtin"` or a `backend=`. Its numbers agree with the C engine's; only the cost of
+  taking them differs.
+- **`sys.monitoring` is not a differentiator.** `line_profiler` 5.0 adopted it too, and this
+  package is built on it. Both coexist with coverage.py rather than fighting for the trace hook.
 - **The accounting layer is the genuinely uncommon piece.** Aggregate phase timing that
   merges across processes and nodes, with per-role attribution and a wait/compute split, is
   not something the others set out to do.
 
 ---
 
-Verified against the `line_profiler` 5.0 changelog, the py-spy README, the Scalene README and
-the VizTracer documentation. Last checked 2026-08. A comparison table that silently rots is
-the documentation equivalent of a wrong number — if you find a claim here that is out of
-date, please open an issue.
+Verified against `line_profiler` 5.0.2 and Scalene 2.3.0 as installed, the py-spy README and
+the VizTracer documentation. Last checked 2026-09. The overhead figures come from
+`benchmarks/bench_lineprofiler.py`, which is one command — `poetry run python
+benchmarks/bench_lineprofiler.py` — so a claim here can be rechecked rather than trusted. A
+comparison table that silently rots is the documentation equivalent of a wrong number; if you
+find one that is out of date, please open an issue.
+
+### Scalene, measured
+
+Scalene samples rather than traces, so it answers a different question and costs far less:
+the same loop runs 2.0x slower under `scalene run --cli --cpu-only` and 2.7x with memory
+profiling on, against 12x for either line-tracing engine here. Reach for it when the question
+is memory, native-versus-Python time, or GPU, or when you do not yet know which of the three
+it is. What it cannot give you is a hit count: a sampler cannot say a line ran 49,200 times,
+and that number is what makes phase boundaries visible in the worked example in the README.
+It also has no exact answer for a region a few milliseconds long, where a handful of samples
+is all it gets.
 
 ## Trace timeline vs VizTracer / Perfetto / nsys
 
