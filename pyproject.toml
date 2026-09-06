@@ -101,8 +101,13 @@ ignore = ["ANN101", "ANN102"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Overhead assertions are timing-sensitive and meaningless on a loaded machine; CI runs them
-# as their own job. Locally: pytest -m overhead
+# as their own job, on a runner doing nothing else. Locally: pytest -m overhead
+#
+# The marker only said so until now -- nothing deselected it, so every ordinary run measured
+# the hot path too, and the sdist job went red whenever its runner was busy. Deselecting it
+# here is what makes the dedicated job the only place these are measured.
 markers = ["overhead: hot-path cost assertions, sensitive to machine load"]
+addopts = "-m 'not overhead'"
 
 [tool.coverage.run]
 branch = true

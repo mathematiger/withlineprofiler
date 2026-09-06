@@ -135,7 +135,8 @@ jobs:
       # The whole value proposition is a ns/call number; without this a 10x regression in
       # _PhaseScope would merge unnoticed. Bounds are deliberately loose — a shared runner is
       # noisy — so this catches order-of-magnitude regressions, not percentages.
-      - run: poetry run pytest tests/test_overhead.py -q
+      # -m overhead opts back in: the default addopts deselect it everywhere else.
+      - run: poetry run pytest tests/test_overhead.py -q -m overhead
 
   build:
     name: build + install the wheel

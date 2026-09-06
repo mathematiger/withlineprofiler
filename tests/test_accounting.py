@@ -202,8 +202,13 @@ def test_recursion_does_not_double_count_the_parent(tmp_path: Path) -> None:
     for path, stats in tree.items():
         assert stats.self_ns >= 0, path
     outermost = tree[("rec",)]
-    assert outermost.self_ns == pytest.approx(0.01e9, rel=0.5)
-    assert outermost.wall_ns == pytest.approx(0.03e9, rel=0.3)
+    # One sleep of its own out of the three below it -- which is what self_ns means, and what
+    # double counting would break. Stated as a floor plus a share of the wall time this run
+    # actually took: a loaded machine returns from a 10 ms sleep late and never early, so a
+    # two-sided tolerance around 10 and 30 ms is a flake, not a measurement.
+    assert outermost.wall_ns >= 0.03e9 * 0.95
+    assert outermost.self_ns >= 0.01e9 * 0.95
+    assert outermost.self_ns <= outermost.wall_ns / 2
 
 
 def test_depth_beyond_the_cap_folds_into_its_ancestor(tmp_path: Path) -> None:

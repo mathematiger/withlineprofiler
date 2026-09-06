@@ -338,9 +338,16 @@ def test_a_two_process_lifecycle_attributes_each_segment_to_the_right_stage(
     aligned = align_run(merge_run(tmp_path, with_trace=True))
     segments = {s.name: s for s in lifecycle_segments(aligned)["inference"]}
 
-    assert segments["begin → admitted"].mean_ns == pytest.approx(50_000_000, rel=0.4)
-    assert segments["admitted → computed"].mean_ns == pytest.approx(20_000_000, rel=0.4)
-    assert segments["begin → admitted"].count == 4
+    batching, compute = segments["begin → admitted"], segments["admitted → computed"]
+
+    # Floors plus the ratio, not a band around each figure: both sleeps overshoot on a loaded
+    # machine and neither can come back early, so the upper half of a +-40% window measures
+    # the runner. The reading this test exists for is that batching dominates compute, which
+    # a swap or a mis-attribution breaks by far more than the 2.5:1 the sleeps set up.
+    assert batching.mean_ns >= 50_000_000 * 0.95
+    assert compute.mean_ns >= 20_000_000 * 0.95
+    assert batching.mean_ns > compute.mean_ns * 1.5
+    assert batching.count == 4
 
 
 def test_the_lifecycle_block_reaches_the_report(tmp_path: Path) -> None:
