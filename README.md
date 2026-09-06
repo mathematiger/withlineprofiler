@@ -496,6 +496,27 @@ The GPU block in the I/O example shows the same principle from the other side: i
 - [Configuration](https://github.com/mathematiger/withlineprofiler/blob/main/docs/configuration.md) — environment variables, `[tool.lineprofiler]`, optional dependencies
 - [Comparison with other profilers](https://github.com/mathematiger/withlineprofiler/blob/main/docs/comparison.md) — `line_profiler`, py-spy, Scalene, VizTracer, and when to use those instead
 
+## Version history
+
+Full detail in [CHANGELOG.md](https://github.com/mathematiger/withlineprofiler/blob/main/CHANGELOG.md).
+
+| Version | Major changes |
+|---|---|
+| **0.8.5** | This version history. |
+| **0.8.4** | `Profiler(run_dir=...)` now turns profiling on by itself; a disabled-but-used profiler warns on `close()`; an empty vs missing run directory says which it is; `write_report()` / `write_trace()`; `python -m lineprofiler` and `import with_line_profiler`. |
+| **0.8.3** | Correctness pass: `CPU peak` was quantisation noise; `sync=True` no longer opens a CUDA context in CPU-only workers; GPU compute no longer called "blocked"; a stepping wall clock no longer destroys the timeline; concurrent asyncio tasks no longer recorded as nesting; one broken worker file no longer costs the report. |
+| **0.8.2** | Per-phase call counts; auto-traced spans carry file/function/line; the trace timeline states what is *wrong* rather than only showing it; findings reach the terminal, CI (`trace --fail-over`) and the keyboard. |
+| **0.8.0** | A `RESOURCES` section opens every report: CPU, RAM and VRAM as run totals, per-process figures, and against machine capacity. CPU is now sampled; `hardware.py` records what each box has; capacity is stored per worker, so heterogeneous jobs report one line per host. |
+| **0.7.0** | `phase(async_work=True)` for work that is never awaited; `GPU BY PHASE`; request lifecycles (`trace_begin` / `trace_mark` / `trace_end`); source provenance in metadata and report headers; counter spread; "is this a hang or queueing?"; named denominators in the text report. |
+| **0.6.0** | The trace timeline: all lanes on one clock, with causal arrows. `signal()` / `wait_on()` for cross-process causality, and `trace="auto"`, which needs no instrumentation at all. |
+| **0.5.0** | A `sys.monitoring` backend on 3.12+, so the line profiler stops fighting coverage.py and pdb. Self-contained HTML reports for both tools. Python 3.10 and 3.11 support. Documentation split out of the README. |
+| **0.4.1** | Opt-in two-line adoption for existing projects. |
+| **0.4.0** | Wrong labels and shares in the report fixed; instrumenting without threading an argument (the module-level `accounting` API); reading a run while it is still running; estimates and generated names labelled as such. |
+| **0.3.0** | Hardening for multi-node HPC: failed I/O reads no longer differenced as real (a 2 KB window once reported 372.5 GB), one failing snapshot no longer ends flushing, re-runs no longer merge the previous attempt. Host/rank/job id in every worker file, host-sharded files, `SIGUSR1`/`SIGHUP` flush, `fsync` before rename, bounded phase paths, GPU paths validated on real A100 hardware. |
+| **0.2.0** | `lineprofiler.accounting`: phase trees, mergeable histograms, cross-process merge, run comparison, text reports and the CLI. Corrected I/O attribution; per-device and per-process GPU utilisation; `phase(sync=True)`. |
+| **0.1.1** | Distribution renamed to `with_line_profiler`; lower line-profiler overhead. |
+| **0.1.0** | Initial `LineProfiler`. |
+
 ## Python support
 
 3.10 and newer. On 3.12+ the line profiler uses `sys.monitoring`, so it can run alongside coverage.py, pdb and other tracing tools; below that it falls back to `sys.settrace`, which is a single global hook and cannot. `tomli` is required only on 3.10, where `tomllib` is not yet in the standard library.

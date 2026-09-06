@@ -48,7 +48,7 @@ Tests (425 total on 3.12, ~18 s; plus 8 GPU-only in `test_gpu_hardware.py`). The
 - [tests/test_accounting_provenance.py](tests/test_accounting_provenance.py) — source provenance, the render-scaling controls (`--max-spans`, progress), the stated denominators, and the request lifecycle end to end. The git tests build a real repo in `tmp_path` and skip cleanly where `git` is absent.
 - [tests/test_accounting_provenance.py](tests/test_accounting_provenance.py) — source provenance, the render-scaling controls (`--max-spans`, progress), the stated denominators, and the request lifecycle end to end. The git tests build a real repo in `tmp_path` and skip cleanly where `git` is absent.
 
-The version number lives in **two** places that must be bumped together: `[project].version` in `pyproject.toml` and `__version__` in [lineprofiler/__init__.py](lineprofiler/__init__.py). Both are currently 0.8.4. [CHANGELOG.md](CHANGELOG.md) records what changed and why.
+The version number lives in **two** places that must be bumped together: `[project].version` in `pyproject.toml` and `__version__` in [lineprofiler/__init__.py](lineprofiler/__init__.py). Both are currently 0.8.5. [CHANGELOG.md](CHANGELOG.md) records what changed and why.
 
 Everything targets Python 3.10+ — `requires-python`, mypy and ruff. The checked-in `.venv` is 3.12, so the 3.10-only branches (the `tomli` import in `config.py`, the `co_qualname` fallback in `_qualname_of`) only ever run in CI; both have unit tests that exercise them on any version.
 

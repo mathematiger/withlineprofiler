@@ -6,6 +6,14 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-09-06
+
+### Documented — a version history in the README
+
+One table, 0.1.0 to here, one line per release. The changelog is 950 lines and answers "what
+exactly changed in 0.8.3"; nothing answered "what has this thing become since 0.1.0" without
+reading all of it.
+
 ## [0.8.4] - 2026-09-05
 
 ### Changed (breaking) — `Profiler(run_dir=...)` now records
