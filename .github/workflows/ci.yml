@@ -62,9 +62,14 @@ jobs:
       # installed poetry with. Put poetry on the matrix interpreter, now that setup-python
       # has provided it, so the venv it builds is this leg's. The first install above has to
       # stay: setup-python's `cache: poetry` runs `poetry config` before this point.
-      - run: >-
-          pipx install poetry==${{ env.POETRY_VERSION }}
-          --python "${{ steps.setup.outputs.python-path }}" --force
+      # Uninstall first rather than `install --force`: pipx ignores --python when --force is
+      # passed, says so on stdout, and installs on the old interpreter anyway with a zero
+      # exit code. The guard below is what caught that.
+      - run: |
+          pipx uninstall poetry
+          pipx install poetry==${{ env.POETRY_VERSION }} \
+            --python "${{ steps.setup.outputs.python-path }}"
+          poetry --version
       # A venv restored from the cache is still one built during the drift, under the name
       # this leg's Python would be given, and poetry adopts an existing directory by name
       # without checking the interpreter inside it. The cache key is the Python version plus
