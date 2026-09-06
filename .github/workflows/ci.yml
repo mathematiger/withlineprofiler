@@ -55,7 +55,19 @@ jobs:
       # green while testing the wrong version. A 3.12-only f-string shipped through "py3.10"
       # and "py3.11" this way. Pin the venv, then refuse to run if it is still not the leg's
       # Python, so the next drift fails loudly instead of silently passing.
-      - run: poetry env use "${{ steps.setup.outputs.python-path }}"
+      # `env use` alone is not enough: the restored cache still holds the venv built during
+      # the drift above, under the name this leg's Python would get, and poetry adopts an
+      # existing directory by name without checking the interpreter inside it. The cache key
+      # is the Python version plus the lock hash, so fixing the workflow does not change it
+      # and the wrong venv is restored for as long as it lives. Rebuild when it does not
+      # match, which also self-heals the caches already poisoned.
+      - name: Use the matrix Python, rebuilding a cached venv that is not it
+        run: |
+          poetry env use "${{ steps.setup.outputs.python-path }}"
+          if ! poetry run python -VV | grep -q "^Python ${{ matrix.python }}\."; then
+            poetry env remove --all
+            poetry env use "${{ steps.setup.outputs.python-path }}"
+          fi
       # psutil is installed on purpose: without it the I/O and memory paths degrade to
       # their absent-capability branches and the suite silently stops testing them.
       - run: poetry install --with dev,test --extras resources
